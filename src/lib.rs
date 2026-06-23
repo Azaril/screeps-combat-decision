@@ -1990,6 +1990,36 @@ mod tests {
     }
 
     #[test]
+    fn force_sized_squad_keeps_holding_while_damaged() {
+        // R3+ HOLD_MARGIN runtime confirmation (operator: "will it hold when damaged / not early-retreat?").
+        // A squad SIZED to out-heal the incoming (heal ≥ tower dps × the hold margin) holds + dismantles
+        // not just at full HP but while DAMAGED — it doesn't early-retreat, because it out-heals (HP
+        // recovers) and stays above the critical-HP floor; only at critical (<25%) does the sanctioned
+        // individual flee fire (correct). An under-sized squad (can't out-heal) retreats. Tower = 150/tick.
+        let base = vec![
+            structure(25, 25, StructureType::Tower, Ownership::Hostile),
+            structure(26, 25, StructureType::Spawn, Ownership::Hostile),
+        ];
+        let squad = |hp: u32, heal_parts: u32| {
+            vec![
+                SquadMemberView { hits: hp, hits_max: 2000, pos: Some(pos(5, 25)), ..Default::default() },
+                SquadMemberView { hits: hp, hits_max: 2000, heal_power: heal_parts, pos: Some(pos(5, 26)), ..Default::default() },
+            ]
+        };
+        let state = |members: &[SquadMemberView]| {
+            decide_squad(&SquadView { members, hostiles: &[], structures: &base, retreat_threshold: 0.3, current_state: SquadOrderState::Engaged, enemy_safe_mode: false }).state
+        };
+        // Sized to out-heal with margin (17 HEAL ×12 = 204 ≥ 150 × 1.3 = 195): holds at full HP …
+        assert_eq!(state(&squad(2000, 17)), SquadOrderState::Engaged, "margin-sized squad holds at full HP");
+        // … AND keeps holding at 60% HP — the "no early retreat on first damage" guarantee.
+        assert_eq!(state(&squad(1200, 17)), SquadOrderState::Engaged, "margin-sized squad keeps holding while damaged (60% HP)");
+        // Critically low (20% < 25%) → the sanctioned individual flee, not an early retreat.
+        assert_eq!(state(&squad(400, 17)), SquadOrderState::Retreating, "critically low → sanctioned retreat");
+        // Under-sized (10 HEAL ×12 = 120 < 150): can't out-heal → bleeds → retreat even at full HP.
+        assert_eq!(state(&squad(2000, 10)), SquadOrderState::Retreating, "under-sized (can't out-heal) → retreat");
+    }
+
+    #[test]
     fn safe_mode_vetoes_engagement() {
         // A trivially-winnable matchup, but the enemy room is in safe mode → our combat is nullified →
         // never engage (ADR 0020 §8 engage-veto).
