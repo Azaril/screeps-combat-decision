@@ -812,6 +812,12 @@ pub struct SquadDecision {
     /// back, present fresh armor); a kiting (skirmish) squad ignores it. Pure tactic — the live
     /// `SquadManager` / sim applies it (`orient_toward` + `reassign_slots`); the job executes movement.
     pub orientation: Option<Direction>,
+    /// Per-member movement-goal override, parallel to `members` (ADR 0019 §8). `Some(tile)` ⇒ this
+    /// member moves to its OWN tile this tick instead of the shared `movement` directive; `None`/empty ⇒
+    /// it follows the block. Today only a pure-support healer in an engaged, non-kiting squad gets one
+    /// (its heal-coverage tile); the adapter stamps it as that member's `Advance{range:0}` directive.
+    /// Consumed only on the anchorless `decide_movement` path — a siege formation keeps its slots.
+    pub member_goals: Vec<Option<Position>>,
 }
 
 /// Mean HP fraction over members that have spawned (`hits_max > 0`).
@@ -991,6 +997,7 @@ pub fn decide_squad(view: &SquadView) -> SquadDecision {
         heal_assignments,
         focus_assignments,
         orientation,
+        member_goals: Vec::new(),
     }
 }
 
@@ -1353,6 +1360,7 @@ pub fn decide_squad_with_pathing(
             centroid,
             threats: &threats,
             towers: &towers,
+            allies: &[], // heal-coverage is a healer-only objective (§8); irrelevant to the block kite
             focus: decision.focus.map(|f| f.pos),
             // Kite weights the DMG term 0, so the richness inputs are moot here — keep it None.
             focus_damage: None,
@@ -1377,6 +1385,7 @@ pub fn decide_squad_with_pathing(
             centroid,
             threats: &threats,
             towers: &towers,
+            allies: &[], // heal-coverage is a healer-only objective (§8); irrelevant to the block engage
             focus: decision.focus.map(|f| f.pos),
             focus_damage,
             params: tactics.engage,
@@ -1392,7 +1401,97 @@ pub fn decide_squad_with_pathing(
         };
     }
 
+    // ── HEALER positioning (ADR 0019 §8) ──
+    // A pure-support healer in an engaged, non-kiting squad picks its OWN tile by heal-coverage vs
+    // danger (the healer preset over per-ally need + the shared threat field + the survival veto) rather
+    // than following the block goal — so it hugs the at-risk allies it can heal instead of lagging until
+    // it takes fire. Routed per-member (`member_goals`); only the anchorless `decide_movement` path
+    // consumes it (a siege formation keeps healers-back slots), so this targets the SK/skirmish duo the
+    // operator reported. Skipped while kiting/retreating (the healer flees with the block) and while
+    // traveling (no engagement yet). Same scored search + shared layers live and in the sim (no fork).
+    if matches!(decision.state, SquadOrderState::Engaged) && !should_kite {
+        let threats = kite_threats(view.hostiles);
+        let towers = kite_towers(view.structures);
+        let mut goals: Vec<Option<Position>> = vec![None; view.members.len()];
+        let mut any = false;
+        for (i, m) in view.members.iter().enumerate() {
+            // Pure support: heals but cannot fight (a creep that also fights stays in the block's
+            // formation/engage). Must have synced its position.
+            let is_pure_healer = m.heal_power > 0 && m.melee_power == 0 && !m.has_ranged;
+            if !is_pure_healer || m.hits == 0 || m.pos.is_none() {
+                continue;
+            }
+            let (fragile_hits, self_heal) = (m.hits, m.heal_power);
+            let allies = ally_needs(view, i, &threats, &towers);
+            if allies.is_empty() {
+                continue;
+            }
+            let healer_view = kite::SquadKiteView {
+                centroid,
+                threats: &threats,
+                towers: &towers,
+                allies: &allies,
+                focus: None,
+                focus_damage: None,
+                params: tactics.healer,
+                fragile_hits,    // the healer's own survivability drives its safety term + the veto
+                squad_heal: self_heal, // self-sustain (same unit the block's squad_heal uses)
+                weapon_range: 1,
+            };
+            if let Some(plan) = kite::plan_kite_anchor(&healer_view, shared, room_callback, max_ops) {
+                goals[i] = Some(plan.goal);
+                any = true;
+            }
+        }
+        if any {
+            decision.member_goals = goals;
+        }
+    }
+
     decision
+}
+
+/// Base in-combat need every covered ally contributes (HP-units), so the healer pre-positions near
+/// allies even before they're hit ("maximum POTENTIAL future healing", operator brief). Seed (§8).
+const HEALER_BASE_NEED: u32 = 100;
+/// Ticks of incoming damage folded into an ally's need — weights "this ally is under heavy fire" so the
+/// healer covers the one most likely to need it. Seed (§8); the EXP-HEAL-POS sweep tunes it.
+const HEALER_RISK_LOOKAHEAD: u32 = 5;
+
+/// Build the risk-weighted need of every OTHER squad member, for the healer's heal-coverage objective
+/// (ADR 0019 §8): a base in-combat weight + the HP deficit + a look-ahead on the damage it's taking.
+/// Excludes the healer itself (its own survival is the safety term) and unspawned/dead members.
+fn ally_needs(view: &SquadView, healer_idx: usize, threats: &[kite::KiteThreat], towers: &[kite::KiteTower]) -> Vec<kite::AllyNeed> {
+    let mut out = Vec::new();
+    for (i, m) in view.members.iter().enumerate() {
+        if i == healer_idx || m.hits == 0 {
+            continue;
+        }
+        let Some(pos) = m.pos else { continue };
+        let deficit = m.hits_max.saturating_sub(m.hits);
+        let risk = incoming_damage_at(pos, threats, towers);
+        out.push(kite::AllyNeed { pos, need: HEALER_BASE_NEED + deficit + HEALER_RISK_LOOKAHEAD * risk });
+    }
+    out
+}
+
+/// Incoming hostile damage/tick at `pos` (melee within range 1 + ranged within range 3 + tower fire) —
+/// the risk weight for ally need (ADR 0019 §8), in HP/tick. Mirrors the threat the safety term models.
+fn incoming_damage_at(pos: Position, threats: &[kite::KiteThreat], towers: &[kite::KiteTower]) -> u32 {
+    let mut d = 0u32;
+    for t in threats {
+        let r = pos.get_range_to(t.pos);
+        if t.attack_power > 0 && r <= 1 {
+            d += t.attack_power;
+        }
+        if t.ranged_power > 0 && r <= 3 {
+            d += t.ranged_power;
+        }
+    }
+    for tw in towers {
+        d += screeps_combat_engine::damage::tower_attack_damage_at_range(pos.get_range_to(tw.pos));
+    }
+    d
 }
 
 #[cfg(test)]

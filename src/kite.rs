@@ -145,6 +145,11 @@ pub struct KiteScoreParams {
     /// **Focus-damage reward** (negative cost) — a tile in weapon range of the focus. Kite weights it
     /// 0 (safety → flee); engage weights it high (commit to dealing damage → stand and fight).
     pub w_dmg: f32,
+    /// **Heal-coverage reward** (negative cost, ADR 0019 §8) — risk-weighted ally need the tile can
+    /// reach (Σ over [`SquadKiteView::allies`] of `need × heal-efficacy(range)`). Kite/engage weight it
+    /// 0 (irrelevant to a fighter); the healer preset weights it dominant so a support healer picks the
+    /// tile maximizing *potential future healing output*, balanced against danger by `w_taken`.
+    pub w_heal: f32,
     /// Cohesion radius K: beyond this distance from the centroid the penalty steepens (×3/tile).
     pub max_cohesion_radius: u32,
 }
@@ -162,6 +167,7 @@ impl Default for KiteScoreParams {
             w_openness: 0.05,
             w_edge: 0.4,
             w_dmg: 0.0,
+            w_heal: 0.0,
             max_cohesion_radius: 2,
         }
     }
@@ -188,6 +194,28 @@ impl KiteScoreParams {
             w_openness: 0.05,
             w_edge: 0.1,
             w_dmg: 2.0,
+            w_heal: 0.0,
+            max_cohesion_radius: 2,
+        }
+    }
+
+    /// The **healer** preset (ADR 0019 §8): the SAME scorer reweighted so a pure-support healer picks
+    /// the tile that maximizes *potential future healing* — the heal-coverage reward dominates (hug the
+    /// at-risk allies it can heal), `w_taken` is a moderate counter-weight (the danger balance: don't
+    /// stand somewhere lethal to cover one more ally), cohesion keeps it with the block, and the
+    /// proximity/focus-damage terms are 0 (a healer never advances to deal damage). Stand-near-the-
+    /// neediest vs back-off-the-danger emerges from these weights, exactly like kite vs engage. Seeds;
+    /// the EXP-HEAL-POS sweep (Stage 4, measure-first) is the sanctioned tuner.
+    pub fn healer() -> Self {
+        Self {
+            w_taken: 1.5,
+            w_future: 0.5,
+            w_cohesion: 0.6,
+            w_prox: 0.0,
+            w_openness: 0.05,
+            w_edge: 0.2,
+            w_dmg: 0.0,
+            w_heal: 2.0,
             max_cohesion_radius: 2,
         }
     }
@@ -204,11 +232,14 @@ pub struct SquadTacticParams {
     pub kite: KiteScoreParams,
     /// Weights for the engage/advance scored search (the engage branch).
     pub engage: KiteScoreParams,
+    /// Weights for the healer heal-coverage scored search (ADR 0019 §8 — a pure-support healer's own
+    /// per-member goal in an engaged, non-kiting squad).
+    pub healer: KiteScoreParams,
 }
 
 impl Default for SquadTacticParams {
     fn default() -> Self {
-        Self { kite: KiteScoreParams::default(), engage: KiteScoreParams::engage() }
+        Self { kite: KiteScoreParams::default(), engage: KiteScoreParams::engage(), healer: KiteScoreParams::healer() }
     }
 }
 
@@ -227,6 +258,9 @@ const ROOM_DIAM_F: f32 = 49.0;
 const SAFETY_PROXY_REF: f32 = 8.0;
 /// Tiles from a room edge under which the edge-trap term applies (matches the per-creep flee repulsor).
 pub const EDGE_THRESH: u32 = 6;
+/// Reference total ally-need that saturates the heal-coverage reward (ADR 0019 §8) — normalizes the
+/// Σ-need term into `[0, SCALE]`. Seed; the EXP-HEAL-POS sweep tunes it.
+const HEAL_COV_REF: f32 = 1000.0;
 /// Min distance from `(x,y)` to any room edge (0 on an edge, up to 24 at the centre).
 fn dist_to_edge(x: u8, y: u8) -> u32 {
     (x.min(49 - x)).min(y.min(49 - y)) as u32
@@ -341,12 +375,26 @@ pub struct FocusDamage {
     pub focus_heal: u32,
 }
 
+/// A friendly creep the healer can cover, with its **risk-weighted need** (ADR 0019 §8): a base
+/// in-combat weight + its HP deficit + a look-ahead on the damage it's taking, so the heal-coverage
+/// term rewards a tile by the *potential future healing* it enables (covering the at-risk and the
+/// damaged), not merely the nearest ally. Built once per decision (the live seam / sim), not per tile.
+#[derive(Clone, Copy, Debug)]
+pub struct AllyNeed {
+    pub pos: Position,
+    /// Risk-weighted need (HP-units): higher ⇒ this ally is more worth being able to heal.
+    pub need: u32,
+}
+
 /// The squad's kite-scoring context — its centroid (cohesion anchor), the threats/towers to avoid,
 /// and the shared focus the value term keeps shootable.
 pub struct SquadKiteView<'a> {
     pub centroid: Position,
     pub threats: &'a [KiteThreat],
     pub towers: &'a [KiteTower],
+    /// Friendly allies + their risk-weighted need, for the heal-coverage reward (ADR 0019 §8). Empty
+    /// for every non-healer search (the term is then 0 — byte-identical to the pre-§8 behavior).
+    pub allies: &'a [AllyNeed],
     /// Shared focus position; the value term keeps it within shooting range 3.
     pub focus: Option<Position>,
     /// The actual-hits inputs for the DMG reward (ADR 0019 focus_damage richness). `None` ⇒ the flat
@@ -507,13 +555,36 @@ pub fn score_tile(view: &SquadKiteView, tile: Position, walkable_neighbors: u8, 
         _ => 0.0,
     };
 
+    // HEAL-COVERAGE (reward, ADR 0019 §8) — the risk-weighted ally need this tile can heal: Σ over the
+    // allies of `need × heal-efficacy(range)`, where efficacy is the heal mechanic itself (full at
+    // range ≤1 = HEAL 12/tick, a third at range 2–3 = RANGED_HEAL 4/tick, 0 beyond). Normalized and
+    // SUBTRACTED like the DMG reward. 0 in the kite/engage presets (`w_heal == 0`) and for any search
+    // with no allies → byte-identical to the pre-§8 behavior. The healer preset weights it dominant, so
+    // the healer's own search picks the tile maximizing potential future healing (the danger of that
+    // tile is the TAKEN term, balancing coverage vs survival per the operator's brief).
+    let heal_cov = if p.w_heal == 0.0 || view.allies.is_empty() {
+        0.0
+    } else {
+        let mut sum = 0.0f32;
+        for a in view.allies {
+            let eff = match tile.get_range_to(a.pos) {
+                0 | 1 => 1.0,
+                2 | 3 => 1.0 / 3.0,
+                _ => 0.0,
+            };
+            sum += a.need as f32 * eff;
+        }
+        (sum / HEAL_COV_REF * SCALE_F).min(SCALE_F)
+    };
+
     (p.w_taken * safety
         + p.w_future * future
         + p.w_cohesion * cohesion
         + p.w_prox * prox
         + p.w_openness * openness
         + p.w_edge * edge
-        - p.w_dmg * focus_dmg)
+        - p.w_dmg * focus_dmg
+        - p.w_heal * heal_cov)
         .round() as i64
 }
 
@@ -628,7 +699,7 @@ mod tests {
     }
     fn view<'a>(centroid: Position, threats: &'a [KiteThreat], towers: &'a [KiteTower], focus: Option<Position>) -> SquadKiteView<'a> {
         // fragile_hits 0 ⇒ the survival veto is disabled (the term-isolation tests don't want it).
-        SquadKiteView { centroid, threats, towers, focus, focus_damage: None, params: KiteScoreParams::default(), fragile_hits: 0, squad_heal: 0, weapon_range: 3 }
+        SquadKiteView { centroid, threats, towers, allies: &[], focus, focus_damage: None, params: KiteScoreParams::default(), fragile_hits: 0, squad_heal: 0, weapon_range: 3 }
     }
     fn melee(x: u8, y: u8, reach: u32) -> KiteThreat {
         KiteThreat { pos: pos(x, y), kind: ThreatKind::MeleeOnly, reach, step_ticks: Some(1), attack_power: 30, ranged_power: 0 }
@@ -763,17 +834,56 @@ mod tests {
         let a = pos(26, 25); // range 2 to focus (in range), range 1 to the threat (inside reach)
         let b = pos(22, 25); // range 6 to focus (out of range), range 5 to the threat (safe)
 
-        let kite = SquadKiteView { centroid, threats: &threats, towers: &[], focus: Some(focus), focus_damage: None, params: KiteScoreParams::default(), fragile_hits: 0, squad_heal: 0, weapon_range: 3 };
+        let kite = SquadKiteView { centroid, threats: &threats, towers: &[], allies: &[], focus: Some(focus), focus_damage: None, params: KiteScoreParams::default(), fragile_hits: 0, squad_heal: 0, weapon_range: 3 };
         assert!(
             score_tile(&kite, b, 8, &KiteFields::default()) < score_tile(&kite, a, 8, &KiteFields::default()),
             "kite prefers the safe tile B (flee)"
         );
 
-        let engage = SquadKiteView { centroid, threats: &threats, towers: &[], focus: Some(focus), focus_damage: None, params: KiteScoreParams::engage(), fragile_hits: 0, squad_heal: 0, weapon_range: 3 };
+        let engage = SquadKiteView { centroid, threats: &threats, towers: &[], allies: &[], focus: Some(focus), focus_damage: None, params: KiteScoreParams::engage(), fragile_hits: 0, squad_heal: 0, weapon_range: 3 };
         assert!(
             score_tile(&engage, a, 8, &KiteFields::default()) < score_tile(&engage, b, 8, &KiteFields::default()),
             "engage prefers the in-range tile A (stand and fight)"
         );
+    }
+
+    // ── heal-coverage objective (ADR 0019 §8) ──
+    fn healer_view<'a>(centroid: Position, allies: &'a [AllyNeed], threats: &'a [KiteThreat]) -> SquadKiteView<'a> {
+        SquadKiteView {
+            centroid,
+            threats,
+            towers: &[],
+            allies,
+            focus: None,
+            focus_damage: None,
+            params: KiteScoreParams::healer(),
+            fragile_hits: 0, // safety-per-fragile/veto disabled; the threat-proxy safety term still applies
+            squad_heal: 0,
+            weapon_range: 1,
+        }
+    }
+
+    #[test]
+    fn heal_coverage_prefers_covering_more_at_risk_allies() {
+        // Two at-risk allies clustered on the left of the centroid.
+        let allies = [AllyNeed { pos: pos(22, 25), need: 500 }, AllyNeed { pos: pos(22, 26), need: 500 }];
+        let v = healer_view(pos(25, 25), &allies, &[]);
+        // Two tiles EQUIDISTANT from the centroid (cohesion ties): A covers both allies, B covers none.
+        let covers_both = score_tile(&v, pos(23, 25), 8, &KiteFields::default()); // range 1 of both allies
+        let covers_none = score_tile(&v, pos(27, 25), 8, &KiteFields::default()); // far from both
+        assert!(covers_both < covers_none, "covering 2 at-risk allies beats covering 0 (cohesion tied): both={covers_both} none={covers_none}");
+    }
+
+    #[test]
+    fn heal_coverage_backs_off_danger_when_coverage_ties() {
+        // One ally; two tiles both at range 1 of it (heal-coverage ties), but one sits inside a melee
+        // threat's reach. The danger (TAKEN) term must break the tie toward the safe side.
+        let allies = [AllyNeed { pos: pos(25, 25), need: 500 }];
+        let threats = [melee(28, 25, 3)]; // reach 3 around (28,25)
+        let v = healer_view(pos(25, 25), &allies, &threats);
+        let dangerous = score_tile(&v, pos(26, 25), 8, &KiteFields::default()); // r1 of ally, r2 of threat (inside reach)
+        let safe = score_tile(&v, pos(24, 25), 8, &KiteFields::default()); // r1 of ally, r4 of threat (outside reach)
+        assert!(safe < dangerous, "a healer backs off the dangerous tile when coverage ties: safe={safe} dangerous={dangerous}");
     }
 
     // ── focus_damage actual-hits richness (ADR 0019 Stage 3b) ──
@@ -782,6 +892,7 @@ mod tests {
             centroid,
             threats: &[],
             towers: &[],
+            allies: &[],
             focus: Some(focus),
             focus_damage: fd,
             params: KiteScoreParams::engage(),
@@ -855,7 +966,7 @@ mod tests {
         let kite = view(centroid, &threats, &[], None); // default weights (w_future = 5)
         let mut attack_params = KiteScoreParams::default();
         attack_params.w_future = 0.0; // a use that ignores durable-standoff
-        let attack = SquadKiteView { centroid, threats: &threats, towers: &[], focus: None, focus_damage: None, params: attack_params, fragile_hits: 0, squad_heal: 0, weapon_range: 3 };
+        let attack = SquadKiteView { centroid, threats: &threats, towers: &[], allies: &[], focus: None, focus_damage: None, params: attack_params, fragile_hits: 0, squad_heal: 0, weapon_range: 3 };
 
         let kite_score = score_tile(&kite, tile, 8, &fields);
         let attack_score = score_tile(&attack, tile, 8, &fields);
@@ -902,7 +1013,7 @@ mod tests {
         let mut cb = |_r| Some(LocalCostMatrix::new());
         let centroid = pos(25, 25);
         let threat = KiteThreat { pos: pos(25, 25), kind: ThreatKind::Ranged, reach: 0, step_ticks: Some(1), attack_power: 0, ranged_power: 100 };
-        let v = SquadKiteView { centroid, threats: &[threat], towers: &[], focus: None, focus_damage: None, params: KiteScoreParams::default(), fragile_hits: 200, squad_heal: 0, weapon_range: 3 };
+        let v = SquadKiteView { centroid, threats: &[threat], towers: &[], allies: &[], focus: None, focus_damage: None, params: KiteScoreParams::default(), fragile_hits: 200, squad_heal: 0, weapon_range: 3 };
         let plan = plan_kite_anchor(&v, None, &mut cb, MAX_KITE_OPS).expect("a non-lethal tile exists");
         assert!(plan.goal.get_range_to(pos(25, 25)) > 3, "fled outside the lethal ranged zone: {:?}", plan.goal);
     }
