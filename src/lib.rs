@@ -37,6 +37,9 @@ pub mod kite;
 /// Pure spawn-body construction (`SpawnBodyDefinition` + `create_body`) — shared with the bot so the
 /// sim/eval can build the bot's real bodies without depending on the whole bot.
 pub mod spawning;
+/// The canonical tower damage/heal/repair falloff curves — re-exported from the engine (single
+/// source of truth) so the bot reaches them through this crate, not a duplicate.
+pub mod damage;
 /// Pure combat-body construction + sizing primitives (`CombatBodySpec`, `build_combat_body`,
 /// `defender_heal_parts_for_dps`) — the force-sizing solver's body layer.
 pub mod bodies;

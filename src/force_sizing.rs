@@ -16,8 +16,8 @@
 //! unwinnable and deferred to the multi-squad **G4-HEAVY** path, not committed.
 
 use crate::bodies::{defender_heal_parts_for_dps, CombatBodySpec};
+use crate::damage::tower_attack_damage_at_range;
 use screeps_combat_engine::constants::{DISMANTLE_POWER, TOWER_ENERGY_COST};
-use screeps_combat_engine::damage::tower_attack_damage_at_range;
 
 /// HOLD margin (ADR 0020 §12.5/§12.6): size heal to out-heal the incoming damage by this factor, NOT
 /// break-even — so the squad HEALS THROUGH transient / approach / focused damage instead of tripping the
