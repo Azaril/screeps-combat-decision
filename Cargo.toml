@@ -26,3 +26,6 @@ screeps-rover = { git = "https://github.com/Azaril/screeps-rover" }
 # is a pure leaf crate (value types only), so this adds no cycle (rover/engine never depend on this).
 # Git dep (root [patch] -> local working tree in-workspace), like all sibling combat-crate deps.
 screeps-combat-engine = { git = "https://github.com/Azaril/screeps-combat-engine" }
+# Force-sizing's persisted body spec (`bodies::CombatBodySpec`, `composition::*`) is Serialize/
+# Deserialize: these ride in the bot's serialized squad state. Pure + wasm-compatible (derive only).
+serde = { version = "1.0", features = ["derive"] }

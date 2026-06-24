@@ -37,6 +37,11 @@ pub mod kite;
 /// Pure spawn-body construction (`SpawnBodyDefinition` + `create_body`) — shared with the bot so the
 /// sim/eval can build the bot's real bodies without depending on the whole bot.
 pub mod spawning;
+/// Pure combat-body construction + sizing primitives (`CombatBodySpec`, `build_combat_body`,
+/// `defender_heal_parts_for_dps`) — the force-sizing solver's body layer.
+pub mod bodies;
+/// The force-sizing oracle (`assess`, `RequiredForce`) — whether/how/how-much to commit a squad.
+pub mod force_sizing;
 
 use screeps::local::LocalCostMatrix;
 use screeps::{Direction, Part, Position, RawObjectId, RoomCoordinate, RoomName, RoomXY, StructureType};
