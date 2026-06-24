@@ -1448,50 +1448,67 @@ pub fn decide_squad_with_pathing(
         };
     }
 
-    // ── HEALER positioning (ADR 0019 §8) ──
-    // A pure-support healer in an engaged, non-kiting squad picks its OWN tile by heal-coverage vs
-    // danger (the healer preset over per-ally need + the shared threat field + the survival veto) rather
-    // than following the block goal — so it hugs the at-risk allies it can heal instead of lagging until
-    // it takes fire. Routed per-member (`member_goals`); only the anchorless `decide_movement` path
-    // consumes it (a siege formation keeps healers-back slots), so this targets the SK/skirmish duo the
-    // operator reported. Skipped while kiting/retreating (the healer flees with the block) and while
-    // traveling (no engagement yet). Same scored search + shared layers live and in the sim (no fork).
+    // ── Per-member layout: single-pass emergent formation (folds in ADR 0019 §8 healer positioning) ──
+    // In an engaged, non-kiting squad, assign each living member its OWN distinct tile from ONE scored
+    // flood ([`kite::plan_squad_layout`]) instead of sending the whole block onto one goal at range 0 —
+    // the pile-up that made members contend/shove and wobbled the centroid into a positioning
+    // oscillation. The role ring emerges from each member's own preset (melee→range 1, ranged→r*,
+    // healer→heal-coverage), an incumbency dead-band damps the tick-to-tick flip, and a bounded spacing
+    // term spreads the block without breaking cohesion. Routed via `member_goals` (the per-member channel
+    // the live SquadManager + the sim already consume); a member with no assigned tile falls back to the
+    // block's `decision.movement` (set above). The §8 healer search is one role in this single pass — no
+    // separate healers-only block. Kite/retreat keep the single shared goal (a fleeing block converges).
+    // Same search + shared `PositionLayers` live and in the sim (no fork).
     if matches!(decision.state, SquadOrderState::Engaged) && !should_kite {
         let threats = kite_threats(view.hostiles);
         let towers = kite_towers(view.structures);
-        let mut goals: Vec<Option<Position>> = vec![None; view.members.len()];
-        let mut any = false;
+        // Fighter preset (Hold zeroes the press-the-kill gradient, as in the engage branch); healers use
+        // their own preset inside plan_squad_layout.
+        let mut engage_params = tactics.engage;
+        if view.engage_objective == EngageObjective::Hold {
+            engage_params.w_close = 0.0;
+        }
+        let focus_damage = decision.focus.and_then(|f| f.id.map(|_| focus_damage_inputs(view, f.pos)));
+        let mut specs: Vec<kite::MemberLayoutSpec> = Vec::new();
         for (i, m) in view.members.iter().enumerate() {
-            // Pure support: heals but cannot fight (a creep that also fights stays in the block's
-            // formation/engage). Must have synced its position.
+            if m.hits == 0 {
+                continue; // dead → no creep to place
+            }
+            let Some(pos) = m.pos else { continue }; // unsynced position → follows the block
             let is_pure_healer = m.heal_power > 0 && m.melee_power == 0 && !m.has_ranged;
-            if !is_pure_healer || m.hits == 0 || m.pos.is_none() {
-                continue;
-            }
-            let (fragile_hits, self_heal) = (m.hits, m.heal_power);
-            let allies = ally_needs(view, i, &threats, &towers);
-            if allies.is_empty() {
-                continue;
-            }
-            let healer_view = kite::SquadKiteView {
+            let (role, allies) = if is_pure_healer {
+                let a = ally_needs(view, i, &threats, &towers);
+                if a.is_empty() {
+                    continue; // a lone healer with no one to cover follows the block
+                }
+                (kite::LayoutRole::Healer, a)
+            } else if m.has_ranged {
+                (kite::LayoutRole::Ranged, Vec::new())
+            } else {
+                (kite::LayoutRole::Melee, Vec::new())
+            };
+            let weapon_range = if m.has_ranged { 3 } else { 1 };
+            specs.push(kite::MemberLayoutSpec { idx: i, pos, hits: m.hits, weapon_range, role, allies });
+        }
+        if !specs.is_empty() {
+            let layout_view = kite::SquadKiteView {
                 centroid,
                 threats: &threats,
                 towers: &towers,
-                allies: &allies,
-                focus: None,
-                focus_damage: None,
-                params: tactics.healer,
-                fragile_hits,    // the healer's own survivability drives its safety term + the veto
-                squad_heal: self_heal, // self-sustain (same unit the block's squad_heal uses)
-                weapon_range: 1,
+                allies: &[], // per-member allies live on each Healer spec
+                focus: decision.focus.map(|f| f.pos),
+                focus_damage,
+                params: engage_params,
+                fragile_hits, // shared-frame placeholders; plan_squad_layout overrides per member
+                squad_heal,
+                weapon_range,
             };
-            if let Some(plan) = kite::plan_kite_anchor(&healer_view, shared, room_callback, max_ops) {
-                goals[i] = Some(plan.goal);
-                any = true;
+            let goals_layout = kite::plan_squad_layout(&layout_view, &specs, tactics.healer, shared, room_callback, max_ops);
+            let mut member_goals: Vec<Option<Position>> = vec![None; view.members.len()];
+            for (k, spec) in specs.iter().enumerate() {
+                member_goals[spec.idx] = goals_layout[k];
             }
-        }
-        if any {
-            decision.member_goals = goals;
+            decision.member_goals = member_goals;
         }
     }
 

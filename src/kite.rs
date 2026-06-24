@@ -721,6 +721,191 @@ pub fn plan_kite_anchor(
     result.path.last().copied().map(|goal| KitePlan { goal })
 }
 
+// ── Single-pass squad layout (emergent per-member formation, not a rigid template) ────────────────
+//
+// The pile-up fix: instead of one scored goal that EVERY member targets at range 0 (→ contention →
+// centroid wobble → oscillation), run the SAME one bounded flood ONCE, then assign each member its OWN
+// distinct tile from that flood. The role-appropriate ring (melee→range 1, ranged→r*, healer→heal
+// coverage) EMERGES from `score_tile` itself — each member is re-priced with its own preset / weapon
+// range / allies — so it is not a hardcoded offset template. Determinism + an incumbency dead-band
+// (don't abandon a good current tile) + a bounded spacing penalty (spread, but never past cohesion) are
+// the stability guards. Members path to their assigned tile via their own move request (no path here).
+
+/// A member's role for layout assignment — decides priority order (who claims the scarce inner tiles
+/// first) and which scoring preset re-prices its tiles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LayoutRole {
+    /// Melee fighter — wants the range-1 ring (claims the contested inner tiles first).
+    Melee,
+    /// Ranged fighter — holds the `r*` ring.
+    Ranged,
+    /// Pure-support healer — wants maximal heal-coverage of at-risk allies (ADR 0019 §8), back-line.
+    Healer,
+}
+
+impl LayoutRole {
+    /// Assignment priority (lower goes first): melee needs the scarce range-1 tiles most, then ranged,
+    /// then healers settle around the placed block.
+    fn order(self) -> u8 {
+        match self {
+            LayoutRole::Melee => 0,
+            LayoutRole::Ranged => 1,
+            LayoutRole::Healer => 2,
+        }
+    }
+}
+
+/// One member to place in [`plan_squad_layout`]. `idx` is where the result is written back; `pos` is the
+/// member's CURRENT tile (the incumbency anchor); `hits` is its own survivability (safety term + veto +
+/// priority tie-break); `allies` is the §8 heal-coverage need list (healers only, empty otherwise).
+#[derive(Clone, Debug)]
+pub struct MemberLayoutSpec {
+    pub idx: usize,
+    pub pos: Position,
+    pub hits: u32,
+    pub weapon_range: u32,
+    pub role: LayoutRole,
+    pub allies: Vec<AllyNeed>,
+}
+
+/// Spacing-penalty reach (tiles): a candidate within this Chebyshev distance of an already-claimed tile
+/// is penalized so the block SPREADS to distinct tiles. Bounded small so it never fights cohesion.
+pub const LAYOUT_SPACING_R: u32 = 1;
+/// Spacing-penalty magnitude (cost units, normalized like a `score_tile` term). Seed; tuned by EXP-*.
+/// Kept below the cohesion steepening (×3/tile past K) so spreading never pulls a member off the block.
+pub const LAYOUT_SPACING_W: i64 = 80;
+/// Incumbency dead-band reach (tiles): a candidate within this of the member's CURRENT tile gets the
+/// stay-put bonus.
+pub const LAYOUT_DEAD_BAND_R: u32 = 1;
+/// Incumbency dead-band magnitude (cost units): a member keeps (or stays adjacent to) its current tile
+/// unless a candidate beats it by more than this — the anti-oscillation hysteresis. Seed; tuned by EXP-*.
+pub const LAYOUT_DEAD_BAND: i64 = 40;
+
+/// Bounded spacing penalty for `tile` given already-`claimed` tiles: `LAYOUT_SPACING_W` scaled down to 0
+/// at `LAYOUT_SPACING_R+1`, taking the WORST (closest) claimed tile — so it is hard-capped at
+/// `LAYOUT_SPACING_W` and vanishes beyond `LAYOUT_SPACING_R` (can't scatter the block).
+fn spacing_penalty(tile: Position, claimed: &[Position]) -> i64 {
+    let mut worst = 0i64;
+    for &c in claimed {
+        let r = tile.get_range_to(c);
+        if r <= LAYOUT_SPACING_R {
+            let p = LAYOUT_SPACING_W * (LAYOUT_SPACING_R + 1 - r) as i64 / (LAYOUT_SPACING_R + 1) as i64;
+            worst = worst.max(p);
+        }
+    }
+    worst
+}
+
+/// Incumbency bonus (a cost SUBTRACTION) keyed on the member's current tile: full `LAYOUT_DEAD_BAND` on
+/// the tile itself, scaled to 0 at `LAYOUT_DEAD_BAND_R+1` — the hysteresis that kills the tick-to-tick
+/// goal flip even though the layout is recomputed every tick.
+fn incumbency_bonus(tile: Position, incumbent: Position) -> i64 {
+    let r = tile.get_range_to(incumbent);
+    if r <= LAYOUT_DEAD_BAND_R {
+        LAYOUT_DEAD_BAND * (LAYOUT_DEAD_BAND_R + 1 - r) as i64 / (LAYOUT_DEAD_BAND_R + 1) as i64
+    } else {
+        0
+    }
+}
+
+/// Plan DISTINCT per-member tiles in ONE pass (the emergent-formation layout). Runs the SAME single
+/// bounded flood as [`plan_kite_anchor`] (via [`LocalPathfinder::search_scored_set`]) to enumerate the
+/// reachable neighbourhood + each tile's cohesion distance `g`, then greedily assigns members (melee →
+/// ranged → healer; ties by fragility then idx) to the tile minimizing their OWN re-priced cost:
+/// `score_tile(member preset) + spacing − incumbency`, with the survival veto applied per member. Role
+/// rings emerge from each member's preset/weapon-range/allies — no fixed offsets. Returns goals aligned
+/// to `members` (`goals[i]` for `members[i]`); `None` ⇒ that member holds / follows the block.
+///
+/// `view` carries the shared frame (centroid, threats, towers, focus, focus_damage, squad_heal) and the
+/// FIGHTER preset in `view.params`; `healer_params` is the §8 healer preset for `Healer` members. One
+/// flood + `O(members × settled)` cheap arithmetic — essentially the current single-goal cost, and ~1/N
+/// of N independent searches.
+pub fn plan_squad_layout(
+    view: &SquadKiteView,
+    members: &[MemberLayoutSpec],
+    healer_params: KiteScoreParams,
+    shared: Option<&PositionLayers>,
+    room_callback: &mut dyn FnMut(RoomName) -> Option<LocalCostMatrix>,
+    max_ops: u32,
+) -> Vec<Option<Position>> {
+    let mut goals: Vec<Option<Position>> = vec![None; members.len()];
+    if members.is_empty() {
+        return goals;
+    }
+    let room = view.centroid.room_name();
+    let matrix = match room_callback(room) {
+        Some(m) => m,
+        None => return goals,
+    };
+    let owned;
+    let layers = match shared {
+        Some(l) => l,
+        None => {
+            owned = PositionLayers::build(view.threats, view.towers, room, &matrix, max_ops);
+            &owned
+        }
+    };
+    let threat_field = layers.threat_field();
+    let threat_reach = layers.threat_reach();
+    // ONE flood. The settled SET is determined by path-cost `g` (Dijkstra order) + max_ops, independent
+    // of the score, so flood by `g` and re-price per member below; we only read each tile's pos + g.
+    let mut cb = |_r: RoomName| Some(matrix.clone());
+    let set = LocalPathfinder.search_scored_set(view.centroid, &mut cb, max_ops, 1, &|_p, g| g as i64);
+    if set.is_empty() {
+        return goals;
+    }
+
+    // Deterministic claim order: melee first (scarce inner ring), then ranged, then healers; ties by
+    // ascending fragility then stable idx.
+    let mut order: Vec<usize> = (0..members.len()).collect();
+    order.sort_by_key(|&i| (members[i].role.order(), members[i].hits, members[i].idx));
+
+    let mut claimed: Vec<Position> = Vec::with_capacity(members.len());
+    for &mi in &order {
+        let m = &members[mi];
+        let (params, allies, focus, weapon_range): (KiteScoreParams, &[AllyNeed], Option<Position>, u32) = match m.role {
+            LayoutRole::Healer => (healer_params, m.allies.as_slice(), None, 1),
+            _ => (view.params, &[], view.focus, m.weapon_range),
+        };
+        let mview = SquadKiteView {
+            centroid: view.centroid,
+            threats: view.threats,
+            towers: view.towers,
+            allies,
+            focus,
+            focus_damage: view.focus_damage,
+            params,
+            fragile_hits: m.hits, // the member's OWN survivability drives its safety term + veto
+            squad_heal: view.squad_heal,
+            weapon_range,
+        };
+        let mut best: Option<(i64, u32, u8, u8, Position)> = None; // (cost, g, x, y) deterministic key
+        for t in &set {
+            let fields = KiteFields { threat_field: Some(threat_field), threat_reach, cohesion_dist: Some(t.g) };
+            let mut cost = score_tile(&mview, t.pos, walkable_neighbors(&matrix, t.pos), &fields);
+            // Survival veto for THIS member (its own hits) — never assign it a lethal tile.
+            let net = (threat_field.raw_at(t.pos) - view.squad_heal as i32).max(0);
+            if m.hits > 0 && net > 0 && net * SURVIVAL_HORIZON > m.hits as i32 {
+                cost = cost.saturating_add(LETHAL_TILE_PENALTY);
+            }
+            cost = cost.saturating_add(spacing_penalty(t.pos, &claimed)).saturating_sub(incumbency_bonus(t.pos, m.pos));
+            let key = (cost, t.g, t.pos.x().u8(), t.pos.y().u8());
+            let better = match best {
+                None => true,
+                Some((bc, bg, bx, by, _)) => key < (bc, bg, bx, by),
+            };
+            if better {
+                best = Some((cost, t.g, t.pos.x().u8(), t.pos.y().u8(), t.pos));
+            }
+        }
+        if let Some((.., pos)) = best {
+            goals[mi] = Some(pos);
+            claimed.push(pos);
+        }
+    }
+    goals
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1070,5 +1255,86 @@ mod tests {
         // No threats/towers/focus → the centroid (cohesion 0) is the global min → hold (no goal).
         let v = view(pos(25, 25), &[], &[], None);
         assert!(plan_kite_anchor(&v, None, &mut cb, MAX_KITE_OPS).is_none(), "nothing to flee → hold");
+    }
+
+    // ── plan_squad_layout (single-pass emergent formation) ──────────────
+    fn engage_view_for_layout<'a>(centroid: Position, focus: Position) -> SquadKiteView<'a> {
+        SquadKiteView {
+            centroid,
+            threats: &[],
+            towers: &[],
+            allies: &[],
+            focus: Some(focus),
+            focus_damage: Some(FocusDamage { melee_power: 90, ranged_power: 60, focus_hits: 100_000, focus_heal: 0 }),
+            params: KiteScoreParams::engage(),
+            fragile_hits: 2000,
+            squad_heal: 0,
+            weapon_range: 3,
+        }
+    }
+    fn spec(idx: usize, x: u8, y: u8, role: LayoutRole, weapon_range: u32) -> MemberLayoutSpec {
+        MemberLayoutSpec { idx, pos: pos(x, y), hits: 2000, weapon_range, role, allies: Vec::new() }
+    }
+
+    #[test]
+    fn layout_assigns_distinct_tiles_to_every_member() {
+        let mut cb = |_r| Some(LocalCostMatrix::new());
+        let focus = pos(25, 30);
+        let v = engage_view_for_layout(pos(25, 25), focus);
+        let members = vec![
+            spec(0, 25, 25, LayoutRole::Ranged, 3),
+            spec(1, 24, 25, LayoutRole::Ranged, 3),
+            spec(2, 26, 25, LayoutRole::Ranged, 3),
+            spec(3, 25, 24, LayoutRole::Ranged, 3),
+        ];
+        let goals = plan_squad_layout(&v, &members, KiteScoreParams::healer(), None, &mut cb, MAX_KITE_OPS);
+        let placed: Vec<Position> = goals.iter().flatten().copied().collect();
+        assert_eq!(placed.len(), 4, "every member got a goal");
+        let unique: std::collections::HashSet<_> = placed.iter().map(|p| (p.x().u8(), p.y().u8())).collect();
+        assert_eq!(unique.len(), 4, "all four goals are DISTINCT tiles (no pile-up): {:?}", placed);
+    }
+
+    #[test]
+    fn layout_is_deterministic() {
+        let mut cb = |_r| Some(LocalCostMatrix::new());
+        let v = engage_view_for_layout(pos(25, 25), pos(30, 25));
+        let members = vec![
+            spec(0, 25, 25, LayoutRole::Melee, 1),
+            spec(1, 24, 25, LayoutRole::Ranged, 3),
+            spec(2, 26, 25, LayoutRole::Ranged, 3),
+        ];
+        let a = plan_squad_layout(&v, &members, KiteScoreParams::healer(), None, &mut cb, MAX_KITE_OPS);
+        let b = plan_squad_layout(&v, &members, KiteScoreParams::healer(), None, &mut cb, MAX_KITE_OPS);
+        assert_eq!(a, b, "same inputs → identical assignment");
+    }
+
+    #[test]
+    fn layout_puts_melee_at_its_weapon_range() {
+        // A melee member's assigned tile is at range 1 of the focus — its r*=1 ring emerges from the
+        // member's own weapon range driving score_tile (prox/dmg pull to range 1), not a fixed template.
+        let mut cb = |_r| Some(LocalCostMatrix::new());
+        let focus = pos(25, 32);
+        let v = engage_view_for_layout(pos(25, 25), focus);
+        let members = vec![spec(0, 25, 25, LayoutRole::Melee, 1)];
+        let goals = plan_squad_layout(&v, &members, KiteScoreParams::healer(), None, &mut cb, MAX_KITE_OPS);
+        let melee = goals[0].expect("melee placed");
+        assert_eq!(melee.get_range_to(focus), 1, "melee closes to its range-1 ring: {:?}", melee);
+    }
+
+    #[test]
+    fn layout_incumbency_breaks_ties_toward_the_current_tile() {
+        // Among equally-good tiles (same cohesion + same in-range damage), the dead-band keeps the member
+        // on its OWN tile instead of flipping to the deterministic-tiebreak winner — the anti-oscillation
+        // guard. Member sits at (25,29) (range 1 of the focus, on the near side); (24,29)/(26,29) are
+        // equally good (same cohesion + range 1) and (24,29) would win the lower-x tiebreak WITHOUT
+        // incumbency, so choosing (25,29) proves the dead-band fired.
+        let mut cb = |_r| Some(LocalCostMatrix::new());
+        let focus = pos(25, 30);
+        let v = engage_view_for_layout(pos(25, 25), focus);
+        let members = vec![spec(0, 25, 29, LayoutRole::Ranged, 3)];
+        let goals = plan_squad_layout(&v, &members, KiteScoreParams::healer(), None, &mut cb, MAX_KITE_OPS);
+        let g = goals[0].expect("placed");
+        assert_eq!(g.get_range_to(focus), 1, "engaged at range 1 (press the kill): {:?}", g);
+        assert_eq!(g, pos(25, 29), "incumbency holds the current tile over the equal lower-x tiebreak: {:?}", g);
     }
 }
