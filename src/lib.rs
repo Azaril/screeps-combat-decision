@@ -407,7 +407,10 @@ fn attack_with_orders(view: &CombatView, orders: &CreepOrders, out: &mut Vec<Com
     // The resolved focus *creep* (the live `resolve_creep()` — `None` for structure targets).
     let focus = orders.focus;
 
-    // Pipeline A: melee — prefer the focus if adjacent, else the lowest-hits adjacent hostile.
+    // Pipeline A: melee — prefer the focus if adjacent, else the lowest-hits adjacent hostile, else an
+    // adjacent hostile STRUCTURE (siege/breach). Without the structure fallback a squad melee creep sat
+    // idle against a structure objective once no hostile creeps remained — the ranged pipeline below and
+    // the solo `fallback_attack` already attack structures; this brings the squad melee path to parity.
     if me.has_working(Part::Attack) {
         let target = match focus {
             Some(f) if me.pos.get_range_to(f.pos) <= 1 => Some(f),
@@ -415,6 +418,8 @@ fn attack_with_orders(view: &CombatView, orders: &CreepOrders, out: &mut Vec<Com
         };
         if let Some(t) = target {
             out.push(CombatIntent::Attack { target: t.pos, id: t.id });
+        } else if let Some(s) = best_hostile_structure_within(view, 1) {
+            out.push(CombatIntent::Attack { target: s.pos, id: None });
         }
     }
 
@@ -1775,6 +1780,27 @@ mod tests {
                 CombatIntent::Attack { target: pos(26, 25), id: focus.id },
                 CombatIntent::RangedAttack { target: pos(26, 25), id: focus.id },
             ]
+        );
+    }
+
+    #[test]
+    fn melee_with_orders_attacks_an_adjacent_structure_when_no_creep_target() {
+        // A squad melee creep (orders present) with NO hostile creeps but an adjacent hostile structure
+        // must attack the structure. Previously the with-orders melee pipeline only targeted creeps, so
+        // a squad melee creep sat idle against a structure objective once no creeps remained
+        // (operator-flagged: "melee doesn't attack structures despite no other threats"). Mirrors the
+        // ranged pipeline's structure fallback + the solo `fallback_attack` path.
+        let s = Scene {
+            squad: squad(),
+            friends: vec![],
+            hostiles: vec![],
+            structures: vec![structure(26, 25, StructureType::Spawn, Ownership::Hostile)],
+        };
+        let me = creep(1, 25, 25, 600, &[(Part::Attack, 6)]);
+        let orders = Some(CreepOrders { focus: None, heal_target: None });
+        assert_eq!(
+            decide_combat(&s.view(&me, orders)),
+            vec![CombatIntent::Attack { target: pos(26, 25), id: None }]
         );
     }
 
