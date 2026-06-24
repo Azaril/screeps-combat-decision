@@ -45,6 +45,10 @@ pub mod damage;
 pub mod bodies;
 /// The force-sizing oracle (`assess`, `RequiredForce`) — whether/how/how-much to commit a squad.
 pub mod force_sizing;
+/// Squad composition + role model (`SquadRole`, `BodyType`, `SquadComposition`, `sized_for`) — the
+/// data-driven squad blueprint + force-driven sizing, shared so the sim/eval field the bot's real
+/// composition.
+pub mod composition;
 
 use screeps::local::LocalCostMatrix;
 use screeps::{Direction, Part, Position, RawObjectId, RoomCoordinate, RoomName, RoomXY, StructureType};
