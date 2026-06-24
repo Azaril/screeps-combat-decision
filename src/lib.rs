@@ -798,6 +798,25 @@ pub struct SquadView<'a> {
     /// combat there is nullified (engine per-intent guard, e.g. `attack.js:30-32`). A hard engage veto
     /// (ADR 0020 §8 / the Lanchester gate): never commit to a fight we can deal zero damage in.
     pub enemy_safe_mode: bool,
+    /// What the squad is trying to DO to the enemy creeps — `Destroy` (close + finish; the offensive
+    /// default) vs `Hold` (pin/harass at standoff). Drives the "press the kill" close gradient + the
+    /// stalemate disengage: a `Destroy` squad closes to finish a winnable fight and disengages a stalled
+    /// one (don't waste lifetime); a `Hold` squad keeps the standoff (pinning IS the goal).
+    pub engage_objective: EngageObjective,
+    /// The squad has made no headway on the enemy for a while (the owner tracks "no killable-enemy HP
+    /// lost for N ticks"). With `Destroy` intent + a non-winning balance this flips the squad to
+    /// `Retreating` so it doesn't burn `CREEP_LIFE_TIME` on an un-closable standoff. Ignored under `Hold`.
+    pub enemy_stalled: bool,
+}
+
+/// What a squad intends toward the enemy creeps (drives close-to-finish vs hold-the-standoff).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EngageObjective {
+    /// Close in and DESTROY the enemy creeps (the offensive default).
+    #[default]
+    Destroy,
+    /// HOLD/pin/harass at weapon standoff — a deliberate stalemate (don't close, don't disengage).
+    Hold,
 }
 
 /// The squad-level decision: the new combat state, the shared focus the members concentrate fire on
@@ -960,7 +979,14 @@ pub fn decide_squad(view: &SquadView) -> SquadDecision {
     let any_critical = view.members.iter().any(|m| m.hits_max > 0 && (m.hits as f32 / m.hits_max as f32) < 0.25);
     let re_engage_band = (view.retreat_threshold + 0.3).min(0.95);
 
-    let retreat_now = assess.unwinnable || assess.balance <= -ENGAGE_BALANCE_BAND || any_critical || avg < view.retreat_threshold;
+    // Stalemate disengage (the kiting-stalemate safety valve): a Destroy-intent squad making no headway
+    // (enemy_stalled) on a fight it isn't clearly winning (balance below the engage band) is in an
+    // un-closable standoff — pull out rather than burn `CREEP_LIFE_TIME`. A Hold-intent squad WANTS the
+    // standoff (pinning), so it's exempt; a clearly-winning squad keeps pressing (the close gradient finishes it).
+    let stalemate_disengage =
+        view.engage_objective == EngageObjective::Destroy && view.enemy_stalled && assess.balance < ENGAGE_BALANCE_BAND;
+    let retreat_now =
+        assess.unwinnable || assess.balance <= -ENGAGE_BALANCE_BAND || any_critical || avg < view.retreat_threshold || stalemate_disengage;
     let can_reengage = !assess.unwinnable && !any_critical && avg > re_engage_band && assess.balance >= ENGAGE_BALANCE_BAND;
     let state = match view.current_state {
         SquadOrderState::Retreating => {
@@ -1396,6 +1422,12 @@ pub fn decide_squad_with_pathing(
         // range of it) — so the engage reward rewards tiles by net hits actually landed, pulls a melee
         // block to range 1, and shrinks to 0 against an out-healed target (→ safety repositions it).
         let focus_damage = decision.focus.and_then(|f| f.id.map(|_| focus_damage_inputs(view, f.pos)));
+        // Press-the-kill (close to finish) only under Destroy intent; a Hold squad keeps the standoff
+        // (the deliberate pin), so zero the close gradient for it.
+        let mut engage_params = tactics.engage;
+        if view.engage_objective == EngageObjective::Hold {
+            engage_params.w_close = 0.0;
+        }
         let engage_view = kite::SquadKiteView {
             centroid,
             threats: &threats,
@@ -1403,7 +1435,7 @@ pub fn decide_squad_with_pathing(
             allies: &[], // heal-coverage is a healer-only objective (§8); irrelevant to the block engage
             focus: decision.focus.map(|f| f.pos),
             focus_damage,
-            params: tactics.engage,
+            params: engage_params,
             fragile_hits,
             squad_heal,
             weapon_range,
@@ -1933,7 +1965,7 @@ mod tests {
         hostiles: &'a [CombatCreepDto],
         current_state: SquadOrderState,
     ) -> SquadView<'a> {
-        SquadView { members, hostiles, structures: &[], retreat_threshold: 0.3, current_state, enemy_safe_mode: false }
+        SquadView { members, hostiles, structures: &[], retreat_threshold: 0.3, current_state, enemy_safe_mode: false, engage_objective: EngageObjective::Destroy, enemy_stalled: false }
     }
 
     #[test]
@@ -1996,7 +2028,7 @@ mod tests {
             structure(26, 25, StructureType::Spawn, Ownership::Hostile),
         ];
         let mk = |members: &[SquadMemberView], st| {
-            decide_squad(&SquadView { members, hostiles: &[], structures: &base, retreat_threshold: 0.3, current_state: st, enemy_safe_mode: false }).state
+            decide_squad(&SquadView { members, hostiles: &[], structures: &base, retreat_threshold: 0.3, current_state: st, enemy_safe_mode: false, engage_objective: EngageObjective::Destroy, enemy_stalled: false }).state
         };
         // 14 HEAL ×12 = 168 > 150 tower → sustained, no loss → siege the base.
         assert_eq!(mk(&[tank, healer(14)], SquadOrderState::Engaged), SquadOrderState::Engaged, "out-heal the towers → dismantle, don't retreat");
@@ -2022,7 +2054,7 @@ mod tests {
             ]
         };
         let state = |members: &[SquadMemberView]| {
-            decide_squad(&SquadView { members, hostiles: &[], structures: &base, retreat_threshold: 0.3, current_state: SquadOrderState::Engaged, enemy_safe_mode: false }).state
+            decide_squad(&SquadView { members, hostiles: &[], structures: &base, retreat_threshold: 0.3, current_state: SquadOrderState::Engaged, enemy_safe_mode: false, engage_objective: EngageObjective::Destroy, enemy_stalled: false }).state
         };
         // Sized to out-heal with margin (17 HEAL ×12 = 204 ≥ 150 × 1.3 = 195): holds at full HP …
         assert_eq!(state(&squad(2000, 17)), SquadOrderState::Engaged, "margin-sized squad holds at full HP");
@@ -2040,7 +2072,7 @@ mod tests {
         // never engage (ADR 0020 §8 engage-veto).
         let members = vec![ranged_member_at(700, 700, 25, 25)];
         let hostiles = vec![creep(1, 26, 25, 100, &[(Part::Attack, 1)])];
-        let view = SquadView { members: &members, hostiles: &hostiles, structures: &[], retreat_threshold: 0.3, current_state: SquadOrderState::Engaged, enemy_safe_mode: true };
+        let view = SquadView { members: &members, hostiles: &hostiles, structures: &[], retreat_threshold: 0.3, current_state: SquadOrderState::Engaged, enemy_safe_mode: true, engage_objective: EngageObjective::Destroy, enemy_stalled: false };
         assert_eq!(decide_squad(&view).state, SquadOrderState::Retreating, "safe mode nullifies our combat → never engage");
     }
 
@@ -2057,6 +2089,8 @@ mod tests {
             retreat_threshold: 0.3,
             current_state: SquadOrderState::Moving,
             enemy_safe_mode: false,
+            engage_objective: EngageObjective::Destroy,
+            enemy_stalled: false,
         };
         let d = decide_squad(&view);
         assert_eq!(d.state, SquadOrderState::Engaged);
@@ -2166,6 +2200,8 @@ mod tests {
             retreat_threshold: 0.3,
             current_state: SquadOrderState::Moving,
             enemy_safe_mode: false,
+            engage_objective: EngageObjective::Destroy,
+            enemy_stalled: false,
         };
 
         let d = decide_squad_with_pathing(&view, None, kite::SquadTacticParams::default(), &mut cb, kite::MAX_KITE_OPS);
@@ -2189,6 +2225,8 @@ mod tests {
             retreat_threshold: 0.3,
             current_state: SquadOrderState::Engaged,
             enemy_safe_mode: false,
+            engage_objective: EngageObjective::Destroy,
+            enemy_stalled: false,
         };
         let mut cb = |_r| Some(LocalCostMatrix::new());
         let d = decide_squad_with_pathing(&view, None, kite::SquadTacticParams::default(), &mut cb, kite::MAX_KITE_OPS);
@@ -2223,7 +2261,7 @@ mod tests {
         // arbitrary tie resolution).
         let members = vec![ranged_member_at(700, 700, 25, 25), ranged_member_at(700, 700, 26, 25)];
         let hostiles = vec![creep(9, 24, 25, 600, &[(Part::Attack, 6), (Part::Move, 6)])];
-        let view = SquadView { members: &members, hostiles: &hostiles, structures: &[], retreat_threshold: 0.3, current_state: SquadOrderState::Engaged, enemy_safe_mode: false };
+        let view = SquadView { members: &members, hostiles: &hostiles, structures: &[], retreat_threshold: 0.3, current_state: SquadOrderState::Engaged, enemy_safe_mode: false, engage_objective: EngageObjective::Destroy, enemy_stalled: false };
         let mut cb1 = |_r| Some(LocalCostMatrix::new());
         let mut cb2 = |_r| Some(LocalCostMatrix::new());
         let a = decide_squad_with_pathing(&view, None, kite::SquadTacticParams::default(), &mut cb1, kite::MAX_KITE_OPS);
@@ -2245,6 +2283,8 @@ mod tests {
             retreat_threshold: 0.3,
             current_state: SquadOrderState::Engaged,
             enemy_safe_mode: false,
+            engage_objective: EngageObjective::Destroy,
+            enemy_stalled: false,
         });
         // The healer (idx 1) is assigned to the wounded attacker (idx 0), adjacent → 12/part.
         assert_eq!(d.heal_assignments.len(), 1);
@@ -2258,10 +2298,10 @@ mod tests {
     fn assign_heals_empty_when_no_healers_or_no_wounded() {
         // No healers.
         let m1 = vec![ranged_member_at(100, 700, 25, 25)];
-        assert!(decide_squad(&SquadView { members: &m1, hostiles: &[], structures: &[], retreat_threshold: 0.3, current_state: SquadOrderState::Moving, enemy_safe_mode: false }).heal_assignments.is_empty());
+        assert!(decide_squad(&SquadView { members: &m1, hostiles: &[], structures: &[], retreat_threshold: 0.3, current_state: SquadOrderState::Moving, enemy_safe_mode: false, engage_objective: EngageObjective::Destroy, enemy_stalled: false }).heal_assignments.is_empty());
         // A healer but everyone full + no damage taken.
         let m2 = vec![ranged_member_at(700, 700, 25, 25), healer_at(600, 600, 5, 26, 25)];
-        assert!(decide_squad(&SquadView { members: &m2, hostiles: &[], structures: &[], retreat_threshold: 0.3, current_state: SquadOrderState::Moving, enemy_safe_mode: false }).heal_assignments.is_empty());
+        assert!(decide_squad(&SquadView { members: &m2, hostiles: &[], structures: &[], retreat_threshold: 0.3, current_state: SquadOrderState::Moving, enemy_safe_mode: false, engage_objective: EngageObjective::Destroy, enemy_stalled: false }).heal_assignments.is_empty());
     }
 
     #[test]
@@ -2274,6 +2314,8 @@ mod tests {
             retreat_threshold: 0.3,
             current_state: SquadOrderState::Moving,
             enemy_safe_mode: false,
+            engage_objective: EngageObjective::Destroy,
+            enemy_stalled: false,
         };
         let mut cb = |_r| Some(LocalCostMatrix::new());
         let d = decide_squad_with_pathing(&view, None, kite::SquadTacticParams::default(), &mut cb, kite::MAX_KITE_OPS);

@@ -150,6 +150,12 @@ pub struct KiteScoreParams {
     /// 0 (irrelevant to a fighter); the healer preset weights it dominant so a support healer picks the
     /// tile maximizing *potential future healing output*, balanced against danger by `w_taken`.
     pub w_heal: f32,
+    /// **Close-to-kill reward** (negative cost) — the "press the kill" gradient: among tiles already IN
+    /// the weapon band that deal damage, prefer the CLOSER one, so a committed (Destroy-intent) squad
+    /// advances to range 1 and finishes/pins the enemy instead of trading at max standoff (the kiting-
+    /// stalemate fix). 0 in kite/healer; engage weights it BELOW `w_taken` so the survival veto still
+    /// forbids a lethal close; the caller zeroes it for a Hold intent (preserve a deliberate pin).
+    pub w_close: f32,
     /// Cohesion radius K: beyond this distance from the centroid the penalty steepens (×3/tile).
     pub max_cohesion_radius: u32,
 }
@@ -168,6 +174,7 @@ impl Default for KiteScoreParams {
             w_edge: 0.4,
             w_dmg: 0.0,
             w_heal: 0.0,
+            w_close: 0.0,
             max_cohesion_radius: 2,
         }
     }
@@ -195,6 +202,9 @@ impl KiteScoreParams {
             w_edge: 0.1,
             w_dmg: 2.0,
             w_heal: 0.0,
+            // Press-the-kill: below `w_taken` (0.5) so safety still vetoes a lethal close, but enough to
+            // break the flat in-band DMG plateau toward range 1 when the fight is survivable.
+            w_close: 0.35,
             max_cohesion_radius: 2,
         }
     }
@@ -211,6 +221,7 @@ impl KiteScoreParams {
             w_taken: 1.5,
             w_future: 0.5,
             w_cohesion: 0.6,
+            w_close: 0.0,
             w_prox: 0.0,
             w_openness: 0.05,
             w_edge: 0.2,
@@ -577,6 +588,40 @@ pub fn score_tile(view: &SquadKiteView, tile: Position, walkable_neighbors: u8, 
         (sum / HEAL_COV_REF * SCALE_F).min(SCALE_F)
     };
 
+    // CLOSE-TO-KILL (reward, the "press the kill" gradient) — among tiles already IN the weapon band
+    // that deal NET damage, prefer the CLOSER one ((r* - r)/r*), so a committed squad advances to range
+    // 1 and finishes/pins instead of trading at max standoff (the kiting-stalemate fix). Only rewards
+    // tiles that deal net damage, so it never pulls onto an out-healed/unkillable focus; below `w_taken`
+    // so the survival veto still forbids a lethal close. 0 when `w_close == 0` (kite/healer/Hold).
+    let close = if p.w_close == 0.0 {
+        0.0
+    } else {
+        match view.focus {
+            Some(f) => {
+                let r = tile.get_range_to(f);
+                let dealing = match view.focus_damage {
+                    Some(fd) => {
+                        let dealt = if r <= 1 {
+                            fd.melee_power + fd.ranged_power
+                        } else if r <= r_star {
+                            fd.ranged_power
+                        } else {
+                            0
+                        };
+                        dealt.saturating_sub(fd.focus_heal) > 0
+                    }
+                    None => r <= r_star,
+                };
+                if dealing && (1..=r_star).contains(&r) {
+                    ((r_star - r) as f32 / r_star.max(1) as f32 * SCALE_F).min(SCALE_F)
+                } else {
+                    0.0
+                }
+            }
+            None => 0.0,
+        }
+    };
+
     (p.w_taken * safety
         + p.w_future * future
         + p.w_cohesion * cohesion
@@ -584,7 +629,8 @@ pub fn score_tile(view: &SquadKiteView, tile: Position, walkable_neighbors: u8, 
         + p.w_openness * openness
         + p.w_edge * edge
         - p.w_dmg * focus_dmg
-        - p.w_heal * heal_cov)
+        - p.w_heal * heal_cov
+        - p.w_close * close)
         .round() as i64
 }
 
