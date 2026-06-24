@@ -79,7 +79,9 @@ pub struct ForceAssessment {
     pub mode: AssaultMode,
     /// Heal/tick the fielded squad must sustain (the binding survival constraint of the chosen mode).
     pub required_heal_per_tick: f32,
-    /// Dismantle DPS (net of repair) the fielded squad must bring.
+    /// GROSS dismantle DPS the fielded squad must bring — it must out-pace the defensive repair AND
+    /// clear the core (NOT the net-of-repair breach rate; sizing to the net would let repair cancel it
+    /// twice and the squad would stall at the wall).
     pub required_dismantle_dps: f32,
     /// Estimated ticks to win (drain + breach + kill) — for ROI / the war supervisor.
     pub est_ticks: u32,
@@ -153,7 +155,13 @@ pub fn assess(profile: &DefenseProfile, budget: &ForceBudget) -> ForceAssessment
                 winnable: true,
                 mode: AssaultMode::Breach,
                 required_heal_per_tick: required_heal,
-                required_dismantle_dps: net_dismantle.max(1.0),
+                // GROSS dismantle the squad must FIELD — not the net-of-repair RATE. `breach_ticks` and
+                // `kill_ticks` above were computed assuming the squad brings the full
+                // `budget.max_dismantle_dps`; sizing to the net (`max − repair`) would have repair
+                // subtract a SECOND time at runtime, so the fielded squad delivers `net − repair` and
+                // stalls at the rampart. The squad must out-pace repair AND clear the core, so it fields
+                // the gross (`net + repair == max_dismantle_dps`).
+                required_dismantle_dps: budget.max_dismantle_dps.max(1.0),
                 est_ticks: total,
                 reason: "breach: out-heal the towers and dismantle through",
             };
@@ -176,7 +184,9 @@ pub fn assess(profile: &DefenseProfile, budget: &ForceBudget) -> ForceAssessment
                     winnable: true,
                     mode: AssaultMode::Drain,
                     required_heal_per_tick: required_heal,
-                    required_dismantle_dps: net_dismantle.max(1.0),
+                    // GROSS dismantle to field (see the Breach branch) — the squad must out-pace repair
+                    // through the breach and clear the core.
+                    required_dismantle_dps: budget.max_dismantle_dps.max(1.0),
                     est_ticks: total,
                     reason: "drain: soak the towers dry, then breach",
                 };
@@ -410,6 +420,24 @@ mod tests {
         let a = assess(&profile, &strong_budget());
         assert!(!a.winnable);
         assert!(a.reason.contains("too slow"), "reason: {}", a.reason);
+    }
+
+    #[test]
+    fn required_dismantle_is_gross_not_net_of_repair() {
+        // A repairing rampart: the fielded squad must out-pace repair, so the required dismantle is the
+        // GROSS the winnability was computed at (the budget's full dismantle), NOT the net-of-repair
+        // rate — else `sized_for` under-sizes WORK by `repair` and the squad stalls at the wall (the
+        // oracle bug the offline oracle-calibration tournament caught).
+        let profile = DefenseProfile { breach_hits: 50_000, objective_hits: 100_000, repair_per_tick: 200.0, ..Default::default() };
+        let a = assess(&profile, &strong_budget());
+        assert!(a.winnable, "600 gross out-paces 200 repair: {}", a.reason);
+        assert_eq!(a.required_dismantle_dps, 600.0, "field the GROSS dismantle, not the net-of-repair rate (200 less)");
+        let rf = RequiredForce::from_assessment(&a);
+        assert!(
+            rf.dismantle_parts as f32 * DISMANTLE_POWER as f32 - 200.0 > 0.0,
+            "the fielded WORK ({} parts) out-paces the 200 repair with breach rate to spare",
+            rf.dismantle_parts
+        );
     }
 
     #[test]
