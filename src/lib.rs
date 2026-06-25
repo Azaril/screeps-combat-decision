@@ -363,16 +363,31 @@ fn assign_focus_fire(members: &[SquadMemberView], hostiles: &[CombatCreepDto], s
 /// (when `view.orders` is `Some`) and `fallback_attack` + `fallback_heal` (when `None`). Intents
 /// are pushed in the live pipeline order — melee (A), then ranged (B), then heal — so the
 /// `IntentRecorder` digest matches. Movement is **not** emitted here (it rides P2.M2).
+/// A creep with both ATTACK and HEAL parts cannot do both this tick — the engine DROPS the melee attack
+/// when any heal is queued (`creeps/intents.js`; resolve.rs `filtered_actions`). So a melee creep is a
+/// FIGHTER first: if it emitted a melee `Attack` (on a creep OR a structure), suppress the heal that
+/// would veto it. Ranged attack + heal still compose (only MELEE attack conflicts), so this gates only
+/// on `CombatIntent::Attack`. Without it a melee+heal creep heals (a wounded ally / self) and never
+/// damages the structure objective it's adjacent to (operator-flagged: "melee+heal not attacking
+/// structures"). Pure healers (no ATTACK) are unaffected; the squad's dedicated healers do the healing.
+fn has_melee_attack(out: &[CombatIntent]) -> bool {
+    out.iter().any(|i| matches!(i, CombatIntent::Attack { .. }))
+}
+
 pub fn decide_combat(view: &CombatView) -> Vec<CombatIntent> {
     let mut out = Vec::new();
     match view.orders {
         Some(orders) => {
             attack_with_orders(view, &orders, &mut out);
-            heal_with_orders(view, &orders, &mut out);
+            if !has_melee_attack(&out) {
+                heal_with_orders(view, &orders, &mut out);
+            }
         }
         None => {
             fallback_attack(view, &mut out);
-            fallback_heal(view, &mut out);
+            if !has_melee_attack(&out) {
+                fallback_heal(view, &mut out);
+            }
         }
     }
     out
@@ -1801,6 +1816,29 @@ mod tests {
         assert_eq!(
             decide_combat(&s.view(&me, orders)),
             vec![CombatIntent::Attack { target: pos(26, 25), id: None }]
+        );
+    }
+
+    #[test]
+    fn melee_plus_heal_creep_attacks_the_structure_not_heals() {
+        // A creep with ATTACK + HEAL adjacent to a hostile structure, with a wounded adjacent ally: the
+        // engine drops a melee attack when a heal is queued, so emitting Heal would veto the structure
+        // attack. A melee creep is a fighter-first → it ATTACKS the structure; the heal is suppressed
+        // (operator-flagged: melee+heal creeps not attacking structures). Ranged+heal would still heal.
+        let wounded = creep(2, 25, 26, 50, &[(Part::Move, 3)]); // adjacent damaged ally
+        let s = Scene {
+            squad: squad(),
+            friends: vec![wounded.clone()],
+            hostiles: vec![],
+            structures: vec![structure(26, 25, StructureType::Spawn, Ownership::Hostile)],
+        };
+        let me = creep(1, 25, 25, 600, &[(Part::Attack, 4), (Part::Heal, 4)]);
+        let orders = Some(CreepOrders { focus: None, heal_target: Some(wounded.as_target()) });
+        let intents = decide_combat(&s.view(&me, orders));
+        assert_eq!(
+            intents,
+            vec![CombatIntent::Attack { target: pos(26, 25), id: None }],
+            "melee+heal attacks the structure; the vetoing heal is suppressed"
         );
     }
 
