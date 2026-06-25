@@ -265,7 +265,7 @@ fn hostile_rampart_tiles(structures: &[CombatStructureDto]) -> std::collections:
 ///   self-healer on the tile);
 /// - hostile **towers** (room-wide, range falloff ~400→100/tick each — `tower_heal_at_range`), which
 ///   can heal a defender same-tick and dominate the sustain in a turtle room.
-fn heal_reaching(hostiles: &[CombatCreepDto], structures: &[CombatStructureDto], pos: Position) -> u32 {
+pub(crate) fn heal_reaching(hostiles: &[CombatCreepDto], structures: &[CombatStructureDto], pos: Position) -> u32 {
     use screeps_combat_engine::constants::{HEAL_POWER, RANGED_HEAL_POWER};
     let creep_heal: u32 = hostiles
         .iter()
@@ -294,7 +294,7 @@ fn heal_reaching(hostiles: &[CombatCreepDto], structures: &[CombatStructureDto],
 
 /// Capability removed by killing `c`: its attack + ranged + heal output (denying sustain counts —
 /// H heal/tick ≈ H damage/tick of value).
-fn threat_value(c: &CombatCreepDto) -> u32 {
+pub(crate) fn threat_value(c: &CombatCreepDto) -> u32 {
     use screeps_combat_engine::constants::{ATTACK_POWER, HEAL_POWER, RANGED_ATTACK_POWER};
     c.working_parts(Part::Attack) as u32 * ATTACK_POWER
         + c.working_parts(Part::RangedAttack) as u32 * RANGED_ATTACK_POWER
@@ -305,7 +305,7 @@ fn threat_value(c: &CombatCreepDto) -> u32 {
 /// BUDGET = `hits + heal reaching it` (the damage to finish it THIS tick). Shared by
 /// [`select_focus_target`] (primary = first) and [`assign_focus_fire`] (spill) so they agree. Empty ⇒
 /// nothing killable (out-healed, rampart-shielded, or `our_dps == 0`).
-fn ev_target_order<'a>(hostiles: &'a [CombatCreepDto], structures: &[CombatStructureDto], our_dps: u32) -> Vec<(&'a CombatCreepDto, u32)> {
+pub(crate) fn ev_target_order<'a>(hostiles: &'a [CombatCreepDto], structures: &[CombatStructureDto], our_dps: u32) -> Vec<(&'a CombatCreepDto, u32)> {
     let ramparts = hostile_rampart_tiles(structures);
     let mut ranked: Vec<(&CombatCreepDto, u32, u64, u64)> = hostiles
         .iter()
