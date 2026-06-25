@@ -34,6 +34,9 @@
 pub mod cohesion;
 /// Pure per-tile pricing for cohesive, safe, higher-EV kite/flee positioning (P2.G3-tail).
 pub mod kite;
+/// ADR 0025 — the unified EV-of-(position × action) combat kernel (win-probability currency + the
+/// engine-legal action menu; the per-tile pricing + squad commit/drain build on these).
+pub mod kernel;
 /// Pure spawn-body construction (`SpawnBodyDefinition` + `create_body`) — shared with the bot so the
 /// sim/eval can build the bot's real bodies without depending on the whole bot.
 pub mod spawning;
