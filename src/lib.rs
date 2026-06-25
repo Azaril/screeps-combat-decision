@@ -358,39 +358,133 @@ fn assign_focus_fire(members: &[SquadMemberView], hostiles: &[CombatCreepDto], s
     out
 }
 
-/// **The per-creep combat decision** (ADR 0006 Inc B): one creep's attack + heal intents for a
-/// tick. A faithful port of `squad_combat`'s `execute_attack_with_orders` + `execute_heal_with_orders`
-/// (when `view.orders` is `Some`) and `fallback_attack` + `fallback_heal` (when `None`). Intents
-/// are pushed in the live pipeline order — melee (A), then ranged (B), then heal — so the
+/// **The per-creep combat decision** (ADR 0006 Inc B): one creep's attack + heal intents for a tick.
+/// Intents are pushed in the live pipeline order — melee (A), then ranged (B), then heal — so the
 /// `IntentRecorder` digest matches. Movement is **not** emitted here (it rides P2.M2).
-/// A creep with both ATTACK and HEAL parts cannot do both this tick — the engine DROPS the melee attack
-/// when any heal is queued (`creeps/intents.js`; resolve.rs `filtered_actions`). So a melee creep is a
-/// FIGHTER first: if it emitted a melee `Attack` (on a creep OR a structure), suppress the heal that
-/// would veto it. Ranged attack + heal still compose (only MELEE attack conflicts), so this gates only
-/// on `CombatIntent::Attack`. Without it a melee+heal creep heals (a wounded ally / self) and never
-/// damages the structure objective it's adjacent to (operator-flagged: "melee+heal not attacking
-/// structures"). Pure healers (no ATTACK) are unaffected; the squad's dedicated healers do the healing.
-fn has_melee_attack(out: &[CombatIntent]) -> bool {
-    out.iter().any(|i| matches!(i, CombatIntent::Attack { .. }))
-}
-
+///
+/// **Capability-EV melee-vs-heal (ADR 0024 §Future-work #1+#2).** A creep with both ATTACK and HEAL
+/// parts can't do both this tick — the engine DROPS the melee attack when any heal/rangedHeal is queued
+/// (`creeps/intents.js`; resolve.rs `filtered_actions`). The old rule was rigid "FIGHTER first" (always
+/// melee, suppress heal); now the choice is by **expected value toward win probability**: dealing melee
+/// damage advances the objective, but **healing an ally in mortal danger averts a death** — the larger
+/// loss — so a melee+heal creep drops its attack to heal *only* when the heal saves a creep about to die
+/// to anticipated incoming ([`best_heal_target`]'s `mortal`). Otherwise it keeps fighting (the operator's
+/// "melee+heal not attacking structures" stays fixed). RANGED attack + heal compose, so ranged fire is
+/// never suppressed — only the melee `Attack` yields. Healing itself is **preemptive**: it anticipates
+/// incoming damage (the [`ThreatField`](kite::ThreatField)), not just topping up already-damaged creeps.
 pub fn decide_combat(view: &CombatView) -> Vec<CombatIntent> {
     let mut out = Vec::new();
+
+    // Pick this creep's best heal action for the tick (preemptive, EV-ranked) BEFORE the attack
+    // pipelines, so the melee-vs-heal tradeoff can see whether a heal would avert a death. A
+    // squad-assigned heal target (the coordinated `assign_heals` pick) takes precedence when reachable;
+    // otherwise the creep picks locally. `None` ⇒ nobody reachable benefits.
+    let heal = if view.me.has_working(Part::Heal) {
+        let threats = kite_threats(view.hostiles);
+        let towers = kite_towers(view.structures);
+        view.orders
+            .and_then(|o| o.heal_target)
+            .and_then(|t| resolve_assigned_heal(view, t, &threats, &towers))
+            .or_else(|| best_heal_target(view, &threats, &towers))
+    } else {
+        None
+    };
+
     match view.orders {
-        Some(orders) => {
-            attack_with_orders(view, &orders, &mut out);
-            if !has_melee_attack(&out) {
-                heal_with_orders(view, &orders, &mut out);
-            }
-        }
-        None => {
-            fallback_attack(view, &mut out);
-            if !has_melee_attack(&out) {
-                fallback_heal(view, &mut out);
-            }
-        }
+        Some(orders) => attack_with_orders(view, &orders, &mut out),
+        None => fallback_attack(view, &mut out),
     }
+    apply_heal(heal, &mut out);
     out
+}
+
+/// The heal action a creep will take this tick (`None` ⇒ no worthwhile heal). `ranged` distinguishes
+/// `RangedHeal` (range 2-3) from `Heal` (≤1); `mortal` marks "this heal averts an imminent death" —
+/// the win-probability case that outranks dealing melee damage in [`apply_heal`].
+struct HealPick {
+    target: FocusTarget,
+    ranged: bool,
+    mortal: bool,
+}
+
+/// Apply the chosen heal, resolving the engine's melee⟂heal exclusion by EV: a melee `Attack` already in
+/// `out` is kept unless the heal is `mortal` (saving a death beats chipping); a heal with no melee in the
+/// way is always emitted (it composes with ranged fire). Heal is pushed last (live pipeline order).
+fn apply_heal(heal: Option<HealPick>, out: &mut Vec<CombatIntent>) {
+    let has_melee = out.iter().any(|i| matches!(i, CombatIntent::Attack { .. }));
+    let push = |h: &HealPick, out: &mut Vec<CombatIntent>| {
+        out.push(if h.ranged {
+            CombatIntent::RangedHeal { target: h.target.pos, id: h.target.id }
+        } else {
+            CombatIntent::Heal { target: h.target.pos, id: h.target.id }
+        });
+    };
+    match heal {
+        Some(h) if !has_melee => push(&h, out),
+        Some(h) if h.mortal => {
+            out.retain(|i| !matches!(i, CombatIntent::Attack { .. })); // drop the vetoed melee — save the death
+            push(&h, out);
+        }
+        _ => {} // keep meleeing; a non-mortal top-up yields to dealing damage
+    }
+}
+
+/// Honor a squad-assigned heal target ([`CreepOrders::heal_target`]) when it is reachable (≤3), computing
+/// its `mortal` flag from anticipated incoming. `None` ⇒ unreachable/unresolved → caller falls back to the
+/// local [`best_heal_target`] pick.
+fn resolve_assigned_heal(view: &CombatView, t: FocusTarget, threats: &[kite::KiteThreat], towers: &[kite::KiteTower]) -> Option<HealPick> {
+    let ranged = match view.me.pos.get_range_to(t.pos) {
+        0..=1 => false,
+        2..=3 => true,
+        _ => return None,
+    };
+    let hits = view.friends.iter().find(|f| Some(f.pos) == Some(t.pos)).map(|f| f.hits).unwrap_or(u32::MAX);
+    let mortal = incoming_damage_at(t.pos, threats, towers) >= hits;
+    Some(HealPick { target: t, ranged, mortal })
+}
+
+/// Pick the best ally (incl. self) to heal THIS tick, anticipating incoming damage (the
+/// [`ThreatField`](kite::ThreatField)) to **maximize win probability** (ADR 0024 §Future-work #2):
+/// - an ally in **mortal danger** (anticipated incoming ≥ its current hits — it dies to the volley
+///   unaided) ranks first, nearest-death (lowest hits) preferred — preventing a death is the biggest
+///   win-probability swing;
+/// - otherwise the ally with the most **useful heal** = `min(my output, deficit + incoming)` — healing
+///   that isn't wasted, and **preemptive**: a full-HP ally about to eat a volley still scores via
+///   `incoming`, so it's topped up *before* it drops.
+///
+/// Replaces the old reactive "lowest-hits damaged ally" (`heal_best_nearby`). With no threats present
+/// (`incoming == 0`) it reduces to "heal the most-wounded reachable ally, adjacent before ranged" —
+/// byte-identical to the prior behaviour for the un-threatened case.
+fn best_heal_target(view: &CombatView, threats: &[kite::KiteThreat], towers: &[kite::KiteTower]) -> Option<HealPick> {
+    use screeps_combat_engine::constants::{HEAL_POWER, RANGED_HEAL_POWER};
+    let me = view.me;
+    let heal_parts = me.working_parts(Part::Heal) as u32;
+    if heal_parts == 0 {
+        return None;
+    }
+    view
+        .friends
+        .iter()
+        .filter(|a| a.hits > 0)
+        .filter_map(|a| {
+            let (per, ranged) = match me.pos.get_range_to(a.pos) {
+                0..=1 => (HEAL_POWER, false),
+                2..=3 => (RANGED_HEAL_POWER, true),
+                _ => return None,
+            };
+            let inc = incoming_damage_at(a.pos, threats, towers);
+            let deficit = a.hits_max.saturating_sub(a.hits);
+            let useful = (heal_parts * per).min(deficit + inc);
+            if useful == 0 {
+                return None; // full HP and nothing incoming → no point
+            }
+            // Rank key (bigger wins): mortal first, then most useful heal, then nearer death.
+            let mortal = inc >= a.hits;
+            let key = (mortal, useful, std::cmp::Reverse(a.hits));
+            Some((key, HealPick { target: FocusTarget { pos: a.pos, id: a.id }, ranged, mortal }))
+        })
+        .max_by(|(k1, _), (k2, _)| k1.cmp(k2))
+        .map(|(_, pick)| pick)
 }
 
 fn min_hits_hostile_within<'a>(view: &CombatView<'a>, range: u32) -> Option<&'a CombatCreepDto> {
@@ -460,25 +554,6 @@ fn attack_with_orders(view: &CombatView, orders: &CreepOrders, out: &mut Vec<Com
     }
 }
 
-fn heal_with_orders(view: &CombatView, orders: &CreepOrders, out: &mut Vec<CombatIntent>) {
-    if !view.me.has_working(Part::Heal) {
-        return;
-    }
-    match orders.heal_target {
-        Some(h) => {
-            let range = view.me.pos.get_range_to(h.pos);
-            if range <= 1 {
-                out.push(CombatIntent::Heal { target: h.pos, id: h.id });
-            } else if range <= 3 {
-                out.push(CombatIntent::RangedHeal { target: h.pos, id: h.id });
-            } else {
-                heal_best_nearby(view, out);
-            }
-        }
-        None => heal_best_nearby(view, out),
-    }
-}
-
 fn fallback_attack(view: &CombatView, out: &mut Vec<CombatIntent>) {
     let me = view.me;
     if view.hostiles.is_empty() {
@@ -510,42 +585,6 @@ fn fallback_attack(view: &CombatView, out: &mut Vec<CombatIntent>) {
         } else if let Some(t) = priority_hostile_within(view, 3) {
             out.push(CombatIntent::RangedAttack { target: t.pos, id: t.id });
         }
-    }
-}
-
-fn fallback_heal(view: &CombatView, out: &mut Vec<CombatIntent>) {
-    if view.me.has_working(Part::Heal) {
-        heal_best_nearby(view, out);
-    }
-}
-
-/// Heal priority shared by the ordered & fallback paths (`squad_combat::heal_best_nearby`): an
-/// adjacent damaged friendly (incl. self), else self if damaged, else a ranged damaged friendly.
-fn heal_best_nearby(view: &CombatView, out: &mut Vec<CombatIntent>) {
-    let me = view.me;
-    let adjacent = view
-        .friends
-        .iter()
-        .filter(|c| me.pos.get_range_to(c.pos) <= 1 && c.is_damaged())
-        .min_by_key(|c| c.hits);
-    if let Some(t) = adjacent {
-        out.push(CombatIntent::Heal { target: t.pos, id: t.id });
-        return;
-    }
-    if me.is_damaged() {
-        out.push(CombatIntent::Heal { target: me.pos, id: me.id });
-        return;
-    }
-    let ranged = view
-        .friends
-        .iter()
-        .filter(|c| {
-            let r = me.pos.get_range_to(c.pos);
-            r > 1 && r <= 3 && c.is_damaged()
-        })
-        .min_by_key(|c| c.hits);
-    if let Some(t) = ranged {
-        out.push(CombatIntent::RangedHeal { target: t.pos, id: t.id });
     }
 }
 
@@ -1037,7 +1076,7 @@ pub fn decide_squad(view: &SquadView) -> SquadDecision {
         _ => SquadMovement::Hold,
     };
 
-    let heal_assignments = assign_heals(view.members);
+    let heal_assignments = assign_heals(view.members, &kite_threats(view.hostiles), &kite_towers(view.structures));
     // Damage spill (ADR 0020 §4.2): per-member focus so combined fire doesn't over-damage one creep.
     let focus_assignments = assign_focus_fire(view.members, view.hostiles, view.structures);
 
@@ -1063,36 +1102,44 @@ pub fn decide_squad(view: &SquadView) -> SquadDecision {
 }
 
 /// Greedy heal assignment over member indices (a faithful pure port of
-/// `SquadContext::compute_heal_assignments`): sort the wounded by urgency (deficit + predicted
-/// incoming), greedily give each the available healer with the most healing (range bands 12@≤1 /
-/// 4@≤3, adjacent preferred on a tie), cap to the remaining deficit; then any idle healer pre-heals
-/// the in-range member taking the most predicted damage. Indices are into `members`; the adapter
-/// resolves them to creeps.
-fn assign_heals(members: &[SquadMemberView]) -> Vec<HealAssignment> {
+/// `SquadContext::compute_heal_assignments`, made **preemptive + win-probability-ordered** — ADR 0024
+/// §Future-work #2): rank the wounded by urgency = deficit + **anticipated incoming** (the
+/// [`ThreatField`](kite::ThreatField), not just last-tick damage), with members in **mortal danger**
+/// (incoming ≥ current hits → they die to the volley unaided) ranked FIRST so the squad spends heal
+/// where it most prevents a death; greedily give each the available healer with the most healing (range
+/// bands 12@≤1 / 4@≤3, adjacent preferred on a tie), cap to remaining; then any idle healer pre-heals the
+/// in-range member at greatest risk. Indices are into `members`; the adapter resolves them to creeps.
+fn assign_heals(members: &[SquadMemberView], threats: &[kite::KiteThreat], towers: &[kite::KiteTower]) -> Vec<HealAssignment> {
     let healers: Vec<usize> = (0..members.len())
         .filter(|&i| members[i].heal_power > 0 && members[i].pos.is_some())
         .collect();
     if healers.is_empty() {
         return Vec::new();
     }
+    // Anticipated incoming damage to a member next tick — the larger of observed (last tick) and
+    // predicted (the threat field), so the first volley a full-HP member is about to eat still registers.
+    let risk_at = |m: &SquadMemberView, pos: Position| m.damage_taken_last_tick.max(incoming_damage_at(pos, threats, towers));
 
     struct Target {
         idx: usize,
         pos: Position,
         remaining: u32,
+        mortal: bool,
     }
     let mut targets: Vec<Target> = (0..members.len())
         .filter_map(|i| {
             let m = &members[i];
             let pos = m.pos?;
-            if m.hits_max == 0 || (m.hits >= m.hits_max && m.damage_taken_last_tick == 0) {
+            let risk = risk_at(m, pos);
+            if m.hits_max == 0 || (m.hits >= m.hits_max && risk == 0) {
                 return None;
             }
             let deficit = m.hits_max - m.hits;
-            Some(Target { idx: i, pos, remaining: deficit + m.damage_taken_last_tick })
+            Some(Target { idx: i, pos, remaining: deficit + risk, mortal: risk >= m.hits })
         })
         .collect();
-    targets.sort_by_key(|t| std::cmp::Reverse(t.remaining));
+    // Mortal-danger first (prevent the death), then most urgent.
+    targets.sort_by(|a, b| b.mortal.cmp(&a.mortal).then(b.remaining.cmp(&a.remaining)));
 
     let mut assigned = vec![false; healers.len()];
     let mut out = Vec::new();
@@ -1131,7 +1178,7 @@ fn assign_heals(members: &[SquadMemberView]) -> Vec<HealAssignment> {
         }
     }
 
-    // Preemptive: an idle healer pre-heals the in-range member taking the most predicted damage.
+    // Preemptive: an idle healer pre-heals the in-range member at greatest anticipated risk.
     for (slot, &mi) in healers.iter().enumerate() {
         if assigned[slot] {
             continue;
@@ -1139,10 +1186,10 @@ fn assign_heals(members: &[SquadMemberView]) -> Vec<HealAssignment> {
         let hp = members[mi].pos.expect("healer filtered to have a position");
         let best = (0..members.len())
             .filter(|&j| j != mi && members[j].pos.is_some_and(|p| hp.get_range_to(p) <= 3))
-            .max_by_key(|&j| members[j].damage_taken_last_tick);
+            .max_by_key(|&j| risk_at(&members[j], members[j].pos.unwrap()));
         if let Some(j) = best {
             let m = &members[j];
-            if m.damage_taken_last_tick > 0 || m.hits < m.hits_max {
+            if risk_at(m, m.pos.unwrap()) > 0 || m.hits < m.hits_max {
                 let range = hp.get_range_to(m.pos.unwrap());
                 let heal = if range > 1 { members[mi].heal_power * 4 } else { members[mi].heal_power * 12 };
                 out.push(HealAssignment { healer_idx: mi, target_idx: j, expected_heal: heal });
@@ -1924,6 +1971,63 @@ mod tests {
         assert_eq!(
             decide_combat(&s3.view(&full_me, None)),
             vec![CombatIntent::RangedHeal { target: pos(25, 28), id: healthy_far.id }]
+        );
+    }
+
+    // ── EV heal: preemptive (anticipated incoming) + win-probability mortal triage (ADR 0024 #2) ──
+    #[test]
+    fn preemptive_heal_tops_up_a_full_hp_ally_about_to_take_a_volley() {
+        // A FULL-HP ally about to eat a ranged volley: the OLD reactive heal (damaged-only) emitted
+        // nothing; the EV heal anticipates the incoming and tops it up BEFORE it drops.
+        let healer = creep(1, 22, 26, 600, &[(Part::Heal, 5)]); // out of the ranged threat's reach (range 6)
+        let ally = creep(2, 25, 26, 200, &[(Part::Move, 2)]); // FULL HP, at range 3 of the healer
+        let shooter = creep(9, 28, 26, 600, &[(Part::RangedAttack, 25)]); // 250 ranged dmg, range 3 of the ally
+        let s = Scene { squad: squad(), friends: vec![healer.clone(), ally.clone()], hostiles: vec![shooter], structures: vec![] };
+        assert_eq!(
+            decide_combat(&s.view(&healer, None)),
+            vec![CombatIntent::RangedHeal { target: pos(25, 26), id: ally.id }],
+            "anticipated 250 incoming on a full-HP ally → preemptive ranged-heal (old code: nothing)"
+        );
+    }
+
+    #[test]
+    fn melee_heal_creep_drops_its_attack_to_save_a_dying_ally() {
+        // A melee+heal creep adjacent to a structure objective AND to an ally in mortal danger under
+        // tower fire: EV says preventing the death beats chipping the structure → it drops the (engine-
+        // vetoed-anyway) melee Attack and heals the ally. Tough on `me` so the healer itself isn't mortal.
+        let me = creep(1, 25, 25, 1000, &[(Part::Tough, 4), (Part::Attack, 3), (Part::Heal, 3)]);
+        let dying = creep(2, 24, 25, 100, &[(Part::Move, 5)]); // 100 hits, range 1
+        let s = Scene {
+            squad: squad(),
+            friends: vec![me.clone(), dying.clone()],
+            hostiles: vec![],
+            // A tower adjacent to the dying ally → 600 incoming ≥ its 100 hits → mortal.
+            structures: vec![structure(23, 25, StructureType::Tower, Ownership::Hostile), structure(26, 25, StructureType::Spawn, Ownership::Hostile)],
+        };
+        assert_eq!(
+            decide_combat(&s.view(&me, None)),
+            vec![CombatIntent::Heal { target: pos(24, 25), id: dying.id }],
+            "mortal ally → heal it, dropping the melee attack on the structure"
+        );
+    }
+
+    #[test]
+    fn melee_heal_creep_keeps_attacking_when_the_ally_is_merely_wounded() {
+        // Same melee+heal creep, but the adjacent ally is wounded-yet-SAFE (no incoming) → not mortal →
+        // EV keeps it fighting the structure (a non-mortal top-up yields to dealing damage). The
+        // operator's "melee+heal not attacking structures" stays fixed.
+        let me = creep(1, 25, 25, 1000, &[(Part::Tough, 4), (Part::Attack, 3), (Part::Heal, 3)]);
+        let wounded = creep(2, 24, 25, 400, &[(Part::Move, 5)]); // damaged (400/500) but no threats
+        let s = Scene {
+            squad: squad(),
+            friends: vec![me.clone(), wounded.clone()],
+            hostiles: vec![],
+            structures: vec![structure(26, 25, StructureType::Spawn, Ownership::Hostile)],
+        };
+        assert_eq!(
+            decide_combat(&s.view(&me, None)),
+            vec![CombatIntent::Attack { target: pos(26, 25), id: None }],
+            "ally safe → keep dismantling the structure"
         );
     }
 
