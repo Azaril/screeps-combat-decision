@@ -1249,6 +1249,14 @@ pub fn build_room_layers(
     kite::PositionLayers::build(&threats, &towers, room, matrix, max_ops)
 }
 
+/// Build just the room's [`kite::ThreatField`] (incoming hits/tick per tile) from the same hostiles +
+/// energized towers [`build_room_layers`] prices — exposed so the **live** cost-matrix can fold the
+/// field into traversal cost (ADR 0024 Stage 1 "safest route": route around tower/enemy kill-zones).
+/// Pure geometry, no flood; the sim builds the equivalent field inside `screeps_combat_agent::pathing`.
+pub fn build_room_threat_field(hostiles: &[CombatCreepDto], structures: &[CombatStructureDto]) -> kite::ThreatField {
+    kite::ThreatField::build(&kite_threats(hostiles), &kite_towers(structures))
+}
+
 /// **The full squad decision incl. the pathfinding-scored kite goal** (P2.G3-tail). Runs
 /// [`decide_squad`] for the focus + hysteresis + state, then — only when kiting is warranted
 /// (`Retreating`, or `Engaged` with a ranged squad and a melee-capable threat near the centroid) —
