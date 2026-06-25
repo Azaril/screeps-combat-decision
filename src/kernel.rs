@@ -269,12 +269,15 @@ const MORTAL_HEAL_MULT: i64 = 4;
 /// Position-shaping coefficients, expressed as multiples of the per-tick currency `unit` so they stay
 /// commensurate with offense/heal EV (tie-breaker scale: a kill is `unit × hundreds`, these are `unit ×
 /// units`). Seeds.
-const DISCOHESION_COEF: i64 = 2;
-const COHESION_K: u32 = 4;
+const DISCOHESION_COEF: i64 = 10;
+const COHESION_K: u32 = 3;
 const SPACING_COEF: i64 = 1;
 const SPACING_R: u32 = 1;
+/// Incumbency dead-band (hold the current tile). Applied only at a FIRING position (offense reachable),
+/// where it damps the engaged period-2 jitter; it is NOT applied while merely approaching/healing (so it
+/// can't out-weigh the approach march). Strong there because the approach term is tiny once in range.
 const INCUMBENCY_COEF: i64 = 3;
-const APPROACH_COEF: i64 = 1;
+const APPROACH_COEF: i64 = 2;
 /// Hard survival backstop: a tile whose net incoming would kill the member within the horizon is priced
 /// astronomically so it is never chosen regardless of EV (the binary veto under the graduated RISK term).
 const LETHAL: i64 = 1_000_000_000_000_000;
@@ -388,13 +391,13 @@ pub fn plan_squad_ev(
         })
         .collect();
 
-    // ── Commit order: highest single-tile EV first (value-derived, NOT role-derived) ──
-    let mut order: Vec<usize> = (0..members.len()).collect();
-    order.sort_by(|&a, &b| {
-        let ea = best_action_value(&members[a], members[a].pos, &dmg, &heals, g_us);
-        let eb = best_action_value(&members[b], members[b].pos, &dmg, &heals, g_us);
-        eb.cmp(&ea).then(members[a].hits.cmp(&members[b].hits)).then(members[a].idx.cmp(&members[b].idx))
-    });
+    // ── Commit order: STABLE (member index) ──
+    // A value-sorted "highest-leverage first" order churns tick-to-tick (per-tick residual/position
+    // shifts flip the comparator), so contended tiles get reassigned between members every tick → a
+    // period-2 position oscillation. A stable index order resolves contention deterministically (the
+    // same member always claims first), which is what kills the swap-oscillation. (Re-introducing a
+    // value/contestedness priority is a tournament refinement once it carries its own hysteresis.)
+    let order: Vec<usize> = (0..members.len()).collect();
 
     let mut out = vec![EvResult::default(); members.len()];
     let mut claimed: Vec<Position> = Vec::with_capacity(members.len());
@@ -617,9 +620,20 @@ fn apply_dmg(act: Act, best: Option<(usize, i64)>, dmg: &[DamageTarget], res: &m
     v
 }
 
+/// Whether `m` could land an OFFENSE action (damage a creep/structure) from `tile` — melee/dismantle/
+/// declaim at range 1, ranged at range ≤ 3. Distinguishes a real firing position (where the incumbency
+/// dead-band should hold the creep) from an approach/heal-in-place tile (where the approach pull wins).
+fn offense_reachable(m: &EvMember, tile: Position, dmg: &[DamageTarget]) -> bool {
+    let melee_range = m.caps.melee || m.caps.dismantle || m.caps.claim;
+    dmg.iter().any(|t| {
+        let r = tile.get_range_to(t.pos);
+        (melee_range && r <= 1) || (m.caps.ranged && r <= 3)
+    })
+}
+
 /// Choose the member's move tile: the local Moore neighbourhood (current ±1, walkable) plus the current
-/// tile, scored by best-action EV there − incoming risk − discohesion + incumbency − spacing, with a
-/// downhill approach gradient when NO action lands, and the hard survival veto. Deterministic tie-break.
+/// tile, scored by best-action EV there − incoming risk − the approach pull toward the objective −
+/// discohesion − spacing, with an incumbency dead-band on a firing tile, and the hard survival veto.
 #[allow(clippy::too_many_arguments)]
 fn best_tile(
     m: &EvMember,
@@ -652,13 +666,15 @@ fn best_tile(
             }
             let action = best_action_value(m, tile, dmg, heals, g_us);
             let net = (threat_field.raw_at(tile) - squad_heal as i32).max(0);
-            let mut cost = if action > 0 {
-                action - g_us.saturating_mul(net as i64) // RISK netted against offense/heal value
-            } else {
-                // Out of range of everything → downhill toward the target (approach gradient), still risk-aware.
-                let d = dist_to_target.get(&(tile.x().u8(), tile.y().u8())).copied().unwrap_or(u32::MAX);
-                -(unit.saturating_mul(APPROACH_COEF).saturating_mul(d.min(10_000) as i64)) - g_us.saturating_mul(net as i64)
-            };
+            // Value of being here = the action EV (offense + heal) − incoming RISK − the approach pull
+            // toward the objective. The approach gradient is applied ALWAYS (not only when out of range):
+            // otherwise a creep that can merely HEAL in place (heal is "doable" almost everywhere there is
+            // an at-risk ally) would never advance to the objective. Once real OFFENSE lands, its huge EV
+            // (`g_them × damage`) dwarfs the small approach term, so the creep holds + fights.
+            let d = dist_to_target.get(&(tile.x().u8(), tile.y().u8())).copied().unwrap_or(u32::MAX);
+            let mut cost = action
+                .saturating_sub(g_us.saturating_mul(net as i64))
+                .saturating_sub(unit.saturating_mul(APPROACH_COEF).saturating_mul(d.min(10_000) as i64));
             // Cohesion: penalize distance past K from the squad centroid.
             let coh = centroid.get_range_to(tile);
             if coh > COHESION_K {
@@ -668,10 +684,11 @@ fn best_tile(
             if claimed.iter().any(|c| tile.get_range_to(*c) <= SPACING_R && *c != tile) {
                 cost -= unit.saturating_mul(SPACING_COEF);
             }
-            // Incumbency: a dead-band biasing the member to HOLD its current tile — the anti-oscillation
-            // damper for IN-RANGE positioning. NOT applied while out of range (action == 0), or it would
-            // out-weigh the +1-tile approach gradient and stall the march toward the target.
-            if tile == m.pos && action > 0 {
+            // Incumbency: hold the current tile to damp engaged period-2 jitter — applied only at a
+            // FIRING position (offense reachable). While approaching/healing it is off, so the approach
+            // pull (always applied above) is never blocked; once in firing range it strongly damps the
+            // tile-flip that two engaged squads would otherwise oscillate into.
+            if tile == m.pos && offense_reachable(m, tile, dmg) {
                 cost += unit.saturating_mul(INCUMBENCY_COEF);
             }
             // Survival veto: never step onto a tile whose net incoming kills the member within the horizon.

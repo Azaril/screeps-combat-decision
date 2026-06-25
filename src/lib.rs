@@ -835,6 +835,15 @@ pub struct SquadMemberView {
     pub ranged_power: u32,
     /// Damage taken since last tick (predicted incoming, for proactive heal assignment).
     pub damage_taken_last_tick: u32,
+    /// The member's creep id — lets the kernel target this ally for a heal intent (ADR 0025). `None`
+    /// before resolve / for an unsynced member.
+    pub id: Option<RawObjectId>,
+    /// Structure damage/tick via `dismantle` (working WORK × `DISMANTLE_POWER`) — enables the kernel's
+    /// breach/dismantle action. Default 0.
+    pub dismantle_power: u32,
+    /// Controller-attack/tick (working CLAIM × `CONTROLLER_ATTACK_PER_PART`) — enables the kernel's
+    /// declaim action. Default 0.
+    pub claim_power: u32,
 }
 
 /// A computed heal assignment over member **indices** (the live adapter / sim resolve indices to the
@@ -914,6 +923,11 @@ pub struct SquadDecision {
     /// (its heal-coverage tile); the adapter stamps it as that member's `Advance{range:0}` directive.
     /// Consumed only on the anchorless `decide_movement` path — a siege formation keeps its slots.
     pub member_goals: Vec<Option<Position>>,
+    /// Per-member emitted combat intents (ADR 0025 EV kernel), parallel to `members`. The kernel chooses
+    /// each member's ACTION jointly with its position, so the adapter emits `member_intents[i]` directly
+    /// for managed creep `i` — no per-creep `decide_combat` pass. Empty ⇒ no kernel ran (the non-pathing
+    /// `decide_squad` path / unmanaged creeps), so the consumer falls back to the solo `decide_combat`.
+    pub member_intents: Vec<Vec<CombatIntent>>,
 }
 
 /// Mean HP fraction over members that have spawned (`hits_max > 0`).
@@ -950,10 +964,15 @@ fn fighting_strength(dps: u64, ehp: u64, n: u32) -> u64 {
 /// The EV engage assessment (ADR 0020 §4.3 Lanchester gate): is this fight winnable, and by how much?
 struct EngageAssessment {
     /// Fighting-strength balance (our − killable-enemy) in permille of enemy strength; >0 favours us.
+    /// This IS the Lanchester margin `μ` the ADR-0025 kernel's win-probability currency consumes.
     balance: i64,
     /// Hard veto — never engage: enemy safe mode, OR incoming damage we can neither remove (kill the
     /// source) nor out-heal, so we just bleed out.
     unwinnable: bool,
+    /// Our Lanchester fighting strength (`dps × ehp`) — feeds the kernel's `g_them` sensitivity.
+    our_strength: u64,
+    /// The killable enemy force's fighting strength — feeds the kernel's `g_us` sensitivity.
+    enemy_strength: u64,
 }
 
 /// Assess engage-vs-retreat by Lanchester fighting strength over the **killable** enemy force, plus the
@@ -963,7 +982,7 @@ struct EngageAssessment {
 fn assess_engage(view: &SquadView, centroid: Option<Position>) -> EngageAssessment {
     use screeps_combat_engine::constants::{ATTACK_POWER, HEAL_POWER, RANGED_ATTACK_POWER, TOWER_ENERGY_COST};
     if view.enemy_safe_mode {
-        return EngageAssessment { balance: -1000, unwinnable: true }; // our combat is nullified
+        return EngageAssessment { balance: -1000, unwinnable: true, our_strength: 0, enemy_strength: 1 }; // our combat is nullified
     }
     let creep_dps = |c: &CombatCreepDto| -> u64 {
         c.working_parts(Part::Attack) as u64 * ATTACK_POWER as u64 + c.working_parts(Part::RangedAttack) as u64 * RANGED_ATTACK_POWER as u64
@@ -1000,14 +1019,14 @@ fn assess_engage(view: &SquadView, centroid: Option<Position>) -> EngageAssessme
     // No enemy creep deals damage (e.g. a STRUCTURE SIEGE — dismantle/raze, whose offense isn't
     // melee/ranged) ⇒ there's no creep attrition race to lose, so the Lanchester μ doesn't apply;
     // it's engageable (the tower `unwinnable` veto above still guards a tower turtle).
+    let our_strength = fighting_strength(our_dps, our_ehp, LANCHESTER_N);
+    let enemy_strength = fighting_strength(killable_dps, killable_ehp, LANCHESTER_N);
     let balance = if killable_dps == 0 && unkillable_dps == 0 {
         1000
     } else {
-        let our_strength = fighting_strength(our_dps, our_ehp, LANCHESTER_N);
-        let enemy_strength = fighting_strength(killable_dps, killable_ehp, LANCHESTER_N).max(1);
-        ((our_strength as i128 - enemy_strength as i128) * 1000 / enemy_strength as i128).clamp(-1000, 1000) as i64
+        ((our_strength as i128 - enemy_strength.max(1) as i128) * 1000 / enemy_strength.max(1) as i128).clamp(-1000, 1000) as i64
     };
-    EngageAssessment { balance, unwinnable }
+    EngageAssessment { balance, unwinnable, our_strength, enemy_strength }
 }
 
 /// **The squad-level tactical decision** (ADR 0008 §4, P2.G3). Picks the squad's shared
@@ -1101,6 +1120,7 @@ pub fn decide_squad(view: &SquadView) -> SquadDecision {
         focus_assignments,
         orientation,
         member_goals: Vec::new(),
+        member_intents: Vec::new(),
     }
 }
 
@@ -1414,6 +1434,7 @@ pub fn decide_squad_with_pathing(
         Some(c) => c,
         None => return decision, // no positioned members → nothing to kite
     };
+    let room = centroid.room_name();
 
     // O3 — layered dismantle: if the focus is a structure shielded by a rampart/wall, redirect to the
     // breach blocker on the path (break it first) and re-aim an Advance at it. Runs only in the
@@ -1526,96 +1547,100 @@ pub fn decide_squad_with_pathing(
         };
     }
 
-    // ── Per-member layout: single-pass emergent formation (folds in ADR 0019 §8 healer positioning) ──
-    // In an engaged, non-kiting squad, assign each living member its OWN distinct tile from ONE scored
-    // flood ([`kite::plan_squad_layout`]) instead of sending the whole block onto one goal at range 0 —
-    // the pile-up that made members contend/shove and wobbled the centroid into a positioning
-    // oscillation. The role ring emerges from each member's own preset (melee→range 1, ranged→r*,
-    // healer→heal-coverage), an incumbency dead-band damps the tick-to-tick flip, and a bounded spacing
-    // term spreads the block without breaking cohesion. Routed via `member_goals` (the per-member channel
-    // the live SquadManager + the sim already consume); a member with no assigned tile falls back to the
-    // block's `decision.movement` (set above). The §8 healer search is one role in this single pass — no
-    // separate healers-only block. Kite/retreat keep the single shared goal (a fleeing block converges).
-    // Same search + shared `PositionLayers` live and in the sim (no fork).
+    // ── ADR 0025: unified EV-of-(position × action) kernel ──
+    // In an engaged, non-kiting squad, the kernel ([`kernel::plan_squad_ev`]) chooses each member's MOVE
+    // goal AND its ACTION (the engine-legal intent set) jointly, by one win-probability EV currency —
+    // replacing the role/archetype layout + the separate `decide_combat` action pipeline. Coordination is
+    // value-sorted residual drain (no overkill / over-heal), so the formation EMERGES; structures (incl.
+    // the breach focus) + heal triage are priced in the same currency. `member_goals` carries the per-tick
+    // moves; `member_intents` carries each creep's intents (the adapter emits them directly). The currency
+    // (`g_us`/`g_them`) comes from the existing Lanchester `assess_engage` — no new weights. Kite/retreat
+    // keep the per-creep `decide_combat` path (a fleeing block converges via the shared movement).
     if matches!(decision.state, SquadOrderState::Engaged) && !should_kite {
-        let threats = kite_threats(view.hostiles);
-        let towers = kite_towers(view.structures);
-        // Fighter preset (Hold zeroes the press-the-kill gradient, as in the engage branch); healers use
-        // their own preset inside plan_squad_layout.
-        let mut engage_params = tactics.engage;
-        if view.engage_objective == EngageObjective::Hold {
-            engage_params.w_close = 0.0;
-        }
-        let focus_damage = decision.focus.and_then(|f| f.id.map(|_| focus_damage_inputs(view, f.pos)));
-        let mut specs: Vec<kite::MemberLayoutSpec> = Vec::new();
-        for (i, m) in view.members.iter().enumerate() {
-            if m.hits == 0 {
-                continue; // dead → no creep to place
-            }
-            let Some(pos) = m.pos else { continue }; // unsynced position → follows the block
-            // Capability-derived (ADR 0024 §Future-work #1): a creep's layout behavior comes from what its
-            // PARTS can do, not a single archetype label — so a melee+ranged creep closes to range 1 (use
-            // both weapons) instead of holding at 3, and a melee+heal creep positions as a fighter (its
-            // heal is the opportunistic EV heal in `decide_combat`, not a back-line support slot).
-            let caps = kite::MemberCaps { can_melee: m.melee_power > 0, can_range: m.has_ranged, can_heal: m.heal_power > 0 };
-            let allies = if caps.is_support() {
-                let a = ally_needs(view, i, &threats, &towers);
-                if a.is_empty() {
-                    continue; // a lone support healer with no one to cover follows the block
+        if let Some(matrix) = room_callback(room) {
+            let threats = kite_threats(view.hostiles);
+            let towers = kite_towers(view.structures);
+            let owned_tf;
+            let threat_field = match shared {
+                Some(l) => l.threat_field(),
+                None => {
+                    owned_tf = kite::ThreatField::build(&threats, &towers);
+                    &owned_tf
                 }
-                a
-            } else {
-                Vec::new()
             };
-            specs.push(kite::MemberLayoutSpec { idx: i, pos, hits: m.hits, caps, allies });
-        }
-        if !specs.is_empty() {
-            let layout_view = kite::SquadKiteView {
-                centroid,
-                threats: &threats,
-                towers: &towers,
-                allies: &[], // per-member allies live on each Healer spec
-                focus: decision.focus.map(|f| f.pos),
-                focus_damage,
-                params: engage_params,
-                fragile_hits, // shared-frame placeholders; plan_squad_layout overrides per member
-                squad_heal,
-                weapon_range,
+            // The shared safe-path-distance field from the focus (one near-whole-room flood over the
+            // threat-weighted matrix) — the downhill approach gradient for out-of-range members.
+            let dist_to_target: std::collections::HashMap<(u8, u8), u32> = match decision.focus {
+                Some(f) => {
+                    let mut cb = |_r: RoomName| Some(matrix.clone());
+                    screeps_rover::LocalPathfinder
+                        .search_scored_set(f.pos, &mut cb, kite::TARGET_FLOOD_OPS, 1, &|_p, _g| 0)
+                        .into_iter()
+                        .map(|t| ((t.pos.x().u8(), t.pos.y().u8()), t.g))
+                        .collect()
+                }
+                None => std::collections::HashMap::new(),
             };
-            let goals_layout = kite::plan_squad_layout(&layout_view, &specs, tactics.healer, shared, room_callback, max_ops);
-            let mut member_goals: Vec<Option<Position>> = vec![None; view.members.len()];
-            for (k, spec) in specs.iter().enumerate() {
-                member_goals[spec.idx] = goals_layout[k];
+            let assess = assess_engage(view, Some(centroid));
+            let squad_heal_out = squad_heal * screeps_combat_engine::constants::HEAL_POWER;
+            let ev_members: Vec<kernel::EvMember> = view
+                .members
+                .iter()
+                .enumerate()
+                .filter_map(|(i, m)| {
+                    let pos = m.pos?;
+                    if m.hits == 0 {
+                        return None;
+                    }
+                    Some(kernel::EvMember {
+                        idx: i,
+                        id: m.id,
+                        pos,
+                        hits: m.hits,
+                        hits_max: m.hits_max,
+                        caps: kernel::ActorCaps {
+                            melee: m.melee_power > 0,
+                            ranged: m.has_ranged,
+                            heal: m.heal_power > 0,
+                            dismantle: m.dismantle_power > 0,
+                            claim: m.claim_power > 0,
+                        },
+                        melee_power: m.melee_power,
+                        ranged_power: m.ranged_power,
+                        heal_parts: m.heal_power,
+                        dismantle_power: m.dismantle_power,
+                        claim_power: m.claim_power,
+                    })
+                })
+                .collect();
+            if !ev_members.is_empty() {
+                let results = kernel::plan_squad_ev(
+                    &ev_members,
+                    view.hostiles,
+                    view.structures,
+                    decision.focus,
+                    centroid,
+                    assess.our_strength,
+                    assess.enemy_strength,
+                    assess.balance,
+                    threat_field,
+                    squad_heal_out,
+                    &matrix,
+                    &dist_to_target,
+                );
+                let mut member_goals: Vec<Option<Position>> = vec![None; view.members.len()];
+                let mut member_intents: Vec<Vec<CombatIntent>> = vec![Vec::new(); view.members.len()];
+                for (k, m) in ev_members.iter().enumerate() {
+                    member_goals[m.idx] = results[k].goal;
+                    member_intents[m.idx] = results[k].intents.clone();
+                }
+                decision.member_goals = member_goals;
+                decision.member_intents = member_intents;
             }
-            decision.member_goals = member_goals;
         }
     }
 
     decision
-}
-
-/// Base in-combat need every covered ally contributes (HP-units), so the healer pre-positions near
-/// allies even before they're hit ("maximum POTENTIAL future healing", operator brief). Seed (§8).
-const HEALER_BASE_NEED: u32 = 100;
-/// Ticks of incoming damage folded into an ally's need — weights "this ally is under heavy fire" so the
-/// healer covers the one most likely to need it. Seed (§8); the EXP-HEAL-POS sweep tunes it.
-const HEALER_RISK_LOOKAHEAD: u32 = 5;
-
-/// Build the risk-weighted need of every OTHER squad member, for the healer's heal-coverage objective
-/// (ADR 0019 §8): a base in-combat weight + the HP deficit + a look-ahead on the damage it's taking.
-/// Excludes the healer itself (its own survival is the safety term) and unspawned/dead members.
-fn ally_needs(view: &SquadView, healer_idx: usize, threats: &[kite::KiteThreat], towers: &[kite::KiteTower]) -> Vec<kite::AllyNeed> {
-    let mut out = Vec::new();
-    for (i, m) in view.members.iter().enumerate() {
-        if i == healer_idx || m.hits == 0 {
-            continue;
-        }
-        let Some(pos) = m.pos else { continue };
-        let deficit = m.hits_max.saturating_sub(m.hits);
-        let risk = incoming_damage_at(pos, threats, towers);
-        out.push(kite::AllyNeed { pos, need: HEALER_BASE_NEED + deficit + HEALER_RISK_LOOKAHEAD * risk });
-    }
-    out
 }
 
 /// Incoming hostile damage/tick at `pos` (melee within range 1 + ranged within range 3 + tower fire) —
@@ -2155,7 +2180,7 @@ mod tests {
         SquadMemberView { hits, hits_max, heal_power: 0, pos: Some(pos(x, y)), has_ranged: true, ranged_power: 70, ..Default::default() }
     }
     fn healer_at(hits: u32, hits_max: u32, heal_power: u32, x: u8, y: u8) -> SquadMemberView {
-        SquadMemberView { hits, hits_max, heal_power, pos: Some(pos(x, y)), has_ranged: false, melee_power: 0, ranged_power: 0, damage_taken_last_tick: 0 }
+        SquadMemberView { hits, hits_max, heal_power, pos: Some(pos(x, y)), ..Default::default() }
     }
     fn squad_view<'a>(
         members: &'a [SquadMemberView],
@@ -2380,16 +2405,7 @@ mod tests {
             CombatStructureDto { pos: pos(8, 25), structure_type: StructureType::Rampart, hits: 100, hits_max: 100, ownership: Ownership::Hostile, energy: 0 },
             CombatStructureDto { pos: pos(10, 25), structure_type: StructureType::Spawn, hits: 5000, hits_max: 5000, ownership: Ownership::Hostile, energy: 0 },
         ];
-        let members = vec![SquadMemberView {
-            hits: 1000,
-            hits_max: 1000,
-            heal_power: 0,
-            pos: Some(pos(5, 25)),
-            has_ranged: false,
-            melee_power: 0,
-            ranged_power: 0,
-            damage_taken_last_tick: 0,
-        }];
+        let members = vec![SquadMemberView { hits: 1000, hits_max: 1000, pos: Some(pos(5, 25)), ..Default::default() }];
         let view = SquadView {
             members: &members,
             hostiles: &[],
