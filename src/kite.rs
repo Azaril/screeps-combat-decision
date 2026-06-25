@@ -731,40 +731,58 @@ pub fn plan_kite_anchor(
 // (don't abandon a good current tile) + a bounded spacing penalty (spread, but never past cohesion) are
 // the stability guards. Members path to their assigned tile via their own move request (no path here).
 
-/// A member's role for layout assignment — decides priority order (who claims the scarce inner tiles
-/// first) and which scoring preset re-prices its tiles.
+/// What a member can DO this tick, derived from its working PARTS (ADR 0024 §Future-work #1 —
+/// capabilities, not a rigid archetype). It drives layout claim-priority + desired engagement distance,
+/// so a multi-capability creep positions for the weapon it will actually use: a melee+ranged creep
+/// closes to range 1 to use BOTH (melee + ranged compose), instead of being labelled "Ranged" and
+/// holding at range 3 where its ATTACK parts never fire.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LayoutRole {
-    /// Melee fighter — wants the range-1 ring (claims the contested inner tiles first).
-    Melee,
-    /// Ranged fighter — holds the `r*` ring.
-    Ranged,
-    /// Pure-support healer — wants maximal heal-coverage of at-risk allies (ADR 0019 §8), back-line.
-    Healer,
+pub struct MemberCaps {
+    pub can_melee: bool,
+    pub can_range: bool,
+    pub can_heal: bool,
 }
 
-impl LayoutRole {
-    /// Assignment priority (lower goes first): melee needs the scarce range-1 tiles most, then ranged,
-    /// then healers settle around the placed block.
+impl MemberCaps {
+    /// A **pure-support healer** (heal, no offense): positions for maximal heal-coverage of the placed
+    /// block (ADR 0019 §8), back-line, scored with the healer preset. A creep that ALSO has offense is a
+    /// FIGHTER whose heal is opportunistic (the EV heal in `decide_combat`), not a back-line support slot.
+    pub fn is_support(self) -> bool {
+        self.can_heal && !self.can_melee && !self.can_range
+    }
+    /// Desired engagement distance for a FIGHTER: range 1 if it can melee (close to bring every weapon to
+    /// bear — melee + ranged compose), else range 3 for ranged-only. (Support healers use the healer
+    /// branch, not this.) The survival veto still forbids closing onto a lethal tile.
+    fn desired_range(self) -> u32 {
+        if self.can_melee {
+            1
+        } else {
+            3
+        }
+    }
+    /// Layout claim priority (lower goes first): melee-capable members need the scarce range-1 tiles most,
+    /// then ranged-only, then support healers settle around the placed block.
     fn order(self) -> u8 {
-        match self {
-            LayoutRole::Melee => 0,
-            LayoutRole::Ranged => 1,
-            LayoutRole::Healer => 2,
+        if self.is_support() {
+            2
+        } else if self.can_melee {
+            0
+        } else {
+            1
         }
     }
 }
 
 /// One member to place in [`plan_squad_layout`]. `idx` is where the result is written back; `pos` is the
 /// member's CURRENT tile (the incumbency anchor); `hits` is its own survivability (safety term + veto +
-/// priority tie-break); `allies` is the §8 heal-coverage need list (healers only, empty otherwise).
+/// priority tie-break); `caps` drives its claim order + desired distance (capability-derived, not a role
+/// label); `allies` is the §8 heal-coverage need list (support healers only, empty otherwise).
 #[derive(Clone, Debug)]
 pub struct MemberLayoutSpec {
     pub idx: usize,
     pub pos: Position,
     pub hits: u32,
-    pub weapon_range: u32,
-    pub role: LayoutRole,
+    pub caps: MemberCaps,
     pub allies: Vec<AllyNeed>,
 }
 
@@ -874,10 +892,10 @@ pub fn plan_squad_layout(
         None => std::collections::HashMap::new(),
     };
 
-    // Deterministic claim order: melee first, then ranged, then healers; ties by ascending fragility then
-    // stable idx. Fighters anchor first; healers (last) cover the placed teammates.
+    // Deterministic claim order: melee-capable first, then ranged-only, then support healers; ties by
+    // ascending fragility then stable idx. Fighters anchor first; support healers (last) cover the block.
     let mut order: Vec<usize> = (0..members.len()).collect();
-    order.sort_by_key(|&i| (members[i].role.order(), members[i].hits, members[i].idx));
+    order.sort_by_key(|&i| (members[i].caps.order(), members[i].hits, members[i].idx));
 
     // Each member picks its LOCAL next-step (current ±1). APPROACH (focus out of action range) → step
     // DOWNHILL on D (the safe route to the target; progress dominates, so spacing/incumbency are not
@@ -887,9 +905,10 @@ pub fn plan_squad_layout(
     let mut claimed: Vec<Position> = Vec::with_capacity(members.len());
     for &mi in &order {
         let m = &members[mi];
-        let (params, allies, focus, weapon_range): (KiteScoreParams, &[AllyNeed], Option<Position>, u32) = match m.role {
-            LayoutRole::Healer => (healer_params, m.allies.as_slice(), None, 1),
-            _ => (view.params, &[], view.focus, m.weapon_range),
+        let (params, allies, focus, weapon_range): (KiteScoreParams, &[AllyNeed], Option<Position>, u32) = if m.caps.is_support() {
+            (healer_params, m.allies.as_slice(), None, 1)
+        } else {
+            (view.params, &[], view.focus, m.caps.desired_range())
         };
         let mview = SquadKiteView {
             centroid: view.centroid, // anchors the proximity beeline; cohesion comes via cohesion_dist (adjacency)
@@ -1323,8 +1342,14 @@ mod tests {
             weapon_range: 3,
         }
     }
-    fn spec(idx: usize, x: u8, y: u8, role: LayoutRole, weapon_range: u32) -> MemberLayoutSpec {
-        MemberLayoutSpec { idx, pos: pos(x, y), hits: 2000, weapon_range, role, allies: Vec::new() }
+    fn melee_caps() -> MemberCaps {
+        MemberCaps { can_melee: true, can_range: false, can_heal: false }
+    }
+    fn ranged_caps() -> MemberCaps {
+        MemberCaps { can_melee: false, can_range: true, can_heal: false }
+    }
+    fn spec(idx: usize, x: u8, y: u8, caps: MemberCaps) -> MemberLayoutSpec {
+        MemberLayoutSpec { idx, pos: pos(x, y), hits: 2000, caps, allies: Vec::new() }
     }
 
     #[test]
@@ -1333,10 +1358,10 @@ mod tests {
         let focus = pos(25, 30);
         let v = engage_view_for_layout(pos(25, 25), focus);
         let members = vec![
-            spec(0, 25, 25, LayoutRole::Ranged, 3),
-            spec(1, 24, 25, LayoutRole::Ranged, 3),
-            spec(2, 26, 25, LayoutRole::Ranged, 3),
-            spec(3, 25, 24, LayoutRole::Ranged, 3),
+            spec(0, 25, 25, ranged_caps()),
+            spec(1, 24, 25, ranged_caps()),
+            spec(2, 26, 25, ranged_caps()),
+            spec(3, 25, 24, ranged_caps()),
         ];
         let goals = plan_squad_layout(&v, &members, KiteScoreParams::healer(), None, &mut cb, MAX_KITE_OPS);
         let placed: Vec<Position> = goals.iter().flatten().copied().collect();
@@ -1350,9 +1375,9 @@ mod tests {
         let mut cb = |_r| Some(LocalCostMatrix::new());
         let v = engage_view_for_layout(pos(25, 25), pos(30, 25));
         let members = vec![
-            spec(0, 25, 25, LayoutRole::Melee, 1),
-            spec(1, 24, 25, LayoutRole::Ranged, 3),
-            spec(2, 26, 25, LayoutRole::Ranged, 3),
+            spec(0, 25, 25, melee_caps()),
+            spec(1, 24, 25, ranged_caps()),
+            spec(2, 26, 25, ranged_caps()),
         ];
         let a = plan_squad_layout(&v, &members, KiteScoreParams::healer(), None, &mut cb, MAX_KITE_OPS);
         let b = plan_squad_layout(&v, &members, KiteScoreParams::healer(), None, &mut cb, MAX_KITE_OPS);
@@ -1368,7 +1393,7 @@ mod tests {
         let focus = pos(25, 32);
         let start = pos(25, 25);
         let v = engage_view_for_layout(start, focus);
-        let members = vec![spec(0, 25, 25, LayoutRole::Melee, 1)];
+        let members = vec![spec(0, 25, 25, melee_caps())];
         let goals = plan_squad_layout(&v, &members, KiteScoreParams::healer(), None, &mut cb, MAX_KITE_OPS);
         let step = goals[0].expect("melee placed");
         assert!(step.get_range_to(start) <= 1, "it is a LOCAL step (current ±1): {:?}", step);
@@ -1385,10 +1410,40 @@ mod tests {
         let mut cb = |_r| Some(LocalCostMatrix::new());
         let focus = pos(25, 30);
         let v = engage_view_for_layout(pos(25, 25), focus);
-        let members = vec![spec(0, 25, 29, LayoutRole::Ranged, 3)];
+        let members = vec![spec(0, 25, 29, ranged_caps())];
         let goals = plan_squad_layout(&v, &members, KiteScoreParams::healer(), None, &mut cb, MAX_KITE_OPS);
         let g = goals[0].expect("placed");
         assert_eq!(g.get_range_to(focus), 1, "engaged at range 1 (press the kill): {:?}", g);
         assert_eq!(g, pos(25, 29), "incumbency holds the current tile over the equal lower-x tiebreak: {:?}", g);
+    }
+
+    #[test]
+    fn member_caps_drive_distance_and_role() {
+        let ranged = ranged_caps();
+        let melee = melee_caps();
+        let support = MemberCaps { can_melee: false, can_range: false, can_heal: true };
+        let medic_fighter = MemberCaps { can_melee: true, can_range: false, can_heal: true };
+        assert_eq!(ranged.desired_range(), 3);
+        assert_eq!(melee.desired_range(), 1);
+        assert!(support.is_support(), "heal-only is a back-line support slot");
+        assert!(!medic_fighter.is_support(), "melee+heal is a fighter (heal is opportunistic), not support");
+        assert_eq!(medic_fighter.desired_range(), 1, "a melee+heal creep positions for melee");
+    }
+
+    #[test]
+    fn a_melee_ranged_creep_approaches_to_melee_range() {
+        // Capability-derived positioning (ADR 0024 #1): a creep that can BOTH melee and range wants
+        // range 1 (bring both weapons to bear), so it has the melee `desired_range` (1) and APPROACHES
+        // the focus tile-by-tile rather than being frozen at the range-3 ring like the old
+        // `LayoutRole::Ranged` label did (where its ATTACK parts never fired). One tick = one step closer.
+        let mut cb = |_r| Some(LocalCostMatrix::new());
+        let focus = pos(25, 30);
+        let start = pos(25, 25); // range 5 of the focus
+        let v = engage_view_for_layout(start, focus);
+        let mr = MemberCaps { can_melee: true, can_range: true, can_heal: false };
+        assert_eq!(mr.desired_range(), 1, "melee+ranged targets melee distance");
+        let step = plan_squad_layout(&v, &[spec(0, 25, 25, mr)], KiteScoreParams::healer(), None, &mut cb, MAX_KITE_OPS)[0].expect("placed");
+        assert!(step.get_range_to(start) <= 1, "a LOCAL step (current ±1): {step:?}");
+        assert!(step.get_range_to(focus) < start.get_range_to(focus), "closes toward the focus: {step:?}");
     }
 }

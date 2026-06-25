@@ -1550,20 +1550,21 @@ pub fn decide_squad_with_pathing(
                 continue; // dead → no creep to place
             }
             let Some(pos) = m.pos else { continue }; // unsynced position → follows the block
-            let is_pure_healer = m.heal_power > 0 && m.melee_power == 0 && !m.has_ranged;
-            let (role, allies) = if is_pure_healer {
+            // Capability-derived (ADR 0024 §Future-work #1): a creep's layout behavior comes from what its
+            // PARTS can do, not a single archetype label — so a melee+ranged creep closes to range 1 (use
+            // both weapons) instead of holding at 3, and a melee+heal creep positions as a fighter (its
+            // heal is the opportunistic EV heal in `decide_combat`, not a back-line support slot).
+            let caps = kite::MemberCaps { can_melee: m.melee_power > 0, can_range: m.has_ranged, can_heal: m.heal_power > 0 };
+            let allies = if caps.is_support() {
                 let a = ally_needs(view, i, &threats, &towers);
                 if a.is_empty() {
-                    continue; // a lone healer with no one to cover follows the block
+                    continue; // a lone support healer with no one to cover follows the block
                 }
-                (kite::LayoutRole::Healer, a)
-            } else if m.has_ranged {
-                (kite::LayoutRole::Ranged, Vec::new())
+                a
             } else {
-                (kite::LayoutRole::Melee, Vec::new())
+                Vec::new()
             };
-            let weapon_range = if m.has_ranged { 3 } else { 1 };
-            specs.push(kite::MemberLayoutSpec { idx: i, pos, hits: m.hits, weapon_range, role, allies });
+            specs.push(kite::MemberLayoutSpec { idx: i, pos, hits: m.hits, caps, allies });
         }
         if !specs.is_empty() {
             let layout_view = kite::SquadKiteView {
