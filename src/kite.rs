@@ -11,7 +11,7 @@
 //! are tunable params (the ADR 0008a EXP-* loop tunes them on the sim).
 
 use screeps::local::{LocalCostMatrix, RoomXY};
-use screeps::{Position, RoomName};
+use screeps::{Position, RoomCoordinate, RoomName};
 use screeps_rover::{LocalPathfinder, ReachSource, ReachabilityMap};
 
 /// Op budget for the per-squad kite search — a local ~window flood, not a full-room path. Bounded
@@ -780,6 +780,14 @@ pub const LAYOUT_DEAD_BAND_R: u32 = 1;
 /// Incumbency dead-band magnitude (cost units): a member keeps (or stays adjacent to) its current tile
 /// unless a candidate beats it by more than this — the anti-oscillation hysteresis. Seed; tuned by EXP-*.
 pub const LAYOUT_DEAD_BAND: i64 = 40;
+/// ADR 0024: a tile IN action range of the target (objective doable) is preferred over any out-of-range
+/// approach tile by this much — large so the member always reaches/holds action range before optimizing
+/// the standing position. Below `LETHAL_TILE_PENALTY` so the survival veto still wins.
+pub const LAYOUT_DOABLE_BONUS: i64 = 100_000;
+/// Op budget for the per-tick TARGET flood (the safe-path-distance field from the focus over the threat-
+/// weighted matrix) — a near-whole-room Dijkstra so a member anywhere in the room gets a downhill route
+/// to the target (non-myopic). One flood per engaged squad, shared across its members.
+pub const TARGET_FLOOD_OPS: u32 = 2500;
 
 /// Bounded spacing penalty for `tile` given already-`claimed` tiles: `LAYOUT_SPACING_W` scaled down to 0
 /// at `LAYOUT_SPACING_R+1`, taking the WORST (closest) claimed tile — so it is hard-capped at
@@ -847,19 +855,35 @@ pub fn plan_squad_layout(
     };
     let threat_field = layers.threat_field();
     let threat_reach = layers.threat_reach();
-    // ONE flood. The settled SET is determined by path-cost `g` (Dijkstra order) + max_ops, independent
-    // of the score, so flood by `g` and re-price per member below; we only read each tile's pos + g.
-    let mut cb = |_r: RoomName| Some(matrix.clone());
-    let set = LocalPathfinder.search_scored_set(view.centroid, &mut cb, max_ops, 1, &|_p, g| g as i64);
-    if set.is_empty() {
-        return goals;
-    }
 
-    // Deterministic claim order: melee first (scarce inner ring), then ranged, then healers; ties by
-    // ascending fragility then stable idx.
+    // ADR 0024 TARGET FLOOD: D[tile] = threat-weighted path-cost to reach the focus from `tile` (one
+    // near-whole-room Dijkstra seeded at the focus, over the same — threat-weighted — matrix). A member
+    // approaching steps to the neighbour minimizing D = the next step on the SAFE route to the target;
+    // because D decreases monotonically along that route, it is NON-MYOPIC (no Chebyshev plateau / no
+    // local-greedy stall — the failures of the raw-distance attempts). `None` focus → no D (healers /
+    // no-target hold via score_tile).
+    let dist_to_target: std::collections::HashMap<(u8, u8), u32> = match view.focus {
+        Some(f) => {
+            let mut cb = |_r: RoomName| Some(matrix.clone());
+            LocalPathfinder
+                .search_scored_set(f, &mut cb, TARGET_FLOOD_OPS, 1, &|_p, _g| 0)
+                .into_iter()
+                .map(|t| ((t.pos.x().u8(), t.pos.y().u8()), t.g))
+                .collect()
+        }
+        None => std::collections::HashMap::new(),
+    };
+
+    // Deterministic claim order: melee first, then ranged, then healers; ties by ascending fragility then
+    // stable idx. Fighters anchor first; healers (last) cover the placed teammates.
     let mut order: Vec<usize> = (0..members.len()).collect();
     order.sort_by_key(|&i| (members[i].role.order(), members[i].hits, members[i].idx));
 
+    // Each member picks its LOCAL next-step (current ±1). APPROACH (focus out of action range) → step
+    // DOWNHILL on D (the safe route to the target; progress dominates, so spacing/incumbency are not
+    // applied — they would stall the march). DOABLE (in action range) or healer/no-focus → score_tile
+    // balances safety/dmg/heal + adjacency, with a doable bonus so the member reaches/holds action range;
+    // spacing + incumbency keep the formation distinct + damp oscillation. The formation EMERGES.
     let mut claimed: Vec<Position> = Vec::with_capacity(members.len());
     for &mi in &order {
         let m = &members[mi];
@@ -868,7 +892,7 @@ pub fn plan_squad_layout(
             _ => (view.params, &[], view.focus, m.weapon_range),
         };
         let mview = SquadKiteView {
-            centroid: view.centroid,
+            centroid: view.centroid, // anchors the proximity beeline; cohesion comes via cohesion_dist (adjacency)
             threats: view.threats,
             towers: view.towers,
             allies,
@@ -879,23 +903,50 @@ pub fn plan_squad_layout(
             squad_heal: view.squad_heal,
             weapon_range,
         };
-        let mut best: Option<(i64, u32, u8, u8, Position)> = None; // (cost, g, x, y) deterministic key
-        for t in &set {
-            let fields = KiteFields { threat_field: Some(threat_field), threat_reach, cohesion_dist: Some(t.g) };
-            let mut cost = score_tile(&mview, t.pos, walkable_neighbors(&matrix, t.pos), &fields);
-            // Survival veto for THIS member (its own hits) — never assign it a lethal tile.
-            let net = (threat_field.raw_at(t.pos) - view.squad_heal as i32).max(0);
-            if m.hits > 0 && net > 0 && net * SURVIVAL_HORIZON > m.hits as i32 {
-                cost = cost.saturating_add(LETHAL_TILE_PENALTY);
-            }
-            cost = cost.saturating_add(spacing_penalty(t.pos, &claimed)).saturating_sub(incumbency_bonus(t.pos, m.pos));
-            let key = (cost, t.g, t.pos.x().u8(), t.pos.y().u8());
-            let better = match best {
-                None => true,
-                Some((bc, bg, bx, by, _)) => key < (bc, bg, bx, by),
-            };
-            if better {
-                best = Some((cost, t.g, t.pos.x().u8(), t.pos.y().u8(), t.pos));
+        let (cx, cy) = (m.pos.x().u8() as i32, m.pos.y().u8() as i32);
+        let mut best: Option<(i64, u8, u8, Position)> = None; // (cost, x, y) deterministic key
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                let (nx, ny) = (cx + dx, cy + dy);
+                if !(0..50).contains(&nx) || !(0..50).contains(&ny) {
+                    continue;
+                }
+                let tile = match (RoomCoordinate::new(nx as u8), RoomCoordinate::new(ny as u8)) {
+                    (Ok(rx), Ok(ry)) => Position::new(rx, ry, room),
+                    _ => continue,
+                };
+                if matrix.get(tile.xy()) == u8::MAX {
+                    continue; // impassable
+                }
+                let xy = (tile.x().u8(), tile.y().u8());
+                let approach = matches!(focus, Some(f) if tile.get_range_to(f) > weapon_range);
+                let mut cost = if approach {
+                    // Pure safe-path-distance downhill toward the target (unreachable → astronomically far).
+                    dist_to_target.get(&xy).map(|&d| d as i64).unwrap_or(LETHAL_TILE_PENALTY)
+                } else {
+                    // DOABLE / healer / no-focus: balanced standing position + formation, strongly prefer
+                    // an in-action-range tile, with spacing + incumbency.
+                    let adj = claimed.iter().map(|c| tile.get_range_to(*c)).min().unwrap_or(0);
+                    let fields = KiteFields { threat_field: Some(threat_field), threat_reach, cohesion_dist: Some(adj) };
+                    let mut c = score_tile(&mview, tile, walkable_neighbors(&matrix, tile), &fields);
+                    if focus.is_some() {
+                        c = c.saturating_sub(LAYOUT_DOABLE_BONUS); // in range → objective doable
+                    }
+                    c.saturating_add(spacing_penalty(tile, &claimed)).saturating_sub(incumbency_bonus(tile, m.pos))
+                };
+                // Survival veto for THIS member (its own hits) — never step onto a lethal tile.
+                let net = (threat_field.raw_at(tile) - view.squad_heal as i32).max(0);
+                if m.hits > 0 && net > 0 && net * SURVIVAL_HORIZON > m.hits as i32 {
+                    cost = cost.saturating_add(LETHAL_TILE_PENALTY);
+                }
+                let key = (cost, tile.x().u8(), tile.y().u8());
+                let better = match best {
+                    None => true,
+                    Some((bc, bx, by, _)) => key < (bc, bx, by),
+                };
+                if better {
+                    best = Some((cost, tile.x().u8(), tile.y().u8(), tile));
+                }
             }
         }
         if let Some((.., pos)) = best {
@@ -1309,16 +1360,19 @@ mod tests {
     }
 
     #[test]
-    fn layout_puts_melee_at_its_weapon_range() {
-        // A melee member's assigned tile is at range 1 of the focus — its r*=1 ring emerges from the
-        // member's own weapon range driving score_tile (prox/dmg pull to range 1), not a fixed template.
+    fn layout_steps_locally_toward_the_focus() {
+        // ADR 0024: the layout returns a LOCAL next-step (current ±1) DOWN the target-flood field — the
+        // squad marches to the target over ticks (the role ring emerges on arrival), it does not teleport
+        // to the final ring in one tick. A member far from the focus steps one tile closer along the route.
         let mut cb = |_r| Some(LocalCostMatrix::new());
         let focus = pos(25, 32);
-        let v = engage_view_for_layout(pos(25, 25), focus);
+        let start = pos(25, 25);
+        let v = engage_view_for_layout(start, focus);
         let members = vec![spec(0, 25, 25, LayoutRole::Melee, 1)];
         let goals = plan_squad_layout(&v, &members, KiteScoreParams::healer(), None, &mut cb, MAX_KITE_OPS);
-        let melee = goals[0].expect("melee placed");
-        assert_eq!(melee.get_range_to(focus), 1, "melee closes to its range-1 ring: {:?}", melee);
+        let step = goals[0].expect("melee placed");
+        assert!(step.get_range_to(start) <= 1, "it is a LOCAL step (current ±1): {:?}", step);
+        assert!(step.get_range_to(focus) < start.get_range_to(focus), "steps closer to the focus: {:?}", step);
     }
 
     #[test]
