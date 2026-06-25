@@ -1627,6 +1627,7 @@ pub fn decide_squad_with_pathing(
                     squad_heal_out,
                     &matrix,
                     &dist_to_target,
+                    &tactics.kernel,
                 );
                 let mut member_goals: Vec<Option<Position>> = vec![None; view.members.len()];
                 let mut member_intents: Vec<Vec<CombatIntent>> = vec![Vec::new(); view.members.len()];

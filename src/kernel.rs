@@ -266,18 +266,31 @@ const FOCUS_STRUCT_BONUS: i64 = 4;
 /// Healing an ally in MORTAL danger (anticipated incoming ≥ its hits) prevents losing its whole fighting
 /// strength — worth a multiple of a marginal top-up.
 const MORTAL_HEAL_MULT: i64 = 4;
-/// Position-shaping coefficients, expressed as multiples of the per-tick currency `unit` so they stay
-/// commensurate with offense/heal EV (tie-breaker scale: a kill is `unit × hundreds`, these are `unit ×
-/// units`). Seeds.
-const DISCOHESION_COEF: i64 = 10;
-const COHESION_K: u32 = 3;
-const SPACING_COEF: i64 = 1;
 const SPACING_R: u32 = 1;
-/// Incumbency dead-band (hold the current tile). Applied only at a FIRING position (offense reachable),
-/// where it damps the engaged period-2 jitter; it is NOT applied while merely approaching/healing (so it
-/// can't out-weigh the approach march). Strong there because the approach term is tiny once in range.
-const INCUMBENCY_COEF: i64 = 3;
-const APPROACH_COEF: i64 = 2;
+
+/// The kernel's **position-shaping tuning seam** (ADR 0025 directive 3 — the tournament tunes these;
+/// `Default` is the working seed set this build shipped with). Each coefficient is a multiple of the
+/// per-tick currency `unit`, so they stay commensurate with offense/heal EV (a kill is `unit × hundreds`;
+/// these are tie-breaker scale, `unit × units`). They are the stability + engagement levers:
+/// - `approach_coef` — the downhill pull toward the objective (per tile of flood-distance). MUST exceed
+///   `incumbency_coef` or a creep stalls instead of advancing.
+/// - `incumbency_coef` — the dead-band that holds a FIRING tile (damps engaged period-2 jitter).
+/// - `discohesion_coef` / `cohesion_k` — the squad-cohesion pull past radius K from the centroid.
+/// - `spacing_coef` — the spread penalty for crowding a claimed tile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KernelParams {
+    pub approach_coef: i64,
+    pub incumbency_coef: i64,
+    pub discohesion_coef: i64,
+    pub cohesion_k: u32,
+    pub spacing_coef: i64,
+}
+
+impl Default for KernelParams {
+    fn default() -> Self {
+        Self { approach_coef: 2, incumbency_coef: 3, discohesion_coef: 10, cohesion_k: 3, spacing_coef: 1 }
+    }
+}
 /// Hard survival backstop: a tile whose net incoming would kill the member within the horizon is priced
 /// astronomically so it is never chosen regardless of EV (the binary veto under the graduated RISK term).
 const LETHAL: i64 = 1_000_000_000_000_000;
@@ -336,6 +349,7 @@ pub fn plan_squad_ev(
     squad_heal: u32,
     matrix: &LocalCostMatrix,
     dist_to_target: &HashMap<(u8, u8), u32>,
+    params: &KernelParams,
 ) -> Vec<EvResult> {
     let room = centroid.room_name();
     let Sensitivities { g_us, g_them } = sensitivities(our_strength, enemy_strength, mu);
@@ -406,7 +420,7 @@ pub fn plan_squad_ev(
         // (1) ACTION from the current tile (engine resolves actions pre-move); drains the ledgers.
         let (_, intents) = best_action(m, m.pos, &mut dmg, &mut heals, g_us, true);
         // (2) POSITION: the local tile (current ±1, walkable) whose value is highest.
-        let goal = best_tile(m, room, &dmg, &heals, squad_heal, g_us, unit, centroid, threat_field, matrix, dist_to_target, &claimed);
+        let goal = best_tile(m, room, &dmg, &heals, squad_heal, g_us, unit, centroid, threat_field, matrix, dist_to_target, &claimed, params);
         if let Some(g) = goal {
             claimed.push(g);
         }
@@ -648,6 +662,7 @@ fn best_tile(
     matrix: &LocalCostMatrix,
     dist_to_target: &HashMap<(u8, u8), u32>,
     claimed: &[Position],
+    params: &KernelParams,
 ) -> Option<Position> {
     let (cx, cy) = (m.pos.x().u8() as i32, m.pos.y().u8() as i32);
     let mut best: Option<(i64, u8, u8, Position)> = None;
@@ -674,22 +689,22 @@ fn best_tile(
             let d = dist_to_target.get(&(tile.x().u8(), tile.y().u8())).copied().unwrap_or(u32::MAX);
             let mut cost = action
                 .saturating_sub(g_us.saturating_mul(net as i64))
-                .saturating_sub(unit.saturating_mul(APPROACH_COEF).saturating_mul(d.min(10_000) as i64));
+                .saturating_sub(unit.saturating_mul(params.approach_coef).saturating_mul(d.min(10_000) as i64));
             // Cohesion: penalize distance past K from the squad centroid.
             let coh = centroid.get_range_to(tile);
-            if coh > COHESION_K {
-                cost -= unit.saturating_mul(DISCOHESION_COEF).saturating_mul((coh - COHESION_K) as i64);
+            if coh > params.cohesion_k {
+                cost -= unit.saturating_mul(params.discohesion_coef).saturating_mul((coh - params.cohesion_k) as i64);
             }
             // Spacing: penalize crowding an already-claimed tile.
             if claimed.iter().any(|c| tile.get_range_to(*c) <= SPACING_R && *c != tile) {
-                cost -= unit.saturating_mul(SPACING_COEF);
+                cost -= unit.saturating_mul(params.spacing_coef);
             }
             // Incumbency: hold the current tile to damp engaged period-2 jitter — applied only at a
             // FIRING position (offense reachable). While approaching/healing it is off, so the approach
             // pull (always applied above) is never blocked; once in firing range it strongly damps the
             // tile-flip that two engaged squads would otherwise oscillate into.
             if tile == m.pos && offense_reachable(m, tile, dmg) {
-                cost += unit.saturating_mul(INCUMBENCY_COEF);
+                cost += unit.saturating_mul(params.incumbency_coef);
             }
             // Survival veto: never step onto a tile whose net incoming kills the member within the horizon.
             if m.hits > 0 && net > 0 && net * SURVIVAL_HORIZON > m.hits as i32 {
@@ -858,7 +873,7 @@ mod tests {
         let me = melee_evm(0, 1, 25, 25);
         let enemy = khostile(9, 26, 25, 100, &[(Part::Attack, 1)]);
         let focus = Some(FocusTarget { pos: enemy.pos, id: enemy.id });
-        let out = plan_squad_ev(&[me], &[enemy], &[], focus, kpos(25, 25), 10_000, 5_000, 300, &no_threat(), 0, &LocalCostMatrix::new(), &chebyshev_flood(kpos(26, 25)));
+        let out = plan_squad_ev(&[me], &[enemy], &[], focus, kpos(25, 25), 10_000, 5_000, 300, &no_threat(), 0, &LocalCostMatrix::new(), &chebyshev_flood(kpos(26, 25)), &KernelParams::default());
         assert!(out[0].intents.iter().any(|i| matches!(i, CombatIntent::Attack { target, .. } if *target == kpos(26, 25))), "melee attacks the adjacent enemy: {:?}", out[0].intents);
     }
 
@@ -867,7 +882,7 @@ mod tests {
         let me = melee_evm(0, 1, 20, 25);
         let enemy = khostile(9, 28, 25, 100, &[(Part::Attack, 1)]);
         let focus = Some(FocusTarget { pos: enemy.pos, id: enemy.id });
-        let out = plan_squad_ev(&[me], &[enemy], &[], focus, kpos(20, 25), 10_000, 5_000, 300, &no_threat(), 0, &LocalCostMatrix::new(), &chebyshev_flood(kpos(28, 25)));
+        let out = plan_squad_ev(&[me], &[enemy], &[], focus, kpos(20, 25), 10_000, 5_000, 300, &no_threat(), 0, &LocalCostMatrix::new(), &chebyshev_flood(kpos(28, 25)), &KernelParams::default());
         let goal = out[0].goal.expect("a move goal");
         assert!(goal.get_range_to(kpos(20, 25)) <= 1, "a local step: {goal:?}");
         assert!(goal.get_range_to(kpos(28, 25)) < kpos(20, 25).get_range_to(kpos(28, 25)), "steps toward the enemy: {goal:?}");
@@ -880,7 +895,7 @@ mod tests {
         let me = melee_evm(0, 1, 25, 25);
         let spawn = kstruct(26, 25, StructureType::Spawn);
         let focus = Some(FocusTarget { pos: spawn.pos, id: None });
-        let out = plan_squad_ev(&[me], &[], &[spawn], focus, kpos(25, 25), 10_000, 5_000, 300, &no_threat(), 0, &LocalCostMatrix::new(), &chebyshev_flood(kpos(26, 25)));
+        let out = plan_squad_ev(&[me], &[], &[spawn], focus, kpos(25, 25), 10_000, 5_000, 300, &no_threat(), 0, &LocalCostMatrix::new(), &chebyshev_flood(kpos(26, 25)), &KernelParams::default());
         assert!(out[0].intents.iter().any(|i| matches!(i, CombatIntent::Attack { target, id: None } if *target == kpos(26, 25))), "melee breaches the structure: {:?}", out[0].intents);
     }
 
@@ -919,7 +934,7 @@ mod tests {
             &[crate::kite::KiteThreat { pos: kpos(27, 25), kind: crate::kite::ThreatKind::MeleeOnly, reach: 1, step_ticks: Some(1), attack_power: 150, ranged_power: 0 }],
             &[],
         );
-        let out = plan_squad_ev(&[healer, ally], &[], &[], None, kpos(25, 25), 10_000, 5_000, -300, &threat, 0, &LocalCostMatrix::new(), &HashMap::new());
+        let out = plan_squad_ev(&[healer, ally], &[], &[], None, kpos(25, 25), 10_000, 5_000, -300, &threat, 0, &LocalCostMatrix::new(), &HashMap::new(), &KernelParams::default());
         assert!(out[0].intents.iter().any(|i| matches!(i, CombatIntent::Heal { target, .. } if *target == kpos(26, 25))), "healer heals the mortal ally: {:?}", out[0].intents);
     }
 
@@ -932,7 +947,7 @@ mod tests {
         let enemy = khostile(9, 26, 25, 100, &[(Part::Attack, 1)]); // both adjacent (a: range1, b: range1)
         let weak = khostile(8, 26, 26, 100, &[(Part::Attack, 1)]); // a second target for the spill
         let focus = Some(FocusTarget { pos: enemy.pos, id: enemy.id });
-        let out = plan_squad_ev(&[a, b], &[enemy.clone(), weak.clone()], &[], focus, kpos(25, 25), 20_000, 4_000, 400, &no_threat(), 0, &LocalCostMatrix::new(), &chebyshev_flood(kpos(26, 25)));
+        let out = plan_squad_ev(&[a, b], &[enemy.clone(), weak.clone()], &[], focus, kpos(25, 25), 20_000, 4_000, 400, &no_threat(), 0, &LocalCostMatrix::new(), &chebyshev_flood(kpos(26, 25)), &KernelParams::default());
         let attacked: Vec<Position> = out.iter().flat_map(|r| r.intents.iter().filter_map(|i| match i { CombatIntent::Attack { target, .. } => Some(*target), _ => None })).collect();
         assert_eq!(attacked.len(), 2, "both creeps act");
         assert!(attacked.contains(&kpos(26, 25)) && attacked.contains(&kpos(26, 26)), "fire spills to the second target instead of overkilling the first: {attacked:?}");

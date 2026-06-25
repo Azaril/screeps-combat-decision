@@ -244,13 +244,20 @@ pub struct SquadTacticParams {
     /// Weights for the engage/advance scored search (the engage branch).
     pub engage: KiteScoreParams,
     /// Weights for the healer heal-coverage scored search (ADR 0019 §8 — a pure-support healer's own
-    /// per-member goal in an engaged, non-kiting squad).
+    /// per-member goal in an engaged, non-kiting squad). (Kite path only; the kernel owns engaged positioning.)
     pub healer: KiteScoreParams,
+    /// ADR 0025 EV-kernel position-shaping seam — what the self-play tournament tunes for engaged combat.
+    pub kernel: crate::kernel::KernelParams,
 }
 
 impl Default for SquadTacticParams {
     fn default() -> Self {
-        Self { kite: KiteScoreParams::default(), engage: KiteScoreParams::engage(), healer: KiteScoreParams::healer() }
+        Self {
+            kite: KiteScoreParams::default(),
+            engage: KiteScoreParams::engage(),
+            healer: KiteScoreParams::healer(),
+            kernel: crate::kernel::KernelParams::default(),
+        }
     }
 }
 
