@@ -1029,6 +1029,34 @@ fn assess_engage(view: &SquadView, centroid: Option<Position>) -> EngageAssessme
     EngageAssessment { balance, unwinnable, our_strength, enemy_strength }
 }
 
+/// The Lanchester engage **prediction** for a matchup, exposed for harness validation (does the model's
+/// predicted balance/win-probability match the sim outcome? — find mispredicted/"broken" comps). Same
+/// numbers the EV kernel's `g_us`/`g_them` currency consumes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EnginePrediction {
+    /// Lanchester margin μ (permille of enemy strength; >0 favours us, clamped ±1000).
+    pub balance: i64,
+    /// Win-probability in permille from the kernel's sigmoid of `balance`.
+    pub win_permille: i64,
+    /// Hard veto: irremovable incoming we can't out-heal / safe-mode → can't win regardless of balance.
+    pub unwinnable: bool,
+    pub our_strength: u64,
+    pub enemy_strength: u64,
+}
+
+/// Predict engage-vs-retreat for `view` (our `members` vs `hostiles`) — the public face of the private
+/// Lanchester gate, for the harness's predicted-vs-actual validation.
+pub fn predict_engage(view: &SquadView, centroid: Option<Position>) -> EnginePrediction {
+    let a = assess_engage(view, centroid);
+    EnginePrediction {
+        balance: a.balance,
+        win_permille: kernel::win_permille(a.balance),
+        unwinnable: a.unwinnable,
+        our_strength: a.our_strength,
+        enemy_strength: a.enemy_strength,
+    }
+}
+
 /// **The squad-level tactical decision** (ADR 0008 §4, P2.G3). Picks the squad's shared
 /// focus ([`select_focus_target`] from the whole roster's perspective) and resolves
 /// engage-vs-retreat with **coupled hysteresis** (no yo-yo): once `Retreating`, the squad
