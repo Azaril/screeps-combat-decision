@@ -26,6 +26,13 @@ use screeps_combat_engine::constants::{DISMANTLE_POWER, RANGED_ATTACK_POWER, TOW
 /// scenarios.
 pub const HOLD_MARGIN: f32 = 1.3;
 
+/// Coordinated square-law over-match seed (ADR 0026 §9.4/§9.8): a player's creeps fight TOGETHER
+/// (focus-fire + mutual heal), so to win the attrition race with survivors we must OUT-power them, not
+/// merely match — field this multiple of the break-even creep-clear force. An `Individual` fight (NPCs
+/// fought one at a time) uses `1.0` (just beat the worst single). Seed; tournament-tuned on the
+/// Coordinated player-squad bed (ADR 0026 §9.8, deferred — see the §9.10 ledger).
+pub const COORDINATED_DPS_MARGIN: f32 = 1.5;
+
 /// One hostile tower's threat to the planned assault position.
 #[derive(Clone, Copy, Debug)]
 pub struct TowerThreat {
@@ -199,6 +206,70 @@ pub fn assess(profile: &DefenseProfile, budget: &ForceBudget) -> ForceAssessment
     unwinnable("towers out-damage a single squad — needs heavy assault (G4-HEAVY)")
 }
 
+/// Size a CREEP-CLEAR engagement (ADR 0026 §9.4 — the keystone for the `PlayerDefend`/`PlayerRaid` rungs).
+/// Unlike a structure breach (where [`assess`] sizes the kill DPS to the squad's *gross* so repair can't
+/// stall it), a creep-clear sizes the kill DPS to the **enemy**: enough to grind their HP net of their
+/// heal within the on-site window AND to OUT-POWER them by `dps_margin` (the Lanchester square-law decisive
+/// win), plus heal to out-heal the incoming. The caller (a `ForceDoctrine`) resolves the coordination axis:
+/// - **Individual** (NPCs fought one at a time): pass the WORST SINGLE enemy + `dps_margin = 1.0`.
+/// - **Coordinated** (a player squad fighting together): pass the AGGREGATE force + `dps_margin =`
+///   [`COORDINATED_DPS_MARGIN`] (out-power, don't merely match).
+///
+/// This is the pure sizing primitive both the offense (`PlayerRaid`) and defense (`PlayerDefend`) doctrines
+/// will use, so the bot and sim size a creep-clear through ONE path (the §9 parity, extended to creeps).
+/// The kill weapon is RANGED/ATTACK: `RequiredForce.ranged_parts` sizes a ranged-attacker role (the comp's
+/// role structure picks WORK vs RANGED). Unwinnable ⇒ all-zero required.
+///
+/// **NOT YET WIRED into a live path** — the doctrines + their bot/defense wiring + the tournament bed that
+/// tunes `dps_margin` are the §9.10 ledger's next rungs.
+pub fn clear_force(
+    towers: Vec<TowerThreat>,
+    enemy_dps: f32,
+    enemy_hits: u32,
+    enemy_heal: f32,
+    budget: &ForceBudget,
+    dps_margin: f32,
+    safe_mode: bool,
+) -> (ForceAssessment, RequiredForce) {
+    let unwinnable = |reason| {
+        (
+            ForceAssessment { winnable: false, mode: AssaultMode::Breach, required_heal_per_tick: 0.0, required_dismantle_dps: 0.0, est_ticks: 0, reason },
+            RequiredForce::default(),
+        )
+    };
+    if safe_mode {
+        return unwinnable("enemy safe mode — zero damage possible");
+    }
+    // Out-heal the incoming (towers + their dps) with the hold margin.
+    let incoming = tower_dps_at_assault(&towers) + enemy_dps;
+    let required_heal = incoming * HOLD_MARGIN;
+    if required_heal > budget.max_heal_per_tick {
+        return unwinnable("can't out-heal the incoming");
+    }
+    // Kill DPS = enough to grind their HP (net of their heal) within the on-site window, AND to out-power
+    // them by `dps_margin` (the decisive square-law win). The margin is baked in here, so it scales the
+    // KILL parts (not the heal — heal is sized to the incoming regardless).
+    let kill_in_time = enemy_hits as f32 / budget.onsite_budget_ticks.max(1) as f32 + enemy_heal;
+    let required_kill_dps = kill_in_time.max(enemy_dps * dps_margin.max(1.0)).max(1.0);
+    if required_kill_dps <= enemy_heal {
+        return unwinnable("their heal out-paces a feasible kill");
+    }
+    if required_kill_dps > budget.max_dismantle_dps {
+        return unwinnable("can't field enough kill dps for one squad");
+    }
+    let est_ticks = (enemy_hits as f32 / (required_kill_dps - enemy_heal)).ceil() as u32;
+    let a = ForceAssessment {
+        winnable: true,
+        mode: AssaultMode::Breach,
+        required_heal_per_tick: required_heal,
+        required_dismantle_dps: required_kill_dps,
+        est_ticks,
+        reason: "clear: out-heal + out-power the enemy creeps",
+    };
+    let required = RequiredForce::from_assessment(&a);
+    (a, required)
+}
+
 // ─── R2: required-force → part counts (ADR 0020 §12.6) ───────────────────────
 //
 // The inverse of the composition's `capabilities()`: turn the oracle's required CAPABILITIES into the
@@ -333,6 +404,43 @@ mod tests {
     #[test]
     fn required_force_is_zero_when_unwinnable() {
         assert_eq!(RequiredForce::from_assessment(&assessment(false, 999.0, 999.0)), RequiredForce::default());
+    }
+
+    // ── clear_force (ADR 0026 §9.4 creep-clear sizing) ──
+    fn clear_budget() -> ForceBudget {
+        ForceBudget { max_heal_per_tick: 600.0, max_dismantle_dps: 600.0, tank_effective_hp: 5000.0, onsite_budget_ticks: 1000 }
+    }
+
+    #[test]
+    fn clear_force_individual_beats_a_single() {
+        // One weak melee creep (30 dps, 1000 HP, no heal), Individual margin 1.0 → winnable, sizes ranged.
+        let (a, rf) = clear_force(vec![], 30.0, 1000, 0.0, &clear_budget(), 1.0, false);
+        assert!(a.winnable, "{}", a.reason);
+        assert!(rf.ranged_parts > 0 && rf.heal_parts > 0, "sized ranged kill + heal parts: {rf:?}");
+    }
+
+    #[test]
+    fn clear_force_coordinated_oversizes_the_kill_vs_individual() {
+        // Same enemy; the Coordinated margin out-powers (more KILL parts) but heal is sized to the incoming
+        // either way (the square-law scales DPS, not heal).
+        let (_, ind) = clear_force(vec![], 200.0, 4000, 0.0, &clear_budget(), 1.0, false);
+        let (_, coord) = clear_force(vec![], 200.0, 4000, 0.0, &clear_budget(), COORDINATED_DPS_MARGIN, false);
+        assert!(coord.ranged_parts > ind.ranged_parts, "coordinated out-powers: {} > {}", coord.ranged_parts, ind.ranged_parts);
+        assert_eq!(coord.heal_parts, ind.heal_parts, "heal sized to the incoming, not the margin");
+    }
+
+    #[test]
+    fn clear_force_out_healed_is_unwinnable() {
+        // Their heal (700) pushes the needed kill dps above our budget (600) → can't grind them down.
+        let (a, rf) = clear_force(vec![], 50.0, 4000, 700.0, &clear_budget(), 1.0, false);
+        assert!(!a.winnable, "out-healed enemy is unwinnable for one squad");
+        assert_eq!(rf, RequiredForce::default());
+    }
+
+    #[test]
+    fn clear_force_safe_mode_is_vetoed() {
+        let (a, _) = clear_force(vec![], 30.0, 100, 0.0, &clear_budget(), 1.0, true);
+        assert!(!a.winnable, "safe mode → zero damage possible");
     }
 
     #[test]
