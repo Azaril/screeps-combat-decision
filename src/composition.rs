@@ -657,18 +657,25 @@ impl SquadComposition {
         let mut heal_per_tick = 0u32;
         let mut structure_dps = 0u32;
         let mut tank_effective_hp = 0u32;
+        // CEILING of RANGED_ATTACK parts one member can field at this energy — what a `sized_for` ranged
+        // member reaches. The winnability budget must use THIS for ranged-attacker roles, not the balanced
+        // template `QuadMember`'s few ranged parts, or the oracle defers every dismantle-immune core/keeper
+        // as "kill too slow" even though a ranged-sized squad clears it (R-attack §12.6 step 4). Probed via
+        // the real builder (incl. the MOVE ratio + 50-cap) so the ceiling can't drift from what spawns.
+        let max_ranged = (1..=MAX_SINGLE_ROLE_PARTS)
+            .rev()
+            .find(|&n| bodies::build_combat_body(&bodies::CombatBodySpec { ranged_attack: n, ..Default::default() }, bodies::MoveProfile::Plains, max_energy).is_some())
+            .unwrap_or(0);
         for slot in &self.slots {
             let bt = slot.body_type;
             heal_per_tick += bt.part_count(max_energy, Part::Heal) * HEAL_POWER;
-            // Structure damage: WORK dismantles (50/part), ATTACK hits a structure (30/part),
-            // RANGED_ATTACK hits a structure (10/part at range ≤3). All contribute to breaching
-            // ramparts and killing the core. RANGED_ATTACK MUST be counted: invader cores are
-            // dismantle-IMMUNE, so a ranged comp is what actually kills them — without this the oracle
-            // sees a `quad_ranged` core-attacker as 0 structure-DPS and defers every core as "breach
-            // too slow".
+            // Structure damage: WORK dismantles (50/part), ATTACK (30/part), RANGED_ATTACK (10/part). All
+            // breach ramparts + kill the core. For a ranged-attacker role use the ranged CEILING (above)
+            // since `sized_for` builds it ranged-maximized; other roles use their template's ranged count.
+            let ranged_parts = if matches!(slot.role, SquadRole::RangedDPS) { max_ranged } else { bt.part_count(max_energy, Part::RangedAttack) };
             structure_dps += bt.part_count(max_energy, Part::Work) * DISMANTLE_POWER
                 + bt.part_count(max_energy, Part::Attack) * ATTACK_POWER
-                + bt.part_count(max_energy, Part::RangedAttack) * RANGED_ATTACK_POWER;
+                + ranged_parts * RANGED_ATTACK_POWER;
             // The tank is the toughest single member (most total HP = parts × 100, unboosted).
             tank_effective_hp = tank_effective_hp.max(bt.estimated_part_count(max_energy) * 100);
         }
@@ -694,6 +701,9 @@ impl SquadComposition {
                 SquadRole::Healer => bodies::CombatBodySpec { heal: n, ..Default::default() },
                 SquadRole::Dismantler => bodies::CombatBodySpec { work: n, ..Default::default() },
                 SquadRole::Tank => bodies::CombatBodySpec { tough: n, ..Default::default() },
+                // RangedDPS sizes RANGED_ATTACK (R-attack §12.6): kill a dismantle-immune target (an
+                // invader core) that WORK can't touch.
+                SquadRole::RangedDPS => bodies::CombatBodySpec { ranged_attack: n, ..Default::default() },
                 _ => bodies::CombatBodySpec::default(),
             }
         };
@@ -708,11 +718,14 @@ impl SquadComposition {
         };
         let template_count = |r: SquadRole| self.slots.iter().filter(|s| s.role == r).count() as u32;
 
-        // Decide member count + per-member spec for each required role present in the template.
-        let roles: [(SquadRole, u32); 3] = [
+        // Decide member count + per-member spec for each required role present in the template. `RangedDPS`
+        // draws from `force.ranged_parts` (R-attack); roles the template lacks are skipped (`template_count
+        // == 0` below), so a WORK siege uses `dismantle_parts` and a ranged quad uses `ranged_parts`.
+        let roles: [(SquadRole, u32); 4] = [
             (SquadRole::Healer, force.heal_parts),
             (SquadRole::Dismantler, force.dismantle_parts),
             (SquadRole::Tank, force.tough_parts),
+            (SquadRole::RangedDPS, force.ranged_parts),
         ];
         let mut sized_roles: Vec<(SquadRole, u32, bodies::CombatBodySpec)> = Vec::new();
         for (role, total) in roles {
@@ -784,7 +797,7 @@ mod tests {
     fn sized_for_distributes_required_force_across_roles() {
         // siege_quad = 2 Dismantler + 2 Healer. 20 heal + 12 dismantle parts, even split, fits RCL7.
         let sized = SquadComposition::siege_quad()
-            .sized_for(RequiredForce { heal_parts: 20, dismantle_parts: 12, tough_parts: 0 }, 5600)
+            .sized_for(RequiredForce { heal_parts: 20, dismantle_parts: 12, ranged_parts: 0, tough_parts: 0 }, 5600)
             .expect("affordable at RCL7");
         let dismantler = sized.slots.iter().find(|s| s.role == SquadRole::Dismantler).unwrap();
         assert!(
@@ -803,7 +816,7 @@ mod tests {
         // 200 heal parts at RCL4 (1300e ⇒ ≤4 HEAL/member) would need ~50 healer members — far past
         // MAX_SIZED_MEMBERS, so it defers to the multi-squad G4-HEAVY path rather than under-size.
         assert!(SquadComposition::siege_quad()
-            .sized_for(RequiredForce { heal_parts: 200, dismantle_parts: 0, tough_parts: 0 }, 1300)
+            .sized_for(RequiredForce { heal_parts: 200, dismantle_parts: 0, ranged_parts: 0, tough_parts: 0 }, 1300)
             .is_none());
     }
 
@@ -813,7 +826,7 @@ mod tests {
         // healer count instead of deferring. 65 heal parts at RCL7 (≤18 HEAL/member) ⇒ ceil(65/18)=4
         // healers, each ~17 HEAL — the squad is fielded (not deferred) and out-heals the requirement.
         let sized = SquadComposition::siege_quad()
-            .sized_for(RequiredForce { heal_parts: 65, dismantle_parts: 12, tough_parts: 0 }, 5600)
+            .sized_for(RequiredForce { heal_parts: 65, dismantle_parts: 12, ranged_parts: 0, tough_parts: 0 }, 5600)
             .expect("grows healers to meet the force at RCL7");
         let healers = sized.slots.iter().filter(|s| s.role == SquadRole::Healer).count();
         assert_eq!(healers, 4, "the 2-healer template grew to 4 to carry 65 HEAL parts");
@@ -909,5 +922,38 @@ mod tests {
             "quad_ranged must contribute structure damage through RANGED_ATTACK (got {})",
             caps.structure_dps
         );
+    }
+
+    /// R-attack §12.6 — a dismantle-immune core (100k hits, no ramparts/towers) is WINNABLE because the
+    /// `quad_ranged` budget uses the RANGED CEILING (`capabilities` step 4): `kill_ticks = 100k / ranged
+    /// DPS` fits a creep lifetime. The balanced template's few ranged parts made the oracle defer every
+    /// core — the soak-confirmed regression this closes.
+    #[test]
+    fn r_attack_makes_a_dismantle_immune_core_winnable() {
+        use crate::force_sizing::{assess, DefenseProfile, ForceBudget, RequiredForce};
+        let caps = SquadComposition::quad_ranged().capabilities(5600);
+        let budget = ForceBudget {
+            max_heal_per_tick: caps.heal_per_tick as f32,
+            max_dismantle_dps: caps.structure_dps as f32,
+            tank_effective_hp: caps.tank_effective_hp as f32,
+            onsite_budget_ticks: 1400, // ~a creep lifetime minus spawn/travel
+        };
+        let core = DefenseProfile { objective_hits: 100_000, ..Default::default() };
+        let a = assess(&core, &budget);
+        assert!(a.winnable, "a no-rampart 100k core is winnable once ranged is sized to the ceiling: {}", a.reason);
+        assert!(RequiredForce::from_assessment(&a).ranged_parts > 0, "the winning force fields RANGED kill parts");
+    }
+
+    /// R-attack — a ranged comp sizes its `RangedDPS` members from `force.ranged_parts` (RANGED, not WORK).
+    #[test]
+    fn sized_for_sizes_ranged_attackers_from_ranged_parts() {
+        use crate::force_sizing::RequiredForce;
+        let force = RequiredForce { ranged_parts: 18, ..Default::default() };
+        let sized = SquadComposition::quad_ranged().sized_for(force, 5600).expect("affordable at RCL7");
+        let ranged = sized.slots.iter().find(|s| s.role == SquadRole::RangedDPS).expect("has RangedDPS");
+        match ranged.body_type {
+            BodyType::Sized(spec) => assert!(spec.ranged_attack > 0 && spec.work == 0, "sized to RANGED, not WORK: {spec:?}"),
+            bt => panic!("RangedDPS not sized: {bt:?}"),
+        }
     }
 }

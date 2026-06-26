@@ -17,7 +17,7 @@
 
 use crate::bodies::{defender_heal_parts_for_dps, CombatBodySpec};
 use crate::damage::tower_attack_damage_at_range;
-use screeps_combat_engine::constants::{DISMANTLE_POWER, TOWER_ENERGY_COST};
+use screeps_combat_engine::constants::{DISMANTLE_POWER, RANGED_ATTACK_POWER, TOWER_ENERGY_COST};
 
 /// HOLD margin (ADR 0020 §12.5/§12.6): size heal to out-heal the incoming damage by this factor, NOT
 /// break-even — so the squad HEALS THROUGH transient / approach / focused damage instead of tripping the
@@ -214,8 +214,14 @@ pub fn assess(profile: &DefenseProfile, budget: &ForceBudget) -> ForceAssessment
 pub struct RequiredForce {
     /// Σ HEAL parts — out-heal the assault position (`required_heal_per_tick`).
     pub heal_parts: u32,
-    /// Σ WORK parts — breach + kill the structure (`required_dismantle_dps`).
+    /// Σ WORK parts — breach + kill a DISMANTLE-able structure (`required_dismantle_dps`).
     pub dismantle_parts: u32,
+    /// Σ RANGED_ATTACK parts — the SAME required structure-DPS as `dismantle_parts`, expressed in RANGED
+    /// parts (it takes `DISMANTLE_POWER/RANGED_ATTACK_POWER` = 5× as many). `sized_for` sizes ranged-
+    /// attacker roles (`RangedDPS`/`DuoRangedAttacker`/`SkRangedAttacker`) from this and WORK roles from
+    /// `dismantle_parts` — the comp's role structure picks the weapon. REQUIRED for a dismantle-IMMUNE
+    /// target (an invader core / a Source Keeper) that only ranged/melee can kill (R-attack, §12.6).
+    pub ranged_parts: u32,
     /// Σ TOUGH parts — the effective-HP buffer. v1 = 0 (role bodies carry their own HP); the
     /// margin-driven EHP buffer is R5/D2.
     pub tough_parts: u32,
@@ -231,6 +237,9 @@ impl RequiredForce {
         RequiredForce {
             heal_parts: defender_heal_parts_for_dps(a.required_heal_per_tick, false),
             dismantle_parts: parts_for_rate(a.required_dismantle_dps, DISMANTLE_POWER),
+            // Same required structure-DPS, in RANGED parts — for a dismantle-immune target. `sized_for`
+            // applies whichever the comp's role structure uses (WORK vs RANGED). (R-attack §12.6.)
+            ranged_parts: parts_for_rate(a.required_dismantle_dps, RANGED_ATTACK_POWER),
             tough_parts: 0,
         }
     }
@@ -238,6 +247,9 @@ impl RequiredForce {
     /// As a single-creep [`CombatBodySpec`] — the solo case + the round-trip seam. `sized_for` splits
     /// the totals across the squad's members instead of stacking them on one creep.
     pub fn as_solo_spec(&self) -> CombatBodySpec {
+        // The solo case is a dismantler (WORK); `ranged_parts` is the ALTERNATIVE weapon a ranged-attacker
+        // SQUAD role uses (sized via `sized_for`), not stacked onto the solo (that would double the kill
+        // weapon + blow the 50-part cap). So the solo spec stays heal+work+tough.
         CombatBodySpec {
             heal: self.heal_parts,
             work: self.dismantle_parts,
@@ -253,6 +265,7 @@ impl RequiredForce {
         RequiredForce {
             heal_parts: s(self.heal_parts),
             dismantle_parts: s(self.dismantle_parts),
+            ranged_parts: s(self.ranged_parts),
             tough_parts: s(self.tough_parts),
         }
     }
@@ -478,7 +491,7 @@ mod tests {
     #[test]
     fn importance_scales_the_invested_force() {
         assert_eq!(importance_margin(0.0), 1.0);
-        let base = RequiredForce { heal_parts: 10, dismantle_parts: 6, tough_parts: 0 };
+        let base = RequiredForce { heal_parts: 10, dismantle_parts: 6, ranged_parts: 0, tough_parts: 0 };
         assert_eq!(base.scaled(importance_margin(0.0)), base, "importance 0 → no over-invest");
         assert_eq!(importance_margin(1.0), 1.5);
         let crit = base.scaled(importance_margin(1.0));
