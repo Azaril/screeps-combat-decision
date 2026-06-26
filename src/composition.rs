@@ -682,6 +682,20 @@ impl SquadComposition {
         SquadCapabilities { heal_per_tick, structure_dps, tank_effective_hp }
     }
 
+    /// Build the force-sizing [`crate::force_sizing::ForceBudget`] for this composition at `member_energy`
+    /// with `onsite_budget_ticks` of on-site time — the CEILING capabilities the oracle assesses against.
+    /// Shared by the bot (`best_force_budget`, which picks the best home + supplies the onsite ticks) and
+    /// the eval (from the scenario) so both build the budget identically (ADR 0026 §9 parity).
+    pub fn force_budget(&self, member_energy: u32, onsite_budget_ticks: u32) -> crate::force_sizing::ForceBudget {
+        let caps = self.capabilities(member_energy);
+        crate::force_sizing::ForceBudget {
+            max_heal_per_tick: caps.heal_per_tick as f32,
+            max_dismantle_dps: caps.structure_dps as f32,
+            tank_effective_hp: caps.tank_effective_hp as f32,
+            onsite_budget_ticks,
+        }
+    }
+
     /// Force-DRIVEN sizing (R3 + D3 member-count scaling, ADR 0020 §12.6 / ADR 0022 D3): return a copy
     /// of this composition sized to deliver `force`. Each role covered by `force` (Healer→HEAL,
     /// Dismantler→WORK, Tank→TOUGH) is sized to its even share of the required parts; when one member

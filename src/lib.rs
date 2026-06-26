@@ -55,6 +55,10 @@ pub mod composition;
 /// ADR 0026 — the objective/information-dependent combat strategy-selection layer (`CombatStrategy` trait
 /// registry + `decide_strategy`); picks the per-squad `SquadTacticParams` weight profile by objective.
 pub mod strategy;
+/// ADR 0026 §9 — the objective + force-composition selection layer (`ForceDoctrine` trait registry +
+/// `decide_doctrine`); picks the objective's sized `SquadComposition`. Host-shared so the bot (war.rs)
+/// and the sim (the eval) select + size through the same code (parity).
+pub mod doctrine;
 
 use screeps::local::LocalCostMatrix;
 use screeps::{Direction, Part, Position, RawObjectId, RoomCoordinate, RoomName, RoomXY, StructureType};
