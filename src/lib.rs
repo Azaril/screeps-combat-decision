@@ -52,6 +52,9 @@ pub mod force_sizing;
 /// data-driven squad blueprint + force-driven sizing, shared so the sim/eval field the bot's real
 /// composition.
 pub mod composition;
+/// ADR 0026 — the objective/information-dependent combat strategy-selection layer (`CombatStrategy` trait
+/// registry + `decide_strategy`); picks the per-squad `SquadTacticParams` weight profile by objective.
+pub mod strategy;
 
 use screeps::local::LocalCostMatrix;
 use screeps::{Direction, Part, Position, RawObjectId, RoomCoordinate, RoomName, RoomXY, StructureType};
