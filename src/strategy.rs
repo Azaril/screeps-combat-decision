@@ -71,9 +71,14 @@ impl SquadTacticParams {
         }
     }
 
-    /// Structure-breach profile — the thorough re-tune's base-attack winner (`a1-i4-def`): low approach,
-    /// moderate incumbency, default cohesion — best objective-progress razing real foreman bases (the
-    /// quick-run approach=4 seed did NOT replicate at scale; the levers are incumbency + cohesion).
+    /// Structure-breach profile (`a1-i4-def`). Vs the open profile it keeps the SAME low approach (the
+    /// thorough re-tune's headline: at scale, low approach survives — a hot approach over-commits and
+    /// bleeds creeps without breaching faster, since a winnable force breaches anyway) but holds LESS
+    /// (incumbency 4 not 6) with looser cohesion — so the squad moves IN to range-1 and dismantles the
+    /// rampart ring rather than holding a ranged firing tile (the kernel's `V_struct` already pulls toward
+    /// the structure; this just stops the squad latching a standoff tile). NOTE: base-attack absolute
+    /// scoring is noise-dominated (~1% cross-process), so this profile rests on the dismantle-needs-range-1
+    /// PRINCIPLE + the open-combat win, not on a measured base-attack lead (see the §per-objective gate).
     pub fn breach() -> Self {
         Self {
             kernel: KernelParams { approach_coef: 1, incumbency_coef: 4, discohesion_coef: 10, cohesion_k: 3, spacing_coef: 1 },
@@ -82,8 +87,8 @@ impl SquadTacticParams {
     }
 
     /// Tower-drain breach profile — when the oracle picks `AssaultMode::Drain` (a tank soaks the towers
-    /// dry, then the squad breaches): hold position longer through the soak (higher incumbency than the
-    /// straight breach). Seed; tuned separately once a tower-energy-bounded drain scenario lands.
+    /// dry, then the squad breaches): like the breach profile but hold position LONGER through the soak
+    /// (incumbency 6). Seed; tuned separately once a tower-energy-bounded drain scenario lands.
     pub fn breach_drain() -> Self {
         Self {
             kernel: KernelParams { approach_coef: 1, incumbency_coef: 6, discohesion_coef: 10, cohesion_k: 3, spacing_coef: 1 },
