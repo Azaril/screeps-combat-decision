@@ -61,12 +61,18 @@ pub trait CombatStrategy: Sync {
 // ── the weight profiles (the thorough re-tune winners) ───────────────────────────────────────────────
 
 impl SquadTacticParams {
-    /// Open-creep combat profile — the thorough re-tune's open-combat winner (`a1-i6-tight`): low approach
-    /// (kite, don't over-commit), strong incumbency (hold firing tiles), tight cohesion. Unexploitable in
-    /// self-play (exploitability 0).
+    /// Open-creep combat profile (`a1-i6-tight-s2`): low approach (kite, don't over-commit), strong
+    /// incumbency (hold firing tiles), tight cohesion, **spacing 2** (de-stack to shed focus-fire / RMA).
+    /// The original §12 re-tune's grid fixed spacing=1 and crowned `a1-i6-tight` "exploitability 0" — but
+    /// that was a BLIND SPOT: Screeps AoE is pure Chebyshev with no LOS, so a tight blob eats stacked
+    /// ranged-mass-attack + tower fire. The spacing-aware re-tune (2026-06-26, on the bit-deterministic
+    /// sim) shows that once spacing is in the field, the old spacing-1 profile is NEGATIVE-mean and
+    /// exploitable (176), while spacing 2 sweeps the top (+103 mean, exploit cut 176→51) and beats the old
+    /// profile by ~+305 over the realistic comp basket. Spacing 2 (not 4) is the generic sweet spot;
+    /// spacing 4 only wins a pure-ranged mirror (a candidate situational mode — see ADR 0026a).
     pub fn open_combat() -> Self {
         Self {
-            kernel: KernelParams { approach_coef: 1, incumbency_coef: 6, discohesion_coef: 20, cohesion_k: 2, spacing_coef: 1 },
+            kernel: KernelParams { approach_coef: 1, incumbency_coef: 6, discohesion_coef: 20, cohesion_k: 2, spacing_coef: 2 },
             ..Self::default()
         }
     }
