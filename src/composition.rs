@@ -956,4 +956,19 @@ mod tests {
             bt => panic!("RangedDPS not sized: {bt:?}"),
         }
     }
+
+    /// R-attack for the SK duo (operator 2026-06-26): with `ranged_parts` set (kill the keeper), the SK
+    /// kiter is SIZED to ranged — not left on the template that caps too low to kill at a low-energy home.
+    /// (Heal-only force keeps it template — see `sk_duo_sizes_healer_to_outheal_a_keeper`.)
+    #[test]
+    fn sk_duo_sizes_kiter_to_kill_the_keeper() {
+        use crate::force_sizing::RequiredForce;
+        let force = RequiredForce { heal_parts: 10, ranged_parts: 15, ..Default::default() };
+        let sized = SquadComposition::duo_sk_farmer().sized_for(force, 5600).expect("RCL7 affords it");
+        let kiter = sized.slots.iter().find(|s| s.role == SquadRole::RangedDPS).expect("has RangedDPS");
+        match kiter.body_type {
+            BodyType::Sized(spec) => assert!(spec.ranged_attack > 0, "kiter sized to ranged kill parts: {spec:?}"),
+            bt => panic!("kiter not sized: {bt:?}"),
+        }
+    }
 }
