@@ -1050,7 +1050,17 @@ fn assess_engage(view: &SquadView, centroid: Option<Position>) -> EngageAssessme
     // No enemy creep deals damage (e.g. a STRUCTURE SIEGE — dismantle/raze, whose offense isn't
     // melee/ranged) ⇒ there's no creep attrition race to lose, so the Lanchester μ doesn't apply;
     // it's engageable (the tower `unwinnable` veto above still guards a tower turtle).
-    let our_strength = fighting_strength(our_dps, our_ehp, LANCHESTER_N);
+    // Layer-A (ADR 0031): a WORK siege's `dismantle` is real offense against a hostile STRUCTURE, but it
+    // cannot touch creeps — so it feeds our fighting STRENGTH (else a dismantle-only force scores zero and
+    // retreats at t0, the measured siege-parks-at-0 bug) WITHOUT entering `ev_target_order`'s creep-
+    // killability (which stays melee+ranged above). Gated on a hostile structure being present (a dismantle
+    // target); members Vec-ordered for determinism.
+    let our_dismantle: u64 = if view.structures.iter().any(|s| s.ownership == Ownership::Hostile && s.hits > 0) {
+        view.members.iter().filter(|m| m.hits > 0).map(|m| m.dismantle_power as u64).sum()
+    } else {
+        0
+    };
+    let our_strength = fighting_strength(our_dps + our_dismantle, our_ehp, LANCHESTER_N);
     let enemy_strength = fighting_strength(killable_dps, killable_ehp, LANCHESTER_N);
     let balance = if killable_dps == 0 && unkillable_dps == 0 {
         1000
