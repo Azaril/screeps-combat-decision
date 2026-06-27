@@ -59,6 +59,10 @@ pub mod strategy;
 /// `decide_doctrine`); picks the objective's sized `SquadComposition`. Host-shared so the bot (war.rs)
 /// and the sim (the eval) select + size through the same code (parity).
 pub mod doctrine;
+/// P-OBJ #23 / ADR 0027 — the pure objective/squad lifecycle DECISIONS (the SquadManager Phase-A
+/// reconcile) lifted out of the ECS so they are deterministically unit-testable offline and shared by
+/// the bot (`squad_manager`) and the lifecycle harness (parity), like `decide_squad`.
+pub mod lifecycle;
 
 use screeps::local::LocalCostMatrix;
 use screeps::{Direction, Part, Position, RawObjectId, RoomCoordinate, RoomName, RoomXY, StructureType};
