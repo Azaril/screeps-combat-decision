@@ -217,7 +217,7 @@ pub fn assess(profile: &DefenseProfile, budget: &ForceBudget) -> ForceAssessment
 ///
 /// This is the pure sizing primitive both the offense (`PlayerRaid`) and defense (`PlayerDefend`) doctrines
 /// will use, so the bot and sim size a creep-clear through ONE path (the §9 parity, extended to creeps).
-/// The kill weapon is RANGED/ATTACK: `RequiredForce.ranged_parts` sizes a ranged-attacker role (the comp's
+/// The kill weapon is RANGED/ATTACK: `RequiredForce.immune_struct_parts` sizes a ranged-attacker role (the comp's
 /// role structure picks WORK vs RANGED). Unwinnable ⇒ all-zero required.
 ///
 /// **NOT YET WIRED into a live path** — the doctrines + their bot/defense wiring + the tournament bed that
@@ -266,7 +266,15 @@ pub fn clear_force(
         est_ticks,
         reason: "clear: out-heal + out-power the enemy creeps",
     };
-    let required = RequiredForce::from_assessment(&a);
+    // The kill is ANTI-CREEP (we clear enemy creeps, not structures), so the kill parts go to
+    // `anti_creep_parts`, NOT the structure terms (`dismantle_parts`/`immune_struct_parts`) that
+    // `from_assessment` sets. Heal matches the defense path (`defender_heal_parts_for_dps`, parity).
+    // (ADR 0031 Layer C — this is what lets a siege facing a guard carry BOTH dismantle AND anti-creep.)
+    let required = RequiredForce {
+        heal_parts: defender_heal_parts_for_dps(required_heal, false),
+        anti_creep_parts: parts_for_rate(required_kill_dps, RANGED_ATTACK_POWER),
+        ..Default::default()
+    };
     (a, required)
 }
 
@@ -292,7 +300,12 @@ pub struct RequiredForce {
     /// attacker roles (`RangedDPS`/`DuoRangedAttacker`/`SkRangedAttacker`) from this and WORK roles from
     /// `dismantle_parts` — the comp's role structure picks the weapon. REQUIRED for a dismantle-IMMUNE
     /// target (an invader core / a Source Keeper) that only ranged/melee can kill (R-attack, §12.6).
-    pub ranged_parts: u32,
+    pub immune_struct_parts: u32,
+    /// Σ RANGED/ATTACK parts to KILL blocking DEFENDER CREEPS (ADR 0031 Layer C) — distinct from
+    /// `immune_struct_parts` (anti-structure). A force facing a guarded structure needs BOTH at once (raze
+    /// the core AND clear the guard), so they are separate, not `max`-ed. Sized via `clear_force` over the
+    /// observed `enemy_force`; both feed `sized_for`'s RangedDPS role (the SUM). Zero when no defenders seen.
+    pub anti_creep_parts: u32,
     /// Σ TOUGH parts — the effective-HP buffer. v1 = 0 (role bodies carry their own HP); the
     /// margin-driven EHP buffer is R5/D2.
     pub tough_parts: u32,
@@ -310,7 +323,10 @@ impl RequiredForce {
             dismantle_parts: parts_for_rate(a.required_dismantle_dps, DISMANTLE_POWER),
             // Same required structure-DPS, in RANGED parts — for a dismantle-immune target. `sized_for`
             // applies whichever the comp's role structure uses (WORK vs RANGED). (R-attack §12.6.)
-            ranged_parts: parts_for_rate(a.required_dismantle_dps, RANGED_ATTACK_POWER),
+            immune_struct_parts: parts_for_rate(a.required_dismantle_dps, RANGED_ATTACK_POWER),
+            // assess() is structure-only — defender DPS folds into heal, not a kill req. The unified emitter
+            // (P2) adds anti-creep via clear_force over enemy_force; here it stays 0.
+            anti_creep_parts: 0,
             tough_parts: 0,
         }
     }
@@ -336,7 +352,8 @@ impl RequiredForce {
         RequiredForce {
             heal_parts: s(self.heal_parts),
             dismantle_parts: s(self.dismantle_parts),
-            ranged_parts: s(self.ranged_parts),
+            immune_struct_parts: s(self.immune_struct_parts),
+            anti_creep_parts: s(self.anti_creep_parts),
             tough_parts: s(self.tough_parts),
         }
     }
@@ -416,7 +433,7 @@ mod tests {
         // One weak melee creep (30 dps, 1000 HP, no heal), Individual margin 1.0 → winnable, sizes ranged.
         let (a, rf) = clear_force(vec![], 30.0, 1000, 0.0, &clear_budget(), 1.0, false);
         assert!(a.winnable, "{}", a.reason);
-        assert!(rf.ranged_parts > 0 && rf.heal_parts > 0, "sized ranged kill + heal parts: {rf:?}");
+        assert!(rf.anti_creep_parts > 0 && rf.heal_parts > 0, "sized anti-creep kill + heal parts: {rf:?}");
     }
 
     #[test]
@@ -425,7 +442,7 @@ mod tests {
         // either way (the square-law scales DPS, not heal).
         let (_, ind) = clear_force(vec![], 200.0, 4000, 0.0, &clear_budget(), 1.0, false);
         let (_, coord) = clear_force(vec![], 200.0, 4000, 0.0, &clear_budget(), COORDINATED_DPS_MARGIN, false);
-        assert!(coord.ranged_parts > ind.ranged_parts, "coordinated out-powers: {} > {}", coord.ranged_parts, ind.ranged_parts);
+        assert!(coord.anti_creep_parts > ind.anti_creep_parts, "coordinated out-powers: {} > {}", coord.anti_creep_parts, ind.anti_creep_parts);
         assert_eq!(coord.heal_parts, ind.heal_parts, "heal sized to the incoming, not the margin");
     }
 
@@ -608,7 +625,7 @@ mod tests {
     #[test]
     fn importance_scales_the_invested_force() {
         assert_eq!(importance_margin(0.0), 1.0);
-        let base = RequiredForce { heal_parts: 10, dismantle_parts: 6, ranged_parts: 0, tough_parts: 0 };
+        let base = RequiredForce { heal_parts: 10, dismantle_parts: 6, immune_struct_parts: 0, anti_creep_parts: 0, tough_parts: 0 };
         assert_eq!(base.scaled(importance_margin(0.0)), base, "importance 0 → no over-invest");
         assert_eq!(importance_margin(1.0), 1.5);
         let crit = base.scaled(importance_margin(1.0));

@@ -413,7 +413,7 @@ impl ForceDoctrine for SkSuppression {
         let keeper = ctx.enemy_force.unwrap_or_default();
         let required = RequiredForce {
             heal_parts: defender_heal_parts_for_dps(keeper.dps * HOLD_MARGIN, false),
-            ranged_parts: keeper.hits.div_ceil(SK_KEEPER_KILL_TICKS * RANGED_ATTACK_POWER),
+            anti_creep_parts: keeper.hits.div_ceil(SK_KEEPER_KILL_TICKS * RANGED_ATTACK_POWER), // a Source Keeper is a CREEP
             ..Default::default()
         };
         let duo = SquadComposition::duo_sk_farmer();
@@ -480,7 +480,7 @@ mod tests {
         let plan = doc.plan(&c, None);
         // Behavior-preserving vs the former SK mission sizing: 5000 HP ÷ 34t ÷ 10 = 15 ranged kill parts
         // (R-attack), and HEAL > 0 to out-heal the 168 melee × HOLD_MARGIN (R6).
-        assert_eq!(plan.required.ranged_parts, 15, "kills the keeper in the window");
+        assert_eq!(plan.required.anti_creep_parts, 15, "kills the keeper (a creep) in the window");
         assert!(plan.required.heal_parts > 0, "out-heals the keeper melee");
         assert!(plan.composition.is_some(), "always fields the duo");
     }
@@ -520,7 +520,7 @@ mod tests {
         let plan = doc.plan(&c, Some(budget.clone()));
         assert!(plan.winnable(), "out-powerable defenders are winnable: {}", plan.assessment.reason);
         assert!(plan.composition.is_some(), "sizes a force when affordable");
-        assert!(plan.required.ranged_parts > 0, "sized the ranged kill parts");
+        assert!(plan.required.anti_creep_parts > 0, "sized the anti-creep kill parts");
         // Enemy safe mode → the oracle defers (the gate the always-field `PlayerRaid` lacks).
         let mut safe = ctx(DoctrineObjective::RaidCreeps, DefenseProfile { safe_mode: true, ..Default::default() });
         safe.enemy_force = c.enemy_force;
@@ -605,7 +605,7 @@ mod tests {
         let plan = doc.plan(&c, budget_for(doc, c.member_energy));
         assert!(plan.winnable(), "weak-tower core is winnable: {}", plan.assessment.reason);
         let comp = plan.composition.expect("a home affords it");
-        assert!(plan.required.ranged_parts > 0, "sized ranged kill parts");
+        assert!(plan.required.immune_struct_parts > 0, "sized ranged kill parts");
         // The sized quad fields RANGED (the core is dismantle-immune), not WORK.
         assert!(comp.slots.iter().any(|s| s.role == crate::composition::SquadRole::RangedDPS));
     }
