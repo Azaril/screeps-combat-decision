@@ -838,6 +838,132 @@ impl SquadComposition {
     }
 }
 
+/// A single-role part SPEC — the body of a member that carries only `n` of its role's weapon part (the
+/// roles a [`RequiredForce`] covers: HEAL/WORK/RANGED/TOUGH; ATTACK/CARRY for exhaustiveness). Shared by
+/// [`assemble_force`] (and the [`SquadComposition::sized_for`] bridge has an identical local copy until P4
+/// deletes it). MOVE is added per-member by [`bodies::build_combat_body`].
+fn single_role_spec(role: SquadRole, n: u32) -> bodies::CombatBodySpec {
+    match role {
+        SquadRole::Healer => bodies::CombatBodySpec { heal: n, ..Default::default() },
+        SquadRole::Dismantler => bodies::CombatBodySpec { work: n, ..Default::default() },
+        SquadRole::RangedDPS => bodies::CombatBodySpec { ranged_attack: n, ..Default::default() },
+        SquadRole::MeleeDPS => bodies::CombatBodySpec { attack: n, ..Default::default() },
+        SquadRole::Tank => bodies::CombatBodySpec { tough: n, ..Default::default() },
+        SquadRole::Hauler => bodies::CombatBodySpec { carry: n, ..Default::default() },
+    }
+}
+
+/// Largest single-role part count one member can carry at `probe_energy` — reverse-probed via the REAL
+/// builder (incl. the per-member MOVE ratio + the 50-part cap) so the cap can never drift from what
+/// actually spawns. 0 ⇒ can't field even one member of this role at this energy.
+fn single_role_cap(role: SquadRole, probe_energy: u32) -> u32 {
+    (1..=MAX_SINGLE_ROLE_PARTS)
+        .rev()
+        .find(|&n| bodies::build_combat_body(&single_role_spec(role, n), bodies::MoveProfile::Plains, probe_energy).is_some())
+        .unwrap_or(0)
+}
+
+/// Formation for an assembled force of `count` members — matches the catalog's solo/duo/quad shapes (the
+/// only precedent), generalized: a lone member roams loose, a duo holds a strict line, ≥3 hold a strict box
+/// (a grown quad already does this under `sized_for`, so this introduces no new movement behavior).
+fn formation_for(count: usize) -> (FormationShape, FormationMode) {
+    match count {
+        0 | 1 => (FormationShape::None, FormationMode::Loose),
+        2 => (FormationShape::Line, FormationMode::Strict),
+        _ => (FormationShape::Box2x2, FormationMode::Strict),
+    }
+}
+
+/// A compact role tally for logging / viz, in slot order (slots are grouped by role) — e.g.
+/// "Assembled 1×Dismantler 1×RangedDPS 2×Healer".
+fn assembled_label(slots: &[SquadSlot]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < slots.len() {
+        let role = slots[i].role;
+        let n = slots[i..].iter().take_while(|s| s.role == role).count();
+        parts.push(format!("{n}×{role:?}"));
+        i += n;
+    }
+    format!("Assembled {}", parts.join(" "))
+}
+
+/// THE ASSEMBLER (ADR 0031 T2) — turn a capability vector ([`RequiredForce`]) DIRECTLY into a fielded
+/// composition, with NO template and NO body catalog: each weapon role's member COUNT emerges continuously
+/// from its demand, and each member's body is force-`Sized` per pick via the real builder. Replaces
+/// `template() + sized_for` (P3).
+///
+/// The min-viable floor is a ROLE-SET (≥1 member per DEMANDED role), NEVER a template count — so the
+/// Layer-B "can't add a role the template lacks" gap and the solo↔quad granularity snap are STRUCTURALLY
+/// impossible (1..=[`MAX_SIZED_MEMBERS`] are all reachable, sized to exactly meet the requirement — winning
+/// but efficient, no over-spend, D13). RANGED carries BOTH the immune-structure DPS AND the anti-creep
+/// kill (the same physical part, additive demand — a siege facing a guard needs enough RANGED for BOTH).
+///
+/// This is the marginal-capability-per-energy fill specialized to the current 1:1 role↔dimension map: each
+/// `RequiredForce` dimension is supplied by exactly one role, so the fill degenerates to "grow each role to
+/// meet its demand" — there is no scarcest-dimension contention to arbitrate. (A future dimension a second
+/// role could supply — e.g. structure DPS via WORK *or* RANGED — would generalize this to the full
+/// scarcest-dimension auction; the frozen demand order below is that auction's tie-break.)
+///
+/// Returns `None` — a TERMINAL defer (D10: no G4-HEAVY failover; the higher-power response is a
+/// strategy-layer call) — when a demanded role can't field even one member at this energy, the requirement
+/// is empty, or the force would exceed [`MAX_SIZED_MEMBERS`]. Bit-deterministic: integer/ceil over a frozen
+/// Vec-ordered demand list, no HashMap.
+pub fn assemble_force(req: &RequiredForce, member_energy: u32) -> Option<SquadComposition> {
+    // Probe per-member caps at the SMALLER of the home capacity and the preferred ceiling, so a force is
+    // split into more, smaller, bankable members rather than one un-spawnable ~5000e blob (the W7N7 bug).
+    let probe_energy = member_energy.min(PREFERRED_MEMBER_ENERGY);
+
+    // The capability vector → weapon-role demands, in the ADR's frozen dimension order (= the slot order +
+    // the determinism tie-break). RANGED = immune_struct + anti_creep (anti-structure AND anti-creep).
+    let demands: [(SquadRole, u32); 4] = [
+        (SquadRole::Healer, req.heal_parts),
+        (SquadRole::Dismantler, req.dismantle_parts),
+        (SquadRole::RangedDPS, req.immune_struct_parts + req.anti_creep_parts),
+        (SquadRole::Tank, req.tough_parts),
+    ];
+
+    let mut slots: Vec<SquadSlot> = Vec::new();
+    for (role, total) in demands {
+        if total == 0 {
+            continue; // no demand for this weapon
+        }
+        let cap = single_role_cap(role, probe_energy);
+        if cap == 0 {
+            return None; // can't field even one member of this role at this energy → defer
+        }
+        // Continuous member count: the role-set floor is ONE (never under-sized), grown by ceil so each
+        // member's even share fits the cap. No template-count floor — Layer B cannot recur. `per_member`
+        // is ceil so Σ over members ≥ total (the force never under-sizes); `per_member ≤ cap` always holds.
+        let count = total.div_ceil(cap).max(1);
+        let per_member = total.div_ceil(count);
+        let spec = single_role_spec(role, per_member);
+        for _ in 0..count {
+            slots.push(SquadSlot { role, body_type: BodyType::Sized(spec) });
+        }
+    }
+
+    if slots.is_empty() {
+        return None; // an empty requirement fields nothing — the caller defers / no-ops
+    }
+    if slots.len() > MAX_SIZED_MEMBERS {
+        // A bigger force is the STRATEGY layer's call (scale the blob / multi-squad / boost — a future
+        // ADR), NOT a composition-layer failover (D10). The assembler terminates at the best single squad.
+        return None;
+    }
+
+    let (formation_shape, formation_mode) = formation_for(slots.len());
+    Some(SquadComposition {
+        label: assembled_label(&slots),
+        slots,
+        formation_shape,
+        formation_mode,
+        // The objective-class retreat tuning (e.g. SK's bursty 0.5) is layered by the caller post-assembly;
+        // the assembler is objective-agnostic (it sees only the vector), so it uses the standard threshold.
+        retreat_threshold: default_retreat_threshold(),
+    })
+}
+
 /// A composition's per-tick combat output + tank HP at a spawn energy — the force-sizing oracle's
 /// `ForceBudget` inputs (ADR 0020 §12.2).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1037,5 +1163,83 @@ mod tests {
             BodyType::Sized(spec) => assert!(spec.ranged_attack > 0, "kiter sized to ranged kill parts: {spec:?}"),
             bt => panic!("kiter not sized: {bt:?}"),
         }
+    }
+
+    // ── T2: assemble_force (ADR 0031 P3 — the marginal-fill assembler) ──
+
+    fn member_count_of(req: RequiredForce, energy: u32) -> Option<usize> {
+        assemble_force(&req, energy).map(|c| c.slots.len())
+    }
+
+    /// The assembler is a pure fold over a frozen Vec-ordered demand list — run-twice-equal (the P3
+    /// determinism fence; the standing sim fence only covers the hardcoded quad_ranged). (ADR 0031 §5.)
+    #[test]
+    fn assemble_force_is_deterministic() {
+        for req in [
+            RequiredForce { heal_parts: 12, dismantle_parts: 8, ..Default::default() },
+            RequiredForce { heal_parts: 20, immune_struct_parts: 10, anti_creep_parts: 14, ..Default::default() },
+            RequiredForce { heal_parts: 40, dismantle_parts: 30, anti_creep_parts: 18, tough_parts: 6, ..Default::default() },
+        ] {
+            let a = assemble_force(&req, 5600).map(|c| format!("{c:?}"));
+            let b = assemble_force(&req, 5600).map(|c| format!("{c:?}"));
+            assert_eq!(a, b, "assembler is deterministic for {req:?}");
+        }
+    }
+
+    /// The Layer-B regression PIN: the assembler's floor is a ROLE-SET (≥1 per demanded role), NEVER a
+    /// template count — so a tiny dismantle+heal force is a DUO (2), not snapped to a quad (4), the member
+    /// count is MONOTONIC non-decreasing in the force, and 3 is reachable (no 2→4 snap). Contrast
+    /// `sized_for`'s `.max(template_count)` (composition.rs ~804), which floored the count at the template's.
+    #[test]
+    fn assemble_force_sizes_continuously_no_snap() {
+        // A minimal one-of-each-weapon force fields exactly the role set — a DUO (1 Dismantler + 1 Healer),
+        // not a 4-member quad.
+        assert_eq!(member_count_of(RequiredForce { heal_parts: 5, dismantle_parts: 5, ..Default::default() }, 5600), Some(2), "minimal force is a duo, not a quad");
+
+        // Monotonic non-decreasing as the force grows, and 3 is reachable (continuity, no 1→4 / 2→4 snap).
+        let sweep: Vec<usize> = (1..=14)
+            .map(|k| member_count_of(RequiredForce { heal_parts: 4 * k, dismantle_parts: 4 * k, ..Default::default() }, 5600).unwrap_or(99))
+            .collect();
+        for w in sweep.windows(2) {
+            assert!(w[1] >= w[0], "member count is monotonic non-decreasing across the sweep: {sweep:?}");
+        }
+        assert!(sweep.contains(&2) && sweep.contains(&3), "intermediate counts 2 and 3 are reachable (no snap): {sweep:?}");
+    }
+
+    /// The role-set viability floor: a force demanding heal + dismantle + ranged fields ≥1 of EACH role —
+    /// never "defenders present but no anti-creep" or "healing required but no healer".
+    #[test]
+    fn assemble_force_fields_the_full_role_set() {
+        let req = RequiredForce { heal_parts: 6, dismantle_parts: 6, anti_creep_parts: 8, ..Default::default() };
+        let comp = assemble_force(&req, 5600).expect("affordable at RCL7");
+        for role in [SquadRole::Healer, SquadRole::Dismantler, SquadRole::RangedDPS] {
+            assert!(comp.slots.iter().any(|s| s.role == role), "{role:?} present in {:?}", comp.label);
+        }
+        // Every member is force-Sized (no catalog body), and the fielded force meets-or-exceeds the demand.
+        assert!(comp.slots.iter().all(|s| matches!(s.body_type, BodyType::Sized(_))), "all members are Sized");
+        let caps = comp.capabilities(5600);
+        assert!(caps.heal_per_tick >= req.heal_parts * HEAL_POWER, "fielded HEAL ≥ required");
+    }
+
+    /// RANGED carries BOTH the immune-structure DPS AND the anti-creep kill (additive) — a siege facing a
+    /// guard fields enough ranged for both. (The sum, matching the `sized_for` bridge.)
+    #[test]
+    fn assemble_force_ranged_covers_immune_struct_plus_anti_creep() {
+        let req = RequiredForce { immune_struct_parts: 10, anti_creep_parts: 10, ..Default::default() };
+        let comp = assemble_force(&req, 5600).expect("affordable");
+        let ranged: u32 = comp.slots.iter().filter(|s| s.role == SquadRole::RangedDPS).map(|s| s.body_type.part_count(5600, Part::RangedAttack)).sum();
+        assert!(ranged >= 20, "ranged covers immune_struct + anti_creep = 20 parts, got {ranged}");
+    }
+
+    /// `None` is a TERMINAL defer (D10): a force past `MAX_SIZED_MEMBERS`, an empty requirement, or a role
+    /// that can't field even one member at this energy all return None (no G4-HEAVY failover, no under-size).
+    #[test]
+    fn assemble_force_defers_terminally() {
+        // Empty requirement → nothing to field.
+        assert!(assemble_force(&RequiredForce::default(), 5600).is_none(), "empty requirement → None");
+        // A huge heal demand at low per-member energy exceeds MAX_SIZED_MEMBERS → None.
+        assert!(assemble_force(&RequiredForce { heal_parts: 400, ..Default::default() }, 5600).is_none(), "force past the 8-member cap → None");
+        // Energy below a single HEAL+MOVE member's cost → can't field even one → None.
+        assert!(assemble_force(&RequiredForce { heal_parts: 4, ..Default::default() }, 100).is_none(), "unaffordable role → None");
     }
 }
