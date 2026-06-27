@@ -135,32 +135,126 @@ impl ForcePlan {
     }
 }
 
-/// Run the force-sizing oracle for a structure objective + size `template` to it. The SHARED sizing path
-/// that the bot's InvaderCore arm and the eval's structure beds both used inline — now ONE place (the
-/// parity seam). `budget` is the caller-computed [`ForceBudget`] for `template` (bot: over home rooms;
-/// eval: from the scenario). `None` composition ⇒ no in-range home affords the required force ⇒ defer.
-fn sized_plan(ctx: &EngagementContext, budget: &ForceBudget, template: SquadComposition) -> ForcePlan {
-    let a = assess(&ctx.defense, budget);
-    if !a.winnable {
-        return ForcePlan::skip(a);
+/// The UNIFIED requirement emitter (ADR 0031 T1) — ONE place that derives the capability vector
+/// ([`RequiredForce`]) + the oracle verdict ([`ForceAssessment`]) for an objective, folding the three
+/// formerly divergent sizing maths: [`assess`] (structure breach/drain), [`clear_force`] (creep
+/// square-law clear), and the SK kite terms. Each doctrine `plan()` becomes a thin caller — it computes
+/// the budget, then selects/sizes a template and wraps the result; the sizing MATH lives HERE (the parity
+/// seam the bot's `war.rs` and the eval both run, so they size identically). `budget` is `None` only for
+/// the SK kite (it sizes directly from the keeper — no winnability-against-budget check); the structure +
+/// creep-clear paths require it.
+///
+/// Exact-behavior-preserving (P2): the STRUCTURE objectives run `assess`, scale by `importance` (R5), and
+/// overlay anti-creep ([`overlay_anti_creep`]) when defenders are observed (`KillImmuneStructure` keeps the
+/// RANGED structure-alt `immune_struct_parts`; `DismantleStructure` zeroes it — a dismantle-able ring uses
+/// WORK). The CREEP-CLEAR objectives size via `clear_force` at the coordinated over-match (the binding
+/// constraint is out-powering the defenders, NOT importance, so they do not scale — preserving the prior
+/// per-doctrine behavior); `RaidCreeps` additionally threads `enemy.hits` (the kill-in-time term).
+/// `Suppress` sizes the keeper kill window. The assembler (P3) consumes this vector instead of `sized_for`.
+pub fn emit_requirement(
+    objective: DoctrineObjective,
+    defense: &DefenseProfile,
+    enemy_force: Option<EnemyForce>,
+    budget: Option<&ForceBudget>,
+    coordination: EnemyCoordination,
+    importance: f32,
+) -> (ForceAssessment, RequiredForce) {
+    match objective {
+        DoctrineObjective::KillImmuneStructure | DoctrineObjective::DismantleStructure => {
+            let budget = budget.expect("a structure objective must be given a ForceBudget");
+            let a = assess(defense, budget);
+            if !a.winnable {
+                return (a, RequiredForce::default());
+            }
+            // R5: over-invest by the objective's importance (a no-op at importance 0). The eval passes 0 to
+            // match its base-force sizing; the bot passes the objective's priority-derived importance.
+            let mut required = RequiredForce::from_assessment(&a).scaled(importance_margin(importance));
+            if matches!(objective, DoctrineObjective::DismantleStructure) {
+                required.immune_struct_parts = 0; // a dismantle-able ring uses WORK, not the RANGED immune-alt
+            }
+            overlay_anti_creep(&mut required, defense, enemy_force, budget, coordination);
+            (a, required)
+        }
+        // CREEP-CLEAR: out-heal the incoming (towers + defenders) × HOLD_MARGIN AND out-power the defenders
+        // by the coordinated square-law margin. `ClearCreeps` (raid/garrison) sizes to out-power with
+        // `hits = 0` (the binding constraint is the dps race, not grinding HP); `RaidCreeps` (the gated
+        // resource-denial raid) also threads `enemy.hits` so an HP-rich room is sized to clear in the window.
+        DoctrineObjective::ClearCreeps | DoctrineObjective::RaidCreeps => {
+            let budget = budget.expect("a creep-clear objective must be given a ForceBudget");
+            let f = enemy_force.unwrap_or_default();
+            let hits = if matches!(objective, DoctrineObjective::RaidCreeps) { f.hits } else { 0 };
+            clear_force(defense.towers.clone(), f.dps, hits, f.heal, budget, COORDINATED_DPS_MARGIN, defense.safe_mode)
+        }
+        // SK SUPPRESSION: kite + out-heal + kill the keeper in the kill window. NOT `clear_force` (kited, no
+        // square-law over-power) — heal out-heals the keeper melee × HOLD_MARGIN (a slip recovers, not dies);
+        // the ranged kill grinds the keeper's HP (a CREEP → `anti_creep_parts`) over the proven kill window.
+        DoctrineObjective::Suppress => {
+            let keeper = enemy_force.unwrap_or_default();
+            let required = RequiredForce {
+                heal_parts: defender_heal_parts_for_dps(keeper.dps * HOLD_MARGIN, false),
+                anti_creep_parts: keeper.hits.div_ceil(SK_KEEPER_KILL_TICKS * RANGED_ATTACK_POWER),
+                ..Default::default()
+            };
+            let assessment = ForceAssessment {
+                winnable: true,
+                mode: AssaultMode::Breach,
+                required_heal_per_tick: keeper.dps * HOLD_MARGIN,
+                required_dismantle_dps: 0.0,
+                est_ticks: SK_KEEPER_KILL_TICKS,
+                reason: "sk: out-heal + kill the keeper",
+            };
+            (assessment, required)
+        }
+        // HARASS: no sizing math today (a fixed throwaway solo); D11's DYNAMIC anti-creep harass is a P4
+        // behavior change. `HarassRemote` does not call the emitter in P2 — this arm keeps the match total
+        // and is the seam P4 routes the dynamic harass through (a winnable/empty "fixed, no oracle gate").
+        DoctrineObjective::Harass => (
+            ForceAssessment {
+                winnable: true,
+                mode: AssaultMode::Breach,
+                required_heal_per_tick: 0.0,
+                required_dismantle_dps: 0.0,
+                est_ticks: 0,
+                reason: "harass: fixed composition (no oracle gate)",
+            },
+            RequiredForce::default(),
+        ),
     }
-    // R5: over-invest by the objective's importance (a no-op at importance 0). The eval passes 0 to match
-    // its current base-force sizing; the bot passes the objective's priority-derived importance.
-    let mut required = RequiredForce::from_assessment(&a).scaled(importance_margin(ctx.importance));
-    // ADR 0031 P2: anti-creep OVERLAY — when defenders are OBSERVED, size `anti_creep_parts` (clear_force)
-    // to KILL them; `assess` only OUT-HEALS them (folds their dps into `incoming`). A RANGED template
-    // (e.g. `quad_ranged` for a defended invader core, which spawns invader creeps) sizes its RangedDPS
-    // from `immune_struct_parts + anti_creep_parts` (the sum) — enough for the core AND the guards. INERT
-    // with no defenders (`enemy_force` absent / `dps == 0`), so the creep-free calibration beds are
-    // unchanged (the `OracleCalibration`/`SizingWins` invariant). A WORK-only template ignores it (no
-    // RangedDPS slot) — `SiegeBreach`'s custom plan fields `siege_assault_quad` to receive it instead.
-    if let Some(enemy) = ctx.enemy_force.filter(|e| e.dps > 0.0) {
-        let margin = if ctx.coordination == EnemyCoordination::Coordinated { COORDINATED_DPS_MARGIN } else { 1.0 };
-        let (clear, req) = clear_force(ctx.defense.towers.clone(), enemy.dps, enemy.hits, enemy.heal, budget, margin, ctx.defense.safe_mode);
+}
+
+/// Anti-creep OVERLAY for a STRUCTURE objective (ADR 0031 Layer C): when defenders are OBSERVED, size
+/// `anti_creep_parts` (via `clear_force` over `enemy_force`) to KILL them — `assess` only OUT-HEALS them
+/// (folds their dps into `incoming`). A force facing a guarded structure needs BOTH the structure weapon
+/// AND anti-creep at once (raze the core AND clear the guard), so they stay separate, not `max`-ed; the
+/// out-heal is raised to cover the towers AND the defenders. INERT with no defenders (`enemy_force` absent
+/// or `dps == 0`), so the creep-free calibration beds are unchanged (the OracleCalibration/SizingWins
+/// invariant). `margin` over-powers for a `Coordinated` defender squad (square law), else 1.0.
+fn overlay_anti_creep(
+    required: &mut RequiredForce,
+    defense: &DefenseProfile,
+    enemy_force: Option<EnemyForce>,
+    budget: &ForceBudget,
+    coordination: EnemyCoordination,
+) {
+    if let Some(enemy) = enemy_force.filter(|e| e.dps > 0.0) {
+        let margin = if coordination == EnemyCoordination::Coordinated { COORDINATED_DPS_MARGIN } else { 1.0 };
+        let (clear, req) = clear_force(defense.towers.clone(), enemy.dps, enemy.hits, enemy.heal, budget, margin, defense.safe_mode);
         if clear.winnable {
             required.anti_creep_parts = req.anti_creep_parts;
             required.heal_parts = required.heal_parts.max(req.heal_parts);
         }
+    }
+}
+
+/// Run the unified emitter for a structure objective + size `template` to it (ADR 0031 P2). The SHARED
+/// sizing path the bot's InvaderCore arm and the eval's structure beds both use — now a thin wrapper over
+/// [`emit_requirement`] (the math) + `sized_for`. `budget` is the caller-computed [`ForceBudget`] for
+/// `template` (bot: over home rooms; eval: from the scenario). `None` composition ⇒ no in-range home
+/// affords the required force ⇒ defer.
+fn sized_plan(ctx: &EngagementContext, budget: &ForceBudget, template: SquadComposition) -> ForcePlan {
+    let (a, required) = emit_requirement(ctx.objective, &ctx.defense, ctx.enemy_force, Some(budget), ctx.coordination, ctx.importance);
+    if !a.winnable {
+        return ForcePlan::skip(a);
     }
     let composition = template.sized_for(required, ctx.member_energy);
     ForcePlan { composition, assessment: a, required }
@@ -231,30 +325,21 @@ impl ForceDoctrine for SiegeBreach {
     fn is_sized(&self) -> bool {
         true
     }
-    /// FUSION (ADR 0031 P1b, throwaway — the assembler P3 subsumes this): the structure is razed by WORK
-    /// (`dismantle_parts`); the RANGED structure-alt (`immune_struct_parts`) is for IMMUNE targets, so it is
-    /// zeroed here. When defenders are OBSERVED, `clear_force` sizes `anti_creep_parts` to KILL them (assess
-    /// only OUT-HEALS them via `incoming`), and the squad fields `siege_assault_quad` — which has a RangedDPS
-    /// slot so `sized_for` keeps those anti-creep parts (`siege_quad`, dismantler-only, would drop them).
+    /// FUSION (ADR 0031 P1b, throwaway — the assembler P3 subsumes this): the requirement (assess + the
+    /// anti-creep overlay, with `immune_struct_parts` zeroed) comes from the unified [`emit_requirement`];
+    /// this wrapper only SELECTS the template — `siege_assault_quad` (a RangedDPS slot to receive the
+    /// anti-creep parts `siege_quad`'s dismantler-only roster would drop, Layer B) when defenders are
+    /// observed, else `siege_quad` — then sizes it.
     fn plan(&self, ctx: &EngagementContext, budget: Option<ForceBudget>) -> ForcePlan {
         let budget = budget.expect("a sized doctrine must be given a ForceBudget");
-        let a = assess(&ctx.defense, &budget);
+        let (a, required) = emit_requirement(ctx.objective, &ctx.defense, ctx.enemy_force, Some(&budget), ctx.coordination, ctx.importance);
         if !a.winnable {
             return ForcePlan::skip(a);
         }
-        let mut required = RequiredForce::from_assessment(&a).scaled(importance_margin(ctx.importance));
-        required.immune_struct_parts = 0; // a dismantle-able ring uses WORK, not the RANGED immune-alt
-        let template = match ctx.enemy_force.filter(|e| e.dps > 0.0) {
-            Some(enemy) => {
-                let margin = if ctx.coordination == EnemyCoordination::Coordinated { COORDINATED_DPS_MARGIN } else { 1.0 };
-                let (clear, req) = clear_force(ctx.defense.towers.clone(), enemy.dps, enemy.hits, enemy.heal, &budget, margin, ctx.defense.safe_mode);
-                if clear.winnable {
-                    required.anti_creep_parts = req.anti_creep_parts;
-                    required.heal_parts = required.heal_parts.max(req.heal_parts); // out-heal towers AND defenders
-                }
-                SquadComposition::siege_assault_quad()
-            }
-            None => SquadComposition::siege_quad(),
+        let template = if ctx.enemy_force.is_some_and(|e| e.dps > 0.0) {
+            SquadComposition::siege_assault_quad()
+        } else {
+            SquadComposition::siege_quad()
         };
         let composition = template.sized_for(required, ctx.member_energy);
         ForcePlan { composition, assessment: a, required }
@@ -292,7 +377,7 @@ impl ForceDoctrine for PlayerRaid {
         }
         let quad = SquadComposition::quad_ranged();
         let budget = quad.force_budget(ctx.member_energy, CLEAR_ONSITE_TICKS);
-        let (_, required) = clear_force(ctx.defense.towers.clone(), f.dps, 0, f.heal, &budget, COORDINATED_DPS_MARGIN, ctx.defense.safe_mode);
+        let (_, required) = emit_requirement(DoctrineObjective::ClearCreeps, &ctx.defense, ctx.enemy_force, Some(&budget), ctx.coordination, ctx.importance);
         let comp = quad.sized_for(required, ctx.member_energy).unwrap_or_else(SquadComposition::quad_ranged);
         ForcePlan::fixed(comp)
     }
@@ -322,22 +407,11 @@ impl ForceDoctrine for GatedPlayerRaid {
     }
     fn plan(&self, ctx: &EngagementContext, budget: Option<ForceBudget>) -> ForcePlan {
         let budget = budget.expect("a sized doctrine must be given a ForceBudget");
-        let f = ctx.enemy_force.unwrap_or_default();
-        // Creep-clear sizing (NOT the structure `assess` the generic sized path runs): out-heal the towers
-        // AND the defenders' dps with the hold margin, and out-power their dps by the square-law margin.
-        // HONOR the verdict — unwinnable ⇒ skip ⇒ the bot's gate DEFERS (the defer the always-field
-        // `PlayerRaid` lacks). `enemy_force.hits` is 0 from the bot today (the binding constraint is out-
-        // powering the defenders, not grinding HP), so this sizes to out-power; passing `f.hits` keeps it
-        // forward-compatible with the eval's `clear_outcome_at` if real hits are wired in.
-        let (assessment, required) = clear_force(
-            ctx.defense.towers.clone(),
-            f.dps,
-            f.hits,
-            f.heal,
-            &budget,
-            COORDINATED_DPS_MARGIN,
-            ctx.defense.safe_mode,
-        );
+        // Creep-clear sizing (NOT the structure `assess` the generic sized path runs) via the unified
+        // emitter: out-heal the towers AND the defenders × the hold margin, out-power their dps by the
+        // square-law margin, and thread `enemy.hits` (the kill-in-time term). HONOR the verdict —
+        // unwinnable ⇒ skip ⇒ the bot's gate DEFERS (the defer the always-field `PlayerRaid` lacks).
+        let (assessment, required) = emit_requirement(DoctrineObjective::RaidCreeps, &ctx.defense, ctx.enemy_force, Some(&budget), ctx.coordination, ctx.importance);
         if !assessment.winnable {
             return ForcePlan::skip(assessment);
         }
@@ -385,7 +459,6 @@ impl ForceDoctrine for GarrisonDefense {
         false
     }
     fn plan(&self, ctx: &EngagementContext, _budget: Option<ForceBudget>) -> ForcePlan {
-        let f = ctx.enemy_force.unwrap_or_default();
         // ADR 0029 — GENERALIZE defense onto the oracle: size a single ranged+heal BASE into a CONTINUOUS
         // blob; the member COUNT emerges from `clear_force`'s required out-power + out-heal, NOT from
         // solo/duo/quad buckets. The buckets straddled a HARD threshold (dps>60 / count>=2 / …) on jittery
@@ -401,7 +474,11 @@ impl ForceDoctrine for GarrisonDefense {
         // completion fix: the 4-member floor × N contested rooms saturated the spawn lanes so no roster ever
         // completed. sized_for grows the duo floor for real threats; the manager deploys it immediately (FIX A).
         let budget = SquadComposition::quad_ranged().force_budget(ctx.member_energy, CLEAR_ONSITE_TICKS);
-        let (_, required) = clear_force(vec![], f.dps, 0, f.heal, &budget, COORDINATED_DPS_MARGIN, false);
+        // Defense is in our OWN room: no enemy towers + no enemy safe-mode (`ctx.defense` is the default
+        // profile), so the unified `ClearCreeps` emitter (which reads `defense.towers`/`defense.safe_mode`)
+        // reproduces the prior `clear_force(vec![], …, false)` exactly. The floor stays the small
+        // `duo_attack_heal` (decoupled from the quad budget — the ADR 0029 forming-completion fix).
+        let (_, required) = emit_requirement(DoctrineObjective::ClearCreeps, &ctx.defense, ctx.enemy_force, Some(&budget), ctx.coordination, ctx.importance);
         let floor = SquadComposition::duo_attack_heal();
         let comp = floor.sized_for(required, ctx.member_energy).unwrap_or(floor);
         ForcePlan::fixed(comp)
@@ -453,26 +530,11 @@ impl ForceDoctrine for SkSuppression {
         false // a custom kiting-suppression sizing (below), not the generic budget/assess path
     }
     fn plan(&self, ctx: &EngagementContext, _budget: Option<ForceBudget>) -> ForcePlan {
-        let keeper = ctx.enemy_force.unwrap_or_default();
-        let required = RequiredForce {
-            heal_parts: defender_heal_parts_for_dps(keeper.dps * HOLD_MARGIN, false),
-            anti_creep_parts: keeper.hits.div_ceil(SK_KEEPER_KILL_TICKS * RANGED_ATTACK_POWER), // a Source Keeper is a CREEP
-            ..Default::default()
-        };
+        // The SK kite needs no budget (it sizes directly from the keeper) — `None` budget to the emitter.
+        let (assessment, required) = emit_requirement(DoctrineObjective::Suppress, &ctx.defense, ctx.enemy_force, None, ctx.coordination, ctx.importance);
         let duo = SquadComposition::duo_sk_farmer();
         let composition = Some(duo.sized_for(required, ctx.member_energy).unwrap_or_else(SquadComposition::duo_sk_farmer));
-        ForcePlan {
-            composition,
-            assessment: ForceAssessment {
-                winnable: true,
-                mode: AssaultMode::Breach,
-                required_heal_per_tick: keeper.dps * HOLD_MARGIN,
-                required_dismantle_dps: 0.0,
-                est_ticks: SK_KEEPER_KILL_TICKS,
-                reason: "sk: out-heal + kill the keeper",
-            },
-            required,
-        }
+        ForcePlan { composition, assessment, required }
     }
 }
 
@@ -675,5 +737,67 @@ mod tests {
             let plan = doc.plan(&c, None);
             assert!(plan.winnable() && plan.composition.is_some(), "fixed arm fields its template");
         }
+    }
+
+    /// ADR 0031 P2 determinism fence: the unified [`emit_requirement`] is a pure fold over Vec-ordered
+    /// inputs, so run-twice-equal must hold for EVERY objective (the standing sim fence only covers the
+    /// hardcoded `quad_ranged`; the emitter is the new shared path). (ADR 0031 §5.)
+    #[test]
+    fn emit_requirement_is_deterministic_over_objectives() {
+        let defense = DefenseProfile {
+            towers: vec![TowerThreat { range_to_assault: 10, energy: 1000 }],
+            breach_hits: 20_000,
+            objective_hits: 100_000,
+            enemy_dps: 120.0,
+            repair_per_tick: 50.0,
+            safe_mode: false,
+        };
+        let enemy = Some(EnemyForce { dps: 120.0, heal: 20.0, hits: 4000, count: 3, boosted: false });
+        let budget = SquadComposition::quad_ranged().force_budget(5600, 1400);
+        for obj in [
+            DoctrineObjective::KillImmuneStructure,
+            DoctrineObjective::DismantleStructure,
+            DoctrineObjective::ClearCreeps,
+            DoctrineObjective::RaidCreeps,
+            DoctrineObjective::Suppress,
+            DoctrineObjective::Harass,
+        ] {
+            let run = || emit_requirement(obj, &defense, enemy, Some(&budget), EnemyCoordination::Coordinated, 0.5);
+            assert_eq!(run(), run(), "{obj:?}: the emitter is deterministic");
+        }
+    }
+
+    /// ADR 0031 P2: the emitter must reproduce each doctrine's prior per-objective sizing semantics — the
+    /// structure paths size the structure weapon + an anti-creep OVERLAY when defenders are present
+    /// (`KillImmuneStructure` keeps the RANGED immune-alt; `DismantleStructure` zeroes it), the creep-clear
+    /// paths produce anti-creep only, and a creep-free structure bed is left unperturbed (the calibration
+    /// invariant). This pins the consolidation contract at the unit level (the eval golden-output over
+    /// `realistic_bases()` pins it at the bed level).
+    #[test]
+    fn emit_requirement_reproduces_per_objective_semantics() {
+        // A guard but NO towers, so the anti-creep overlay's `clear_force` is out-heal-feasible against the
+        // siege budget (towers + a guard exceed a siege quad's heal — that's a correct defer, tested elsewhere).
+        let guarded = DefenseProfile { towers: vec![], breach_hits: 10_000, objective_hits: 100_000, enemy_dps: 90.0, repair_per_tick: 0.0, safe_mode: false };
+        let undefended = DefenseProfile { breach_hits: 10_000, objective_hits: 100_000, ..Default::default() };
+        let guard = Some(EnemyForce { dps: 90.0, heal: 0.0, hits: 3000, count: 2, boosted: false });
+        let budget = SquadComposition::siege_quad().force_budget(5600, 1400);
+
+        // DismantleStructure vs a guard: WORK to raze (dismantle_parts), anti-creep to clear the guard, and
+        // the RANGED immune-alt is zeroed (a dismantle-able ring uses WORK).
+        let (a, dr) = emit_requirement(DoctrineObjective::DismantleStructure, &guarded, guard, Some(&budget), EnemyCoordination::Coordinated, 0.0);
+        assert!(a.winnable && dr.dismantle_parts > 0 && dr.anti_creep_parts > 0 && dr.immune_struct_parts == 0, "siege vs guard: WORK + anti-creep, no immune-alt: {dr:?}");
+
+        // KillImmuneStructure vs a guard: the RANGED immune-alt is KEPT + anti-creep is added (both feed the
+        // ranged role's sum) — the core needs ranged AND the guard needs killing.
+        let (_, kr) = emit_requirement(DoctrineObjective::KillImmuneStructure, &guarded, guard, Some(&budget), EnemyCoordination::Coordinated, 0.0);
+        assert!(kr.immune_struct_parts > 0 && kr.anti_creep_parts > 0, "immune core vs guard: ranged immune-alt + anti-creep: {kr:?}");
+
+        // A creep-free structure bed is UNPERTURBED (no anti-creep overlay) — the OracleCalibration invariant.
+        let (_, clean) = emit_requirement(DoctrineObjective::DismantleStructure, &undefended, None, Some(&budget), EnemyCoordination::Individual, 0.0);
+        assert_eq!(clean.anti_creep_parts, 0, "no defenders → no anti-creep (calibration beds unperturbed)");
+
+        // Creep-clear produces ANTI-CREEP only (no structure weapon).
+        let (_, cc) = emit_requirement(DoctrineObjective::ClearCreeps, &DefenseProfile::default(), guard, Some(&budget), EnemyCoordination::Coordinated, 0.0);
+        assert!(cc.anti_creep_parts > 0 && cc.dismantle_parts == 0 && cc.immune_struct_parts == 0, "clear → anti-creep only: {cc:?}");
     }
 }
