@@ -64,6 +64,11 @@ pub mod doctrine;
 /// the bot (`squad_manager`) and the lifecycle harness (parity), like `decide_squad`.
 pub mod lifecycle;
 
+/// Pure spawn-throughput model (P-OBJ harness): a deterministic mirror of the live spawnsystem's
+/// per-room head-of-line spawn loop, so the offline lifecycle harness reproduces spawn-lane contention
+/// (the "roster stuck at 3/5" failure) and we tune combat-vs-economy spawn priority offline.
+pub mod spawn_throughput;
+
 use screeps::local::LocalCostMatrix;
 use screeps::{Direction, Part, Position, RawObjectId, RoomCoordinate, RoomName, RoomXY, StructureType};
 
