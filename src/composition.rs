@@ -575,6 +575,37 @@ impl SquadComposition {
         }
     }
 
+    /// Siege ASSAULT quad (ADR 0031 P1b): a dismantler to raze the structure + a RANGED attacker to clear
+    /// the blocking defenders + 2 healers, box formation. The fusion template `SiegeBreach` fields when
+    /// defenders are observed — it has a `RangedDPS` slot so `sized_for` keeps the `anti_creep_parts`
+    /// (`siege_quad`, dismantler-only, drops them — Layer B). Throwaway: the assembler (P3) derives this mix.
+    pub fn siege_assault_quad() -> Self {
+        SquadComposition {
+            label: "Siege Assault Quad".into(),
+            slots: vec![
+                SquadSlot {
+                    role: SquadRole::Dismantler,
+                    body_type: BodyType::SiegeDismantler,
+                },
+                SquadSlot {
+                    role: SquadRole::RangedDPS,
+                    body_type: BodyType::QuadMember,
+                },
+                SquadSlot {
+                    role: SquadRole::Healer,
+                    body_type: BodyType::DuoHealer,
+                },
+                SquadSlot {
+                    role: SquadRole::Healer,
+                    body_type: BodyType::DuoHealer,
+                },
+            ],
+            formation_shape: FormationShape::Box2x2,
+            formation_mode: FormationMode::Strict,
+            retreat_threshold: default_retreat_threshold(),
+        }
+    }
+
     /// Cheap solo attacker for level 0 invader cores.
     pub fn solo_core_attacker() -> Self {
         SquadComposition {

@@ -216,6 +216,34 @@ impl ForceDoctrine for SiegeBreach {
     fn is_sized(&self) -> bool {
         true
     }
+    /// FUSION (ADR 0031 P1b, throwaway — the assembler P3 subsumes this): the structure is razed by WORK
+    /// (`dismantle_parts`); the RANGED structure-alt (`immune_struct_parts`) is for IMMUNE targets, so it is
+    /// zeroed here. When defenders are OBSERVED, `clear_force` sizes `anti_creep_parts` to KILL them (assess
+    /// only OUT-HEALS them via `incoming`), and the squad fields `siege_assault_quad` — which has a RangedDPS
+    /// slot so `sized_for` keeps those anti-creep parts (`siege_quad`, dismantler-only, would drop them).
+    fn plan(&self, ctx: &EngagementContext, budget: Option<ForceBudget>) -> ForcePlan {
+        let budget = budget.expect("a sized doctrine must be given a ForceBudget");
+        let a = assess(&ctx.defense, &budget);
+        if !a.winnable {
+            return ForcePlan::skip(a);
+        }
+        let mut required = RequiredForce::from_assessment(&a).scaled(importance_margin(ctx.importance));
+        required.immune_struct_parts = 0; // a dismantle-able ring uses WORK, not the RANGED immune-alt
+        let template = match ctx.enemy_force.filter(|e| e.dps > 0.0) {
+            Some(enemy) => {
+                let margin = if ctx.coordination == EnemyCoordination::Coordinated { COORDINATED_DPS_MARGIN } else { 1.0 };
+                let (clear, req) = clear_force(ctx.defense.towers.clone(), enemy.dps, enemy.hits, enemy.heal, &budget, margin, ctx.defense.safe_mode);
+                if clear.winnable {
+                    required.anti_creep_parts = req.anti_creep_parts;
+                    required.heal_parts = required.heal_parts.max(req.heal_parts); // out-heal towers AND defenders
+                }
+                SquadComposition::siege_assault_quad()
+            }
+            None => SquadComposition::siege_quad(),
+        };
+        let composition = template.sized_for(required, ctx.member_energy);
+        ForcePlan { composition, assessment: a, required }
+    }
 }
 
 /// Clear hostile creeps (an operator attack flag / secure a player room) → a ranged quad CLEAR_FORCE-SIZED
