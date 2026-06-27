@@ -964,6 +964,37 @@ pub fn assemble_force(req: &RequiredForce, member_energy: u32) -> Option<SquadCo
     })
 }
 
+/// Fighters in the winnability CEILING (the strongest single squad the oracle judges against — the
+/// assembler can field up to [`MAX_SIZED_MEMBERS`], so a "winnable" verdict from this ceiling stays
+/// conservative). 3 fighters + 5 healers = 8 (the eval's long-standing `siege_ceiling` shape).
+const CEILING_FIGHTERS: usize = 3;
+const CEILING_HEALERS: usize = 5;
+
+/// The template-free winnability CEILING (ADR 0031 P4) — the BUDGET source that replaces
+/// `doctrine.template().force_budget(..)`: `force_ceiling(energy, fighter).force_budget(..)` is the oracle's
+/// `ForceBudget` with NO catalog constructor in sight. `fighter` is the kill weapon role (`Dismantler` for
+/// dismantle-able rings, `RangedDPS` for immune cores / creep clear). Each member is maxed at `member_energy`
+/// via the real builder (full-energy probe — the conservative ceiling the oracle is calibrated against,
+/// matching the eval's `siege_ceiling`). Identical in shape to `siege_ceiling(energy)` for `Dismantler`, so
+/// the calibration gates that judge against the ceiling are preserved.
+pub fn force_ceiling(member_energy: u32, fighter: SquadRole) -> SquadComposition {
+    let fighter_cap = single_role_cap(fighter, member_energy);
+    let heal_cap = single_role_cap(SquadRole::Healer, member_energy);
+    let mut slots = Vec::new();
+    if fighter_cap > 0 {
+        for _ in 0..CEILING_FIGHTERS {
+            slots.push(SquadSlot { role: fighter, body_type: BodyType::Sized(single_role_spec(fighter, fighter_cap)) });
+        }
+    }
+    if heal_cap > 0 {
+        for _ in 0..CEILING_HEALERS {
+            slots.push(SquadSlot { role: SquadRole::Healer, body_type: BodyType::Sized(single_role_spec(SquadRole::Healer, heal_cap)) });
+        }
+    }
+    let (formation_shape, formation_mode) = formation_for(slots.len());
+    SquadComposition { label: "Force Ceiling".into(), slots, formation_shape, formation_mode, retreat_threshold: default_retreat_threshold() }
+}
+
 /// A composition's per-tick combat output + tank HP at a spawn energy — the force-sizing oracle's
 /// `ForceBudget` inputs (ADR 0020 §12.2).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1229,6 +1260,23 @@ mod tests {
         let comp = assemble_force(&req, 5600).expect("affordable");
         let ranged: u32 = comp.slots.iter().filter(|s| s.role == SquadRole::RangedDPS).map(|s| s.body_type.part_count(5600, Part::RangedAttack)).sum();
         assert!(ranged >= 20, "ranged covers immune_struct + anti_creep = 20 parts, got {ranged}");
+    }
+
+    /// `force_ceiling` (the template-free budget source, ADR 0031 P4) builds the conservative ceiling:
+    /// CEILING_FIGHTERS fighters + CEILING_HEALERS healers, each force-Sized + maxed, with a sane budget.
+    /// `Dismantler` fields WORK; `RangedDPS` fields RANGED — and the budget's structure DPS reflects it.
+    #[test]
+    fn force_ceiling_builds_the_budget_source() {
+        let siege = force_ceiling(5600, SquadRole::Dismantler);
+        assert_eq!(siege.slots.iter().filter(|s| s.role == SquadRole::Dismantler).count(), CEILING_FIGHTERS);
+        assert_eq!(siege.slots.iter().filter(|s| s.role == SquadRole::Healer).count(), CEILING_HEALERS);
+        assert!(siege.slots.iter().all(|s| matches!(s.body_type, BodyType::Sized(_))), "ceiling is all force-Sized (no catalog)");
+        let b = siege.force_budget(5600, 1400);
+        assert!(b.max_heal_per_tick > 0.0 && b.max_dismantle_dps > 0.0, "siege ceiling budget: {b:?}");
+        // Ranged ceiling fields RANGED structure DPS (immune cores / creep clear).
+        let ranged = force_ceiling(5600, SquadRole::RangedDPS);
+        assert!(ranged.slots.iter().any(|s| matches!(s.body_type, BodyType::Sized(spec) if spec.ranged_attack > 0)), "ranged ceiling fields RANGED");
+        assert!(ranged.force_budget(5600, 1400).max_dismantle_dps > 0.0, "ranged ceiling has structure DPS via RANGED");
     }
 
     /// `None` is a TERMINAL defer (D10): a force past `MAX_SIZED_MEMBERS`, an empty requirement, or a role
