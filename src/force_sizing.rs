@@ -444,6 +444,15 @@ mod tests {
     }
 
     #[test]
+    fn clear_force_sizes_more_heal_for_towers() {
+        // L4-activate: a player base's TOWERS add to the incoming → more out-heal. (Far tower so it stays
+        // winnable within the budget.)
+        let no_tower = clear_force(vec![], 100.0, 0, 0.0, &clear_budget(), 1.5, false).1;
+        let with_tower = clear_force(vec![TowerThreat { range_to_assault: 20, energy: 1000 }], 100.0, 0, 0.0, &clear_budget(), 1.5, false).1;
+        assert!(with_tower.heal_parts > no_tower.heal_parts, "towers raise the out-heal: {} > {}", with_tower.heal_parts, no_tower.heal_parts);
+    }
+
+    #[test]
     fn required_force_spec_is_buildable_by_r1() {
         // R1∘R2 seam: the spec R2 produces builds into a real body at RCL7 energy.
         let rf = RequiredForce::from_assessment(&assessment(true, 120.0, 300.0));
