@@ -78,6 +78,12 @@ pub mod rally;
 /// same transitions the bot does. The ECS actions stay in the bot; only the pure decision lives here.
 pub mod squad_fsm;
 
+/// Pure fielding kernel (P-OBJ harness / ADR 0028 K3): composition + filled-slots → spawn-queue requests.
+pub mod fielding;
+
+/// Pure claim-pacing kernel (P-OBJ harness / ADR 0028 K4): Phase C "how many new objectives to claim".
+pub mod claim_pacing;
+
 use screeps::local::LocalCostMatrix;
 use screeps::{Direction, Part, Position, RawObjectId, RoomCoordinate, RoomName, RoomXY, StructureType};
 
