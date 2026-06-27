@@ -13,7 +13,9 @@
 //!
 //! Doctrines (ADR 0026 §9.5/§9.10): OFFENSE (`default_doctrines`) = `NpcCore` (sized ranged quad vs a
 //! dismantle-immune core), `SiegeBreach` (sized siege quad vs a structure ring), `PlayerRaid` (L4 —
-//! clear_force-sized ranged quad vs a player room's creeps, always-field), `HarassRemote` (fixed solo).
+//! clear_force-sized ranged quad vs a player room's creeps, always-field), `GatedPlayerRaid` (ADR 0029
+//! §7/D7 — the SIZED + GATED resource-denial raid: same clear_force sizing, but DEFERS a hopeless room
+//! through the bot's winnability + ROI gate), `HarassRemote` (fixed solo).
 //! DEFENSE (`defense_doctrines`) = `GarrisonDefense` (L3 — clear_force-sized defender). SK
 //! (`sk_doctrines`) = `SkSuppression` (L7 — sized kiting duo vs a keeper). The `coordination`/
 //! `enemy_force` context fields feed the creep-clear sizing (`clear_force`).
@@ -48,6 +50,11 @@ pub enum DoctrineObjective {
     DismantleStructure,
     /// Clear hostile CREEPS from a room (an operator attack flag / secure).
     ClearCreeps,
+    /// RAID a hostile PLAYER's remote to deny resources — the SIZED + GATED creep-clear (ADR 0029 §7/D7).
+    /// Same `clear_force` sizing as `ClearCreeps`, but routed to [`GatedPlayerRaid`], which HONORS the
+    /// oracle's unwinnable verdict so the bot's winnability + ROI gate DEFERS a hopeless / unaffordable
+    /// room — vs `ClearCreeps`/`PlayerRaid`, which always-field operator intent.
+    RaidCreeps,
     /// Harass / deny a hostile remote (don't hold).
     Harass,
     /// Suppress a farmable hazard creep (a Source Keeper) — kite + out-heal + kill, hold the source.
@@ -248,6 +255,54 @@ impl ForceDoctrine for PlayerRaid {
     }
 }
 
+/// Resource-denial RAID on a hostile PLAYER's remote (ADR 0029 §7/D7) — the SIZED + GATED twin of
+/// [`PlayerRaid`]. It runs the SAME `clear_force` creep-clear sizing (out-power + out-heal the defenders
+/// AND their towers), but unlike `PlayerRaid` (always-field operator intent) it HONORS the oracle's
+/// verdict: a hopeless room (enemy safe mode / can't out-heal the towers / their heal out-paces a feasible
+/// kill) returns [`ForcePlan::skip`], so the bot's winnability + ROI gate DEFERS it instead of feeding a
+/// doomed squad to a tower (the prior solo-harasser death). `is_sized() == true` so it flows through the
+/// bot's force-budget + winnability + ROI gate (the structural arms' path); the custom `plan` swaps the
+/// structure `assess` for creep `clear_force`. `Coordinated` (a player's creeps fight together).
+pub struct GatedPlayerRaid;
+impl ForceDoctrine for GatedPlayerRaid {
+    fn name(&self) -> &'static str {
+        "gated-player-raid"
+    }
+    fn applies(&self, ctx: &EngagementContext) -> bool {
+        matches!(ctx.objective, DoctrineObjective::RaidCreeps)
+    }
+    fn template(&self) -> SquadComposition {
+        SquadComposition::quad_ranged()
+    }
+    fn is_sized(&self) -> bool {
+        true // routes through the bot's force-budget + winnability + ROI gate (defer on unwinnable)
+    }
+    fn plan(&self, ctx: &EngagementContext, budget: Option<ForceBudget>) -> ForcePlan {
+        let budget = budget.expect("a sized doctrine must be given a ForceBudget");
+        let f = ctx.enemy_force.unwrap_or_default();
+        // Creep-clear sizing (NOT the structure `assess` the generic sized path runs): out-heal the towers
+        // AND the defenders' dps with the hold margin, and out-power their dps by the square-law margin.
+        // HONOR the verdict — unwinnable ⇒ skip ⇒ the bot's gate DEFERS (the defer the always-field
+        // `PlayerRaid` lacks). `enemy_force.hits` is 0 from the bot today (the binding constraint is out-
+        // powering the defenders, not grinding HP), so this sizes to out-power; passing `f.hits` keeps it
+        // forward-compatible with the eval's `clear_outcome_at` if real hits are wired in.
+        let (assessment, required) = clear_force(
+            ctx.defense.towers.clone(),
+            f.dps,
+            f.hits,
+            f.heal,
+            &budget,
+            COORDINATED_DPS_MARGIN,
+            ctx.defense.safe_mode,
+        );
+        if !assessment.winnable {
+            return ForcePlan::skip(assessment);
+        }
+        let composition = SquadComposition::quad_ranged().sized_for(required, ctx.member_energy);
+        ForcePlan { composition, assessment, required }
+    }
+}
+
 /// Harass / deny a hostile remote → a throwaway solo. LOW priority, no oracle gate (current behavior).
 pub struct HarassRemote;
 impl ForceDoctrine for HarassRemote {
@@ -324,6 +379,7 @@ pub fn default_doctrines() -> Vec<Box<dyn ForceDoctrine>> {
         Box::new(NpcCore),
         Box::new(SiegeBreach),
         Box::new(PlayerRaid),
+        Box::new(GatedPlayerRaid),
         Box::new(HarassRemote),
     ]
 }
@@ -450,6 +506,30 @@ mod tests {
     }
 
     #[test]
+    fn gated_player_raid_sizes_when_winnable_else_defers() {
+        // ADR 0029 §7/D7: the SIZED + GATED resource-denial raid. Unlike the always-field `PlayerRaid`, it
+        // HONORS `clear_force`'s verdict so the bot's gate can DEFER a hopeless room.
+        let docs = default_doctrines();
+        let mut c = ctx(DoctrineObjective::RaidCreeps, DefenseProfile::default());
+        c.enemy_force = Some(EnemyForce { dps: 120.0, heal: 0.0, hits: 0, count: 3, boosted: false });
+        let doc = decide_doctrine(&c, &docs).expect("RaidCreeps → gated-player-raid");
+        assert_eq!(doc.name(), "gated-player-raid");
+        assert!(doc.is_sized(), "flows through the bot's force-budget + winnability + ROI gate");
+        let budget = doc.template().force_budget(c.member_energy, 1400);
+        // Out-powerable defenders → winnable → a clear_force-sized ranged force (NOT deferred).
+        let plan = doc.plan(&c, Some(budget.clone()));
+        assert!(plan.winnable(), "out-powerable defenders are winnable: {}", plan.assessment.reason);
+        assert!(plan.composition.is_some(), "sizes a force when affordable");
+        assert!(plan.required.ranged_parts > 0, "sized the ranged kill parts");
+        // Enemy safe mode → the oracle defers (the gate the always-field `PlayerRaid` lacks).
+        let mut safe = ctx(DoctrineObjective::RaidCreeps, DefenseProfile { safe_mode: true, ..Default::default() });
+        safe.enemy_force = c.enemy_force;
+        let plan = doc.plan(&safe, Some(budget));
+        assert!(!plan.winnable(), "safe mode → defer");
+        assert!(plan.composition.is_none(), "deferred → no force fielded (the bot skips)");
+    }
+
+    #[test]
     fn garrison_defense_clear_force_sizes_the_defender() {
         // L3b: a strong grouped threat → the quad's parts are clear_force-sized to OUT-POWER it (a Sized
         // body with ranged), not the bare spawn-path template.
@@ -508,6 +588,7 @@ mod tests {
             (DoctrineObjective::KillImmuneStructure, "npc-core"),
             (DoctrineObjective::DismantleStructure, "siege-breach"),
             (DoctrineObjective::ClearCreeps, "player-raid"),
+            (DoctrineObjective::RaidCreeps, "gated-player-raid"),
             (DoctrineObjective::Harass, "harass-remote"),
         ];
         for (obj, name) in cases {
