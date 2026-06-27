@@ -16,10 +16,12 @@
 //! §9.7); `GarrisonDefense` (L3) unifies the bot's defender selection onto the registry. The
 //! `coordination`/`enemy_force` context fields feed the creep-clear sizing.
 
+use crate::bodies::defender_heal_parts_for_dps;
 use crate::composition::SquadComposition;
 use crate::force_sizing::{
-    assess, importance_margin, AssaultMode, DefenseProfile, ForceAssessment, ForceBudget, RequiredForce,
+    assess, importance_margin, AssaultMode, DefenseProfile, ForceAssessment, ForceBudget, RequiredForce, HOLD_MARGIN,
 };
+use screeps_combat_engine::constants::RANGED_ATTACK_POWER;
 
 /// How the opposing force fights — the axis that selects the sizing math (ADR 0026 §9.4, operator
 /// 2026-06-26). Rung-1 doctrines are all `Individual`; the `Coordinated` square-law branch is rungs 2–3.
@@ -46,6 +48,8 @@ pub enum DoctrineObjective {
     ClearCreeps,
     /// Harass / deny a hostile remote (don't hold).
     Harass,
+    /// Suppress a farmable hazard creep (a Source Keeper) — kite + out-heal + kill, hold the source.
+    Suppress,
 }
 
 /// The resolved enemy creep force a creep-clear / defense sizes against (ADR 0026 §9.3/§9.4), derived from
@@ -287,6 +291,61 @@ pub fn default_doctrines() -> Vec<Box<dyn ForceDoctrine>> {
     ]
 }
 
+/// SK kill window: ticks to grind a keeper's HP at the proven full-template suppression rate (~150 DPS,
+/// R6 + R-attack). A keeper does NOT self-heal (engine-fixed body), so net kill == gross ranged DPS.
+const SK_KEEPER_KILL_TICKS: u32 = 34;
+
+/// Source-Keeper suppression (ADR 0026 §9.10 L7) — the SK farm's duo, UNIFIED onto the registry from the
+/// SK mission's former inline sizing. Sizes the HEALER to out-heal the keeper's melee (× `HOLD_MARGIN`, so
+/// a kiting slip recovers, not dies) AND the KITER's RANGED to KILL the keeper in the kill window (a dead
+/// keeper clears the source for the respawn). `Individual` (one keeper per source) + KITED, so this is NOT
+/// `clear_force` — the duo kites and out-heals rather than trading blows, so there is no square-law
+/// over-power term. The keeper's stats arrive as the observed `enemy_force`. Sizes `duo_sk_farmer`, falling
+/// back to the template when no home affords the sized duo (behavior-identical to the prior SK sizing).
+pub struct SkSuppression;
+impl ForceDoctrine for SkSuppression {
+    fn name(&self) -> &'static str {
+        "sk-suppression"
+    }
+    fn applies(&self, ctx: &EngagementContext) -> bool {
+        matches!(ctx.objective, DoctrineObjective::Suppress)
+    }
+    fn template(&self) -> SquadComposition {
+        SquadComposition::duo_sk_farmer()
+    }
+    fn is_sized(&self) -> bool {
+        false // a custom kiting-suppression sizing (below), not the generic budget/assess path
+    }
+    fn plan(&self, ctx: &EngagementContext, _budget: Option<ForceBudget>) -> ForcePlan {
+        let keeper = ctx.enemy_force.unwrap_or_default();
+        let required = RequiredForce {
+            heal_parts: defender_heal_parts_for_dps(keeper.dps * HOLD_MARGIN, false),
+            ranged_parts: keeper.hits.div_ceil(SK_KEEPER_KILL_TICKS * RANGED_ATTACK_POWER),
+            ..Default::default()
+        };
+        let duo = SquadComposition::duo_sk_farmer();
+        let composition = Some(duo.sized_for(required, ctx.member_energy).unwrap_or_else(SquadComposition::duo_sk_farmer));
+        ForcePlan {
+            composition,
+            assessment: ForceAssessment {
+                winnable: true,
+                mode: AssaultMode::Breach,
+                required_heal_per_tick: keeper.dps * HOLD_MARGIN,
+                required_dismantle_dps: 0.0,
+                est_ticks: SK_KEEPER_KILL_TICKS,
+                reason: "sk: out-heal + kill the keeper",
+            },
+            required,
+        }
+    }
+}
+
+/// The SK-suppression doctrine collection — the SK farm coordinator's registry (its duo selection joins
+/// the doctrine layer; the keeper stats arrive as the engagement's `enemy_force`).
+pub fn sk_doctrines() -> Vec<Box<dyn ForceDoctrine>> {
+    vec![Box::new(SkSuppression)]
+}
+
 /// The DEFENSE doctrine collection — a separate registry so defender selection joins the doctrine layer
 /// (L3) without coupling to the offense `ClearCreeps` arm (`SecureRoom`, still rung-1 fixed pending the
 /// L4 `PlayerRaid` reachability/operator-intent call). One doctrine today; future turtle/sally variants
@@ -317,6 +376,20 @@ mod tests {
             importance: 0.0,
             member_energy: 5600,
         }
+    }
+
+    #[test]
+    fn sk_suppression_sizes_the_keeper_kill() {
+        let docs = sk_doctrines();
+        let mut c = ctx(DoctrineObjective::Suppress, DefenseProfile::default());
+        c.enemy_force = Some(EnemyForce { dps: 168.0, heal: 0.0, hits: 5000, count: 1, boosted: false });
+        let doc = decide_doctrine(&c, &docs).expect("Suppress → sk-suppression");
+        let plan = doc.plan(&c, None);
+        // Behavior-preserving vs the former SK mission sizing: 5000 HP ÷ 34t ÷ 10 = 15 ranged kill parts
+        // (R-attack), and HEAL > 0 to out-heal the 168 melee × HOLD_MARGIN (R6).
+        assert_eq!(plan.required.ranged_parts, 15, "kills the keeper in the window");
+        assert!(plan.required.heal_parts > 0, "out-heals the keeper melee");
+        assert!(plan.composition.is_some(), "always fields the duo");
     }
 
     #[test]
