@@ -13,7 +13,8 @@
 //!
 //! **Rung 1 (this module) re-expresses the CURRENT arms as doctrines — behaviorally a no-op.** The
 //! `Coordinated` square-law sizing + the `PlayerDefend`/`PlayerRaid` doctrines are rungs 2–3 (ADR 0026
-//! §9.7); the `coordination`/`worst_single` context fields are carried now so those rungs slot in.
+//! §9.7); `GarrisonDefense` (L3) unifies the bot's defender selection onto the registry. The
+//! `coordination`/`enemy_force` context fields feed the creep-clear sizing.
 
 use crate::composition::SquadComposition;
 use crate::force_sizing::{
@@ -47,14 +48,17 @@ pub enum DoctrineObjective {
     Harass,
 }
 
-/// The strongest SINGLE enemy unit, derived from OBSERVED bodies (ADR 0026 §9.3: size from observed
-/// intel, never type constants) — the binding constraint for an `Individual` engagement. Carried now;
-/// the sizing branch that consumes it is rungs 2–3.
+/// The resolved enemy creep force a creep-clear / defense sizes against (ADR 0026 §9.3/§9.4), derived from
+/// OBSERVED bodies — NOT type constants. For an `Individual` fight it is the WORST SINGLE enemy; for a
+/// `Coordinated` one, the AGGREGATE. `dps`/`hits`/`heal` drive `force_sizing::clear_force`; `count`/
+/// `boosted` drive a defender's SHAPE selection (`GarrisonDefense`).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct UnitThreat {
+pub struct EnemyForce {
     pub dps: f32,
     pub heal: f32,
     pub hits: u32,
+    pub count: u32,
+    pub boosted: bool,
 }
 
 /// What a doctrine activator reads: the objective intent + the expected opposing force + the sizing
@@ -66,9 +70,10 @@ pub struct EngagementContext {
     pub objective: DoctrineObjective,
     pub coordination: EnemyCoordination,
     pub defense: DefenseProfile,
-    /// For `Individual`: the strongest single enemy (rungs 2–3 size to it; rung 1's NPC arms already
-    /// build a single-target `defense`, so this is forward context).
-    pub worst_single: Option<UnitThreat>,
+    /// The resolved enemy creep force (single for `Individual`, aggregate for `Coordinated`) — feeds the
+    /// creep-clear sizing (`GarrisonDefense` / the future `PlayerDefend`/`PlayerRaid`). `None` for the
+    /// structure arms (NpcCore/SiegeBreach), which size from `defense`.
+    pub enemy_force: Option<EnemyForce>,
     /// Objective importance ∈ [0,1] → [`importance_margin`] over-investment (0 = base force, no scaling).
     pub importance: f32,
     /// Strongest in-range spawn energy — the sizing ceiling passed to [`SquadComposition::sized_for`].
@@ -236,7 +241,40 @@ impl ForceDoctrine for HarassRemote {
     }
 }
 
-/// The standard offense doctrine collection (collection order = priority; first activator wins). Rung-1
+/// Garrison defense (ADR 0026 §9.10 L3) — hold an owned/remote room against a present threat. UNIFIES the
+/// bot's former `DefenseEscalation::from_threat` 3-bucket selection onto the registry: selects the defender
+/// SHAPE by the threat and fields it spawn-path-sized (no oracle sizing — `clear_force`-based threat-
+/// proportional defender sizing is the §9.8/L6 enhancement, which is why this is `is_sized() == false`).
+/// Always-fields (you can't skip defending an owned room). The shape thresholds are the §9.8 `defend_size_
+/// curve` (L6-tunable); kept as the former `from_threat` constants so the unification is behavior-preserving.
+pub struct GarrisonDefense;
+impl ForceDoctrine for GarrisonDefense {
+    fn name(&self) -> &'static str {
+        "garrison-defense"
+    }
+    fn applies(&self, ctx: &EngagementContext) -> bool {
+        matches!(ctx.objective, DoctrineObjective::ClearCreeps)
+    }
+    fn template(&self) -> SquadComposition {
+        SquadComposition::quad_ranged()
+    }
+    fn is_sized(&self) -> bool {
+        false
+    }
+    fn plan(&self, ctx: &EngagementContext, _budget: Option<ForceBudget>) -> ForcePlan {
+        let f = ctx.enemy_force.unwrap_or_default();
+        let comp = if (f.boosted && f.dps > 200.0) || (f.heal > 100.0 && f.dps > 150.0) || f.count >= 4 {
+            SquadComposition::quad_ranged()
+        } else if f.dps > 60.0 || f.heal > 20.0 || f.count >= 2 || f.boosted {
+            SquadComposition::duo_attack_heal()
+        } else {
+            SquadComposition::solo_ranged()
+        };
+        ForcePlan::fixed(comp)
+    }
+}
+
+/// The standard OFFENSE doctrine collection (collection order = priority; first activator wins). Rung-1
 /// objectives are mutually exclusive (each candidate maps to one [`DoctrineObjective`]), so order is not
 /// yet load-bearing; it becomes so when a player room matches more than one (rungs 2–3). Add / retire a
 /// doctrine = one entry — the bot and eval are untouched.
@@ -247,6 +285,14 @@ pub fn default_doctrines() -> Vec<Box<dyn ForceDoctrine>> {
         Box::new(SecureRoom),
         Box::new(HarassRemote),
     ]
+}
+
+/// The DEFENSE doctrine collection — a separate registry so defender selection joins the doctrine layer
+/// (L3) without coupling to the offense `ClearCreeps` arm (`SecureRoom`, still rung-1 fixed pending the
+/// L4 `PlayerRaid` reachability/operator-intent call). One doctrine today; future turtle/sally variants
+/// add entries here.
+pub fn defense_doctrines() -> Vec<Box<dyn ForceDoctrine>> {
+    vec![Box::new(GarrisonDefense)]
 }
 
 /// First doctrine whose activator fires (collection order = priority) — the twin of `decide_strategy`.
@@ -267,10 +313,26 @@ mod tests {
             objective,
             coordination: EnemyCoordination::Individual,
             defense,
-            worst_single: None,
+            enemy_force: None,
             importance: 0.0,
             member_energy: 5600,
         }
+    }
+
+    #[test]
+    fn garrison_defense_selects_shape_by_threat() {
+        let docs = defense_doctrines();
+        let shape = |force: EnemyForce| {
+            let mut c = ctx(DoctrineObjective::ClearCreeps, DefenseProfile::default());
+            c.enemy_force = Some(force);
+            let doc = decide_doctrine(&c, &docs).expect("ClearCreeps → garrison-defense");
+            doc.plan(&c, None).composition.expect("defense always fields").slots.len()
+        };
+        // Solo (1 slot) for a trivial threat; Duo (2) for moderate; Quad (4) for count ≥ 4 — the former
+        // DefenseEscalation::from_threat buckets, now on the registry.
+        assert_eq!(shape(EnemyForce { dps: 10.0, heal: 0.0, hits: 100, count: 1, boosted: false }), 1, "solo");
+        assert_eq!(shape(EnemyForce { dps: 80.0, heal: 0.0, hits: 2000, count: 2, boosted: false }), 2, "duo");
+        assert_eq!(shape(EnemyForce { dps: 50.0, heal: 0.0, hits: 8000, count: 5, boosted: false }), 4, "quad");
     }
 
     /// A winnable core defense: one weak tower, the core's hits, reachable.
