@@ -69,6 +69,15 @@ pub mod lifecycle;
 /// (the "roster stuck at 3/5" failure) and we tune combat-vs-economy spawn priority offline.
 pub mod spawn_throughput;
 
+/// Pure rally / boundary-cohesion gates (P-OBJ #23 / ADR 0028): squad_ready_to_depart +
+/// should_hold_at_boundary, shared by the bot (`military::formation`) and the lifecycle harness.
+pub mod rally;
+
+/// Pure squad-combat FSM transition kernel (P-OBJ #23 / ADR 0028 K2): the MoveToRoom/CombatResponse/
+/// Engaged/Retreating transition table of `jobs/squad_combat.rs`, so the lifecycle harness drives the
+/// same transitions the bot does. The ECS actions stay in the bot; only the pure decision lives here.
+pub mod squad_fsm;
+
 use screeps::local::LocalCostMatrix;
 use screeps::{Direction, Part, Position, RawObjectId, RoomCoordinate, RoomName, RoomXY, StructureType};
 
