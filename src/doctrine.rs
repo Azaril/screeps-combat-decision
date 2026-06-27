@@ -296,14 +296,16 @@ impl ForceDoctrine for GarrisonDefense {
         // + wipe). A continuous size cannot straddle. `clear_force` out-heals the incoming AND out-powers it
         // (Coordinated square-law), `hits=0` (defense has no kill-deadline). Needs a REAL `member_energy`
         // (the defense scan now passes the defended room's spawn capacity, not 0, so `sized_for` actually
-        // sizes instead of silently falling back to the bare template). Base = the ranged+heal `quad_ranged`:
-        // its `force_budget` is large enough to size a STRONG threat (a smaller base under-budgets clear_force
-        // → defer/fallback), and sized_for grows it from there — defense over-spends a trivial threat to the
-        // 4-member floor, the safe side (you can never UNDER-defend an owned room).
-        let base = SquadComposition::quad_ranged();
-        let budget = base.force_budget(ctx.member_energy, CLEAR_ONSITE_TICKS);
+        // sizes instead of silently falling back to the bare template). BUDGET from `quad_ranged` (large
+        // enough that clear_force sizes a STRONG threat — a smaller base's budget trips the can't-out-heal
+        // guard → an under-strength default), but FLOOR from the smaller `duo_attack_heal` so a TRIVIAL
+        // threat doesn't over-spawn to 4. Decoupling the floor from the budget is the ADR 0029 forming-
+        // completion fix: the 4-member floor × N contested rooms saturated the spawn lanes so no roster ever
+        // completed. sized_for grows the duo floor for real threats; the manager deploys it immediately (FIX A).
+        let budget = SquadComposition::quad_ranged().force_budget(ctx.member_energy, CLEAR_ONSITE_TICKS);
         let (_, required) = clear_force(vec![], f.dps, 0, f.heal, &budget, COORDINATED_DPS_MARGIN, false);
-        let comp = base.sized_for(required, ctx.member_energy).unwrap_or(base);
+        let floor = SquadComposition::duo_attack_heal();
+        let comp = floor.sized_for(required, ctx.member_energy).unwrap_or(floor);
         ForcePlan::fixed(comp)
     }
 }
@@ -470,14 +472,15 @@ mod tests {
             let doc = decide_doctrine(&c, &docs).expect("ClearCreeps → garrison-defense");
             doc.plan(&c, None).composition.expect("defense always fields").slots.len()
         };
-        // ADR 0029: no buckets. The defender floors at the base (≥4 — over-spend a trivial threat, the safe
-        // side: never solo, so there is no small count to straddle to → the W9N8 1↔2 flap is structurally
-        // impossible), and the size is MONOTONIC non-decreasing in the threat (a stronger threat is never
-        // fielded smaller — what the hard-threshold buckets violated as the live threat jittered).
+        // ADR 0029: no buckets, and the floor is DECOUPLED from the budget (forming-completion fix). A
+        // trivial threat floors at the small `duo_attack_heal` (2) — NOT the over-spending quad (4) that ×N
+        // contested rooms saturated the spawn lanes — yet is sized via the quad BUDGET so a strong threat
+        // still grows. No discrete shape to straddle (the W9N8 1↔2 flap is structurally impossible), and the
+        // size is MONOTONIC non-decreasing in the threat (what the hard-threshold buckets violated).
         let trivial = size(EnemyForce { dps: 10.0, heal: 0.0, hits: 100, count: 1, boosted: false });
         let moderate = size(EnemyForce { dps: 80.0, heal: 0.0, hits: 2000, count: 2, boosted: false });
         let strong = size(EnemyForce { dps: 150.0, heal: 30.0, hits: 8000, count: 5, boosted: false });
-        assert!((4..=8).contains(&trivial), "defense floors at the base, never solo/duo: {trivial}");
+        assert!((2..=8).contains(&trivial), "defense floors at the small duo (2), not the over-spending quad: {trivial}");
         assert!(moderate >= trivial, "monotonic non-decreasing: {moderate} >= {trivial}");
         assert!(strong >= moderate, "monotonic non-decreasing: {strong} >= {moderate}");
     }
