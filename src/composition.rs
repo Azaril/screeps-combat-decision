@@ -38,7 +38,9 @@ const MAX_SINGLE_ROLE_PARTS: u32 = 25;
 /// member is ~half an RCL7 capacity — easily banked — yet counts stay within [`MAX_SIZED_MEMBERS`] for
 /// normal targets. The 50-part engine cap and [`MAX_SINGLE_ROLE_PARTS`] remain the hard CEILING; this
 /// only ever LOWERS the capacity probe. (~3000 ⇒ 15 RANGED+15 MOVE = 3000e, or 10 HEAL+10 MOVE = 3000e.)
-const PREFERRED_MEMBER_ENERGY: u32 = 3000;
+/// Also used by the spawn path (`queue_slot_spawn`) to cap TEMPLATE bodies (the `sized_for`-deferred
+/// fallback shapes), so every spawned member — sized or template — stays bankable.
+pub const PREFERRED_MEMBER_ENERGY: u32 = 3000;
 
 /// Role a creep plays within a squad.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
