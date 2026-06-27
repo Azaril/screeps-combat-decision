@@ -18,7 +18,12 @@ pub fn squad_ready_to_depart(member_positions: &[Option<Position>], requested_sl
     if requested_slots == 0 {
         return true;
     }
-    member_positions.len() >= requested_slots && member_positions.iter().all(|p| p.is_some())
+    // Enough members are PRESENT (spawned + in the world) to depart. Count present members, NOT
+    // "all members" — an EXTRA still-spawning member (left over when the objective's requested size
+    // oscillates DOWN, e.g. 2→1) must not jam the gate: the squad departs once the requested count is
+    // present, orphaning any surplus. (Counting all-Some made an oscillating-size objective rally forever
+    // at "present=requested but holding" — the live W9N8 stuck-at-1/1 bug.)
+    member_positions.iter().filter(|p| p.is_some()).count() >= requested_slots
 }
 
 /// Whether to HOLD the squad's virtual anchor at a room boundary for cohesion (don't advance across until
@@ -153,5 +158,8 @@ mod tests {
         assert!(!squad_ready_to_depart(&[Some(p), None], 2), "a still-spawning member → hold + rally");
         assert!(!squad_ready_to_depart(&[Some(p)], 2), "roster not fully spawned → hold + rally");
         assert!(squad_ready_to_depart(&[Some(p)], 0), "unknown roster size → do not gate (legacy)");
+        // An EXTRA still-spawning member (requested oscillated down 2→1) must NOT jam the gate: the
+        // requested count IS present, so depart (orphaning the surplus). The live W9N8 stuck-at-1/1 bug.
+        assert!(squad_ready_to_depart(&[Some(p), None], 1), "requested present + surplus spawning → depart");
     }
 }
