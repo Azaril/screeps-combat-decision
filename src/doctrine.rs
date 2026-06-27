@@ -25,9 +25,9 @@
 //! `enemy_force` context fields feed the creep-clear sizing (`clear_force`).
 
 use crate::bodies::defender_heal_parts_for_dps;
-use crate::composition::{assemble_force, force_ceiling, SquadComposition, SquadRole};
+use crate::composition::{assemble_force, SquadComposition, SquadRole};
 use crate::force_sizing::{
-    assess, clear_force, importance_margin, AssaultMode, DefenseProfile, ForceAssessment, ForceBudget, RequiredForce, COORDINATED_DPS_MARGIN, HOLD_MARGIN,
+    assess, clear_force, importance_margin, AssaultMode, DefenseProfile, ForceAssessment, ForceBudget, RequiredForce,
 };
 use screeps_combat_engine::constants::RANGED_ATTACK_POWER;
 
@@ -93,9 +93,19 @@ pub struct EngagementContext {
     pub enemy_force: Option<EnemyForce>,
     /// Objective importance ∈ [0,1] → [`importance_margin`] over-investment (0 = base force, no scaling).
     pub importance: f32,
-    /// Strongest in-range spawn energy — the per-member sizing ceiling [`assemble_force`] sizes each
-    /// member to (and that [`force_ceiling`] derives the default winnability budget from).
+    /// Strongest in-range spawn energy — informational; the optimizer sizes each member to
+    /// `params.member_energy`. Kept for callers / logging.
     pub member_energy: u32,
+    /// The TARGET VALUE (ADR 0031 D16) — the EV upside of taking this objective. The optimizer maximizes
+    /// `EV(C) = P(win)·target_value − cost(C)`; set high enough that "EV > commit" ⇔ "winnable" so a
+    /// winnable target is never deferred for a low value (preserving the OracleCalibration FP/FN semantics).
+    pub target_value: f32,
+    /// On-site window (ticks) the candidate has to deliver its kill — `CREEP_LIFE_TIME − spawn − travel`
+    /// (offense) or a defender lifetime (defense). Feeds the optimizer's `deliverable = structure_dps · window`.
+    pub onsite_window: u32,
+    /// The tournament-tunable optimizer knobs (ADR 0031 D16/D17). [`CompositionParams::default`] reproduces
+    /// today's fielding.
+    pub params: crate::composition::CompositionParams,
 }
 
 /// The driver's output: the assembled force + the oracle verdict (ADR 0026 §9.3 / ADR 0031).
@@ -117,9 +127,6 @@ impl ForcePlan {
         self.assessment.winnable
     }
 
-    fn skip(assessment: ForceAssessment) -> Self {
-        ForcePlan { composition: None, assessment, required: RequiredForce::default() }
-    }
 }
 
 /// The UNIFIED requirement emitter (ADR 0031 T1) — ONE place that derives the capability vector
@@ -139,6 +146,7 @@ impl ForcePlan {
 /// constraint is out-powering the defenders, NOT importance, so they do not scale — preserving the prior
 /// per-doctrine behavior); `RaidCreeps` additionally threads `enemy.hits` (the kill-in-time term).
 /// `Suppress` sizes the keeper kill window. [`assemble_force`] consumes this capability vector directly.
+#[allow(clippy::too_many_arguments)]
 pub fn emit_requirement(
     objective: DoctrineObjective,
     defense: &DefenseProfile,
@@ -146,6 +154,8 @@ pub fn emit_requirement(
     budget: Option<&ForceBudget>,
     coordination: EnemyCoordination,
     importance: f32,
+    hold_margin: f32,
+    over_power_margin: f32,
 ) -> (ForceAssessment, RequiredForce) {
     match objective {
         DoctrineObjective::KillImmuneStructure | DoctrineObjective::DismantleStructure => {
@@ -165,7 +175,7 @@ pub fn emit_requirement(
                 DoctrineObjective::KillImmuneStructure => required.dismantle_parts = 0,     // a dismantle-IMMUNE core needs RANGED
                 _ => {}
             }
-            overlay_anti_creep(&mut required, defense, enemy_force, budget, coordination);
+            overlay_anti_creep(&mut required, defense, enemy_force, budget, coordination, over_power_margin);
             (a, required)
         }
         // CREEP-CLEAR: out-heal the incoming (towers + defenders) × HOLD_MARGIN AND out-power the defenders
@@ -176,7 +186,7 @@ pub fn emit_requirement(
             let budget = budget.expect("a creep-clear objective must be given a ForceBudget");
             let f = enemy_force.unwrap_or_default();
             let hits = if matches!(objective, DoctrineObjective::RaidCreeps) { f.hits } else { 0 };
-            clear_force(defense.towers.clone(), f.dps, hits, f.heal, budget, COORDINATED_DPS_MARGIN, defense.safe_mode)
+            clear_force(defense.towers.clone(), f.dps, hits, f.heal, budget, over_power_margin, defense.safe_mode)
         }
         // SK SUPPRESSION: kite + out-heal + kill the keeper in the kill window. NOT `clear_force` (kited, no
         // square-law over-power) — heal out-heals the keeper melee × HOLD_MARGIN (a slip recovers, not dies);
@@ -184,14 +194,14 @@ pub fn emit_requirement(
         DoctrineObjective::Suppress => {
             let keeper = enemy_force.unwrap_or_default();
             let required = RequiredForce {
-                heal_parts: defender_heal_parts_for_dps(keeper.dps * HOLD_MARGIN, false),
+                heal_parts: defender_heal_parts_for_dps(keeper.dps * hold_margin, false),
                 anti_creep_parts: keeper.hits.div_ceil(SK_KEEPER_KILL_TICKS * RANGED_ATTACK_POWER),
                 ..Default::default()
             };
             let assessment = ForceAssessment {
                 winnable: true,
                 mode: AssaultMode::Breach,
-                required_heal_per_tick: keeper.dps * HOLD_MARGIN,
+                required_heal_per_tick: keeper.dps * hold_margin,
                 required_dismantle_dps: 0.0,
                 est_ticks: SK_KEEPER_KILL_TICKS,
                 reason: "sk: out-heal + kill the keeper",
@@ -205,7 +215,7 @@ pub fn emit_requirement(
         DoctrineObjective::Harass => {
             let budget = budget.expect("harass needs a ForceBudget (the room-force ceiling)");
             let f = enemy_force.unwrap_or_default();
-            clear_force(defense.towers.clone(), f.dps, 0, f.heal, budget, COORDINATED_DPS_MARGIN, defense.safe_mode)
+            clear_force(defense.towers.clone(), f.dps, 0, f.heal, budget, over_power_margin, defense.safe_mode)
         }
     }
 }
@@ -223,9 +233,10 @@ fn overlay_anti_creep(
     enemy_force: Option<EnemyForce>,
     budget: &ForceBudget,
     coordination: EnemyCoordination,
+    over_power_margin: f32,
 ) {
     if let Some(enemy) = enemy_force.filter(|e| e.dps > 0.0) {
-        let margin = if coordination == EnemyCoordination::Coordinated { COORDINATED_DPS_MARGIN } else { 1.0 };
+        let margin = if coordination == EnemyCoordination::Coordinated { over_power_margin } else { 1.0 };
         let (clear, req) = clear_force(defense.towers.clone(), enemy.dps, enemy.hits, enemy.heal, budget, margin, defense.safe_mode);
         if clear.winnable {
             required.anti_creep_parts = req.anti_creep_parts;
@@ -247,34 +258,78 @@ fn default_floor_force() -> RequiredForce {
     RequiredForce { heal_parts: DEFAULT_FLOOR_PARTS, anti_creep_parts: DEFAULT_FLOOR_PARTS, ..Default::default() }
 }
 
-/// The SHARED engagement driver (ADR 0031 T3a, D15) — THE one path every fielded combat squad is born
-/// through: emit the capability vector → gate on winnability (if the doctrine honors the verdict) → ASSEMBLE
-/// the force. No template, no `sized_for`, no per-doctrine sizing fork. `budget` is the caller's winnability
-/// ceiling budget (offense: travel-based via `best_force_budget(force_ceiling(..))`; `None` → the driver
-/// derives the default [`force_ceiling`] budget; ignored for `Suppress`, which sizes from the keeper).
-/// A GATED doctrine (`honor_verdict() == true`) defers to `None` when unwinnable (D10); an ALWAYS-FIELD one
+/// The SHARED engagement driver (ADR 0031 T3a, D15/D16) — THE one path every fielded combat squad is born
+/// through: emit the per-objective requirement (T1, for the win-confidence log + the always-field floor) →
+/// run the EV optimizer ([`crate::composition::optimize_composition`], D16) which presumes NO reference
+/// squad, searches the over-power / tough ladders, and commits the max-EV candidate (gated doctrines defer
+/// when EV ≤ `commit_ev_threshold`). No template, no `sized_for`, no `force_ceiling` budget, no per-doctrine
+/// sizing fork. `budget` is an OPTIONAL caller-supplied report budget for the emitted assessment (the
+/// optimizer derives its own internal ceiling); `Suppress` is assembled directly (winnable-by-construction +
+/// kited, no EV search). A GATED doctrine (`honor_verdict() == true`) defers to `None` when EV-negative (D10); an ALWAYS-FIELD one
 /// fields the best assembled force, falling to [`default_floor_force`] when nothing assembles (D11).
 pub fn plan_engagement(doctrine: &dyn ForceDoctrine, ctx: &EngagementContext, budget: Option<ForceBudget>) -> ForcePlan {
+    // Keep emit_requirement's (assessment, required) for the caller's win-confidence log + the always-field
+    // floor; the COMPOSITION is now chosen by the EV optimizer (D16), which presumes no reference squad and
+    // commits the max-EV candidate (gated doctrines defer when EV ≤ commit_ev_threshold).
+    let params = ctx.params;
+    let onsite_window = if ctx.onsite_window > 0 { ctx.onsite_window } else { CLEAR_ONSITE_TICKS };
     // Suppress sizes directly from the keeper (no budget); every other objective needs the ceiling budget —
-    // the caller's if given, else derived from the template-free force_ceiling at this member energy.
-    let budget = budget.or_else(|| {
+    // the caller's if given, else the optimizer derives its own internal ceiling.
+    let report_budget = budget.or_else(|| {
         (!matches!(ctx.objective, DoctrineObjective::Suppress))
-            .then(|| force_ceiling(ctx.member_energy, doctrine.fighter_role()).force_budget(ctx.member_energy, CLEAR_ONSITE_TICKS))
+            .then(|| crate::composition::optimizer_ceiling_budget(ctx.objective, params.member_energy, onsite_window))
     });
-    let (assessment, mut required) = emit_requirement(ctx.objective, &ctx.defense, ctx.enemy_force, budget.as_ref(), ctx.coordination, ctx.importance);
-    if doctrine.honor_verdict() && !assessment.winnable {
-        return ForcePlan::skip(assessment); // gated defer (D10)
+    let (assessment, mut required) = emit_requirement(
+        ctx.objective,
+        &ctx.defense,
+        ctx.enemy_force,
+        report_budget.as_ref(),
+        ctx.coordination,
+        ctx.importance,
+        params.hold_margin,
+        params.over_power_margin,
+    );
+
+    // Suppress is winnable-by-construction + kited (no EV search needed — the keeper kill is the requirement);
+    // assemble it directly so its bursty retreat tuning + always-field floor flow through unchanged.
+    if matches!(ctx.objective, DoctrineObjective::Suppress) {
+        let retreat = doctrine.retreat_threshold();
+        let composition = assemble_force(&required, params.member_energy).map(|mut c| {
+            c.retreat_threshold = retreat;
+            c
+        });
+        return ForcePlan { composition, assessment, required };
     }
+
     // An ALWAYS-FIELD doctrine (operator intent / defense / deny) fields AT LEAST the minimal default floor
-    // and scales UP with the observed threat (D11) — so an unscouted room / a too-large threat still fields a
-    // survivable force that scouts + lets the bot re-size, never nothing and never a hardcoded template (D15).
+    // and scales UP with the observed threat (D11). The floor is applied by raising the requirement the
+    // optimizer searches over (a max — never below floor); the optimizer then EV-searches the over-power /
+    // tough ladders from there.
     if !doctrine.honor_verdict() {
         let floor = default_floor_force();
         required.heal_parts = required.heal_parts.max(floor.heal_parts);
         required.anti_creep_parts = required.anti_creep_parts.max(floor.anti_creep_parts);
     }
+
     let retreat = doctrine.retreat_threshold();
-    let composition = assemble_force(&required, ctx.member_energy).map(|mut c| {
+    let composition = crate::composition::optimize_composition(
+        ctx.objective,
+        &ctx.defense,
+        ctx.enemy_force,
+        ctx.target_value,
+        onsite_window,
+        ctx.coordination,
+        ctx.importance,
+        doctrine.honor_verdict(),
+        &params,
+    )
+    // The always-field floor (above) ⇒ the optimizer searches a non-empty requirement; but if it can't field
+    // even one member at this energy it returns None. For an always-field doctrine that means assemble the
+    // floor directly so we never field nothing (D11).
+    .or_else(|| {
+        (!doctrine.honor_verdict()).then(|| assemble_force(&required, params.member_energy)).flatten()
+    })
+    .map(|mut c| {
         c.retreat_threshold = retreat;
         c
     });
@@ -512,7 +567,7 @@ pub fn decide_doctrine<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::force_sizing::TowerThreat;
+    use crate::force_sizing::{TowerThreat, COORDINATED_DPS_MARGIN, HOLD_MARGIN};
 
     fn ctx(objective: DoctrineObjective, defense: DefenseProfile) -> EngagementContext {
         EngagementContext {
@@ -522,6 +577,11 @@ mod tests {
             enemy_force: None,
             importance: 0.0,
             member_energy: 5600,
+            // High value so "EV > commit" ⇔ "winnable" (a winnable target is never deferred for low value);
+            // window = a full creep lifetime; Default optimizer knobs.
+            target_value: 100_000.0,
+            onsite_window: 1400,
+            params: crate::composition::CompositionParams { member_energy: 5600, ..Default::default() },
         }
     }
 
@@ -694,7 +754,7 @@ mod tests {
             safe_mode: false,
         };
         let enemy = Some(EnemyForce { dps: 120.0, heal: 20.0, hits: 4000, count: 3, boosted: false });
-        let budget = force_ceiling(5600, SquadRole::RangedDPS).force_budget(5600, 1400);
+        let budget = crate::composition::optimizer_ceiling_budget(DoctrineObjective::KillImmuneStructure, 5600, 1400);
         for obj in [
             DoctrineObjective::KillImmuneStructure,
             DoctrineObjective::DismantleStructure,
@@ -703,7 +763,7 @@ mod tests {
             DoctrineObjective::Suppress,
             DoctrineObjective::Harass,
         ] {
-            let run = || emit_requirement(obj, &defense, enemy, Some(&budget), EnemyCoordination::Coordinated, 0.5);
+            let run = || emit_requirement(obj, &defense, enemy, Some(&budget), EnemyCoordination::Coordinated, 0.5, HOLD_MARGIN, COORDINATED_DPS_MARGIN);
             assert_eq!(run(), run(), "{obj:?}: the emitter is deterministic");
         }
     }
@@ -721,24 +781,24 @@ mod tests {
         let guarded = DefenseProfile { towers: vec![], breach_hits: 10_000, objective_hits: 100_000, enemy_dps: 90.0, repair_per_tick: 0.0, safe_mode: false };
         let undefended = DefenseProfile { breach_hits: 10_000, objective_hits: 100_000, ..Default::default() };
         let guard = Some(EnemyForce { dps: 90.0, heal: 0.0, hits: 3000, count: 2, boosted: false });
-        let budget = force_ceiling(5600, SquadRole::Dismantler).force_budget(5600, 1400);
+        let budget = crate::composition::optimizer_ceiling_budget(DoctrineObjective::DismantleStructure, 5600, 1400);
 
         // DismantleStructure vs a guard: WORK to raze (dismantle_parts), anti-creep to clear the guard, and
         // the RANGED immune-alt is zeroed (a dismantle-able ring uses WORK).
-        let (a, dr) = emit_requirement(DoctrineObjective::DismantleStructure, &guarded, guard, Some(&budget), EnemyCoordination::Coordinated, 0.0);
+        let (a, dr) = emit_requirement(DoctrineObjective::DismantleStructure, &guarded, guard, Some(&budget), EnemyCoordination::Coordinated, 0.0, HOLD_MARGIN, COORDINATED_DPS_MARGIN);
         assert!(a.winnable && dr.dismantle_parts > 0 && dr.anti_creep_parts > 0 && dr.immune_struct_parts == 0, "siege vs guard: WORK + anti-creep, no immune-alt: {dr:?}");
 
         // KillImmuneStructure vs a guard: the RANGED immune-alt is KEPT + anti-creep is added (both feed the
         // ranged role's sum) — the core needs ranged AND the guard needs killing.
-        let (_, kr) = emit_requirement(DoctrineObjective::KillImmuneStructure, &guarded, guard, Some(&budget), EnemyCoordination::Coordinated, 0.0);
+        let (_, kr) = emit_requirement(DoctrineObjective::KillImmuneStructure, &guarded, guard, Some(&budget), EnemyCoordination::Coordinated, 0.0, HOLD_MARGIN, COORDINATED_DPS_MARGIN);
         assert!(kr.immune_struct_parts > 0 && kr.anti_creep_parts > 0, "immune core vs guard: ranged immune-alt + anti-creep: {kr:?}");
 
         // A creep-free structure bed is UNPERTURBED (no anti-creep overlay) — the OracleCalibration invariant.
-        let (_, clean) = emit_requirement(DoctrineObjective::DismantleStructure, &undefended, None, Some(&budget), EnemyCoordination::Individual, 0.0);
+        let (_, clean) = emit_requirement(DoctrineObjective::DismantleStructure, &undefended, None, Some(&budget), EnemyCoordination::Individual, 0.0, HOLD_MARGIN, COORDINATED_DPS_MARGIN);
         assert_eq!(clean.anti_creep_parts, 0, "no defenders → no anti-creep (calibration beds unperturbed)");
 
         // Creep-clear produces ANTI-CREEP only (no structure weapon).
-        let (_, cc) = emit_requirement(DoctrineObjective::ClearCreeps, &DefenseProfile::default(), guard, Some(&budget), EnemyCoordination::Coordinated, 0.0);
+        let (_, cc) = emit_requirement(DoctrineObjective::ClearCreeps, &DefenseProfile::default(), guard, Some(&budget), EnemyCoordination::Coordinated, 0.0, HOLD_MARGIN, COORDINATED_DPS_MARGIN);
         assert!(cc.anti_creep_parts > 0 && cc.dismantle_parts == 0 && cc.immune_struct_parts == 0, "clear → anti-creep only: {cc:?}");
     }
 }

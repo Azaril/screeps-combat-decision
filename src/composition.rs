@@ -9,7 +9,8 @@
 //! precomputed `travel_ticks` (the bot owns the `PathfinderService`; see `war::best_force_budget`).
 
 use crate::bodies;
-use crate::force_sizing::RequiredForce;
+use crate::doctrine::{emit_requirement, DoctrineObjective, EnemyCoordination, EnemyForce};
+use crate::force_sizing::{tower_dps_at_assault, win_probability, DefenseProfile, ForceBudget, RequiredForce, COORDINATED_DPS_MARGIN, HOLD_MARGIN};
 use screeps::{Part, ResourceType};
 use screeps_combat_engine::constants::{ATTACK_POWER, CREEP_LIFE_TIME, DISMANTLE_POWER, HEAL_POWER, RANGED_ATTACK_POWER};
 use serde::{Deserialize, Serialize};
@@ -427,37 +428,199 @@ pub fn assemble_force(req: &RequiredForce, member_energy: u32) -> Option<SquadCo
     })
 }
 
-/// Fighters in the winnability CEILING (the strongest single squad the oracle judges against — the
-/// assembler can field up to [`MAX_SIZED_MEMBERS`], so a "winnable" verdict from this ceiling stays
-/// conservative). 3 fighters + 5 healers = 8 (the eval's long-standing `siege_ceiling` shape).
-const CEILING_FIGHTERS: usize = 3;
-const CEILING_HEALERS: usize = 5;
+// ═══ ADR 0031 D16/D17 — the EV-MAXIMIZING composition optimizer ═══════════════════════════════════════
+//
+// `optimize_composition` SUPERSEDES `force_ceiling` (D16): it presumes NO reference squad. It enumerates
+// candidate compositions over a bounded, bit-deterministic search (over-power ladder × TOUGH ladder), scores
+// `EV(C) = P(win | C) · target_value − cost(C)` for each candidate computed from THAT candidate's OWN
+// `capabilities()` vs the (dynamic-margin-inflated) threat, and commits the max-EV comp (gated doctrines
+// only when `EV > commit_ev_threshold`). `emit_requirement` (T1) survives as the per-objective requirement
+// + weapon-mix; `assemble_force` (D3) survives as the per-candidate comp BUILDER; `win_probability`
+// survives as the probability model.
 
-/// The template-free winnability CEILING (ADR 0031 P4) — the BUDGET source the driver uses:
-/// `force_ceiling(energy, fighter).force_budget(..)` is the oracle's `ForceBudget` with NO catalog
-/// constructor in sight. `fighter` is the kill weapon role (`Dismantler` for
-/// dismantle-able rings, `RangedDPS` for immune cores / creep clear). Each member is sized at the SAME
-/// per-member cap the ASSEMBLER uses (`min(energy, PREFERRED_MEMBER_ENERGY)`) — so the ceiling represents a
-/// force the assembler can actually field within [`MAX_SIZED_MEMBERS`], NOT an over-stated full-energy blob
-/// that `assess` would size a required force past the 8-member cap to match. Conservative: the assembler can
-/// still grow toward this ceiling, so a "winnable" verdict stays safe.
-pub fn force_ceiling(member_energy: u32, fighter: SquadRole) -> SquadComposition {
+/// Minimal DEFAULT capability floor an always-field doctrine keeps on the requirement (mirrors
+/// `doctrine::DEFAULT_FLOOR_PARTS`; D11) — never field below a survivable scout force.
+const DEFAULT_FLOOR_PARTS: u32 = 4;
+
+/// The over-power ladder (D17): scale `emit_requirement`'s required vector by `k` per candidate. `1.0` is
+/// the minimal winning force; higher rungs over-invest (more, bigger members) so a high-value target can
+/// trade cost for a higher P(win). Vec-ordered (the determinism tie-break prefers the lowest `k`).
+const OVER_POWER_LADDER: [f32; 4] = [1.0, 1.25, 1.5, 2.0];
+
+/// The TOUGH ladder (D17): TOUGH parts = `ceil(t · fighter_parts)` added to the requirement as EHP front
+/// armor (was hardwired 0). Vec-ordered (the tie-break prefers the lowest `t`).
+const TOUGH_LADDER: [f32; 3] = [0.0, 0.1, 0.2];
+
+/// The tournament-tunable knobs for [`optimize_composition`] (ADR 0031 D16/D17 / 0031a §2). NOT
+/// `Serialize` — a transient per-tick search input, never persisted, so it costs no `WORLD_FORMAT_VERSION`
+/// bump. [`CompositionParams::default`] reproduces the current fielding seeds (`HOLD_MARGIN` 1.3,
+/// `COORDINATED_DPS_MARGIN` 1.5, `PREFERRED_MEMBER_ENERGY` 3000, no dynamic inflation, EV floor 0), so
+/// swapping `force_ceiling` for the optimizer at Default is behavior-preserving for the calibration gates.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CompositionParams {
+    /// Cost weight per ENERGY (spawn cost) in `cost(C)`. Small so a borderline-EV target still fields when
+    /// it is actually winnable (the OracleCalibration FP/FN semantics are preserved at a sensible
+    /// `target_value`); larger values down-weight a marginal siege under spawn contention.
+    pub w_energy: f32,
+    /// Cost weight per CREEP (member) in `cost(C)` — a tie-break nudge toward fewer, fatter members.
+    pub w_creep: f32,
+    /// Heal-surplus safety factor threaded into [`emit_requirement`] (the seed [`HOLD_MARGIN`]).
+    pub hold_margin: f32,
+    /// Coordinated square-law over-match threaded into [`emit_requirement`] (the seed
+    /// [`COORDINATED_DPS_MARGIN`]).
+    pub over_power_margin: f32,
+    /// Inflate the OBSERVED hostile force (incoming dps, enemy hits) so a GROWING threat still loses. 1.0 =
+    /// trust the snapshot (the seed); >1.0 sizes against a rising threat.
+    pub dynamic_margin: f32,
+    /// Per-member energy cap (the small-many-vs-few-big lever; the seed [`PREFERRED_MEMBER_ENERGY`]). The
+    /// optimizer probes member caps at `min(member_energy, this)`.
+    pub member_energy: u32,
+    /// EV floor a GATED doctrine must clear to field at all (else `None` defer). Seed 0 (field any positive
+    /// EV); >0 means "only commit with real EV headroom."
+    pub commit_ev_threshold: f32,
+}
+
+impl Default for CompositionParams {
+    fn default() -> Self {
+        CompositionParams {
+            // Small energy weight so a winnable target at a sensible `target_value` always clears
+            // `EV > 0` — i.e. "EV > commit" ⇔ "winnable" (preserving the OracleCalibration FP/FN
+            // semantics). w_creep 0 (pure tie-break role, off by default).
+            w_energy: 0.001,
+            w_creep: 0.0,
+            hold_margin: HOLD_MARGIN,
+            over_power_margin: COORDINATED_DPS_MARGIN,
+            dynamic_margin: 1.0,
+            member_energy: PREFERRED_MEMBER_ENERGY,
+            commit_ev_threshold: 0.0,
+        }
+    }
+}
+
+/// THE EV OPTIMIZER (ADR 0031 D16/D17) — the EV-maximizing composition selector that SUPERSEDES
+/// `force_ceiling`'s presumed 3+5 budget: it presumes NO reference squad. It runs ONE bounded,
+/// bit-deterministic search — over-power ladder × TOUGH ladder — building each candidate via
+/// [`assemble_force`] from [`emit_requirement`]'s (per-objective weapon-mixed) requirement scaled by the
+/// rung, scores `EV(C) = P(win | C) · target_value − cost(C)` from the candidate's OWN
+/// [`SquadComposition::capabilities`] vs the (dynamic-margin-inflated) threat, and returns the max-EV
+/// candidate (deterministic tie-break: lowest k, then lowest tough, then fewest members).
+///
+/// `honor_verdict == true` (a GATED doctrine) → commit the max-EV comp iff `EV > commit_ev_threshold`, else
+/// `None` (the honest unwinnable defer, D10). `honor_verdict == false` (always-field) → commit the max-EV
+/// comp regardless (the caller already raised the requirement to the default floor).
+///
+/// Bit-deterministic: integer/ceil folds over the two Vec-ordered ladders, no HashMap.
+#[allow(clippy::too_many_arguments)]
+pub fn optimize_composition(
+    objective: DoctrineObjective,
+    defense: &DefenseProfile,
+    enemy: Option<EnemyForce>,
+    target_value: f32,
+    onsite_window: u32,
+    coordination: EnemyCoordination,
+    importance: f32,
+    honor_verdict: bool,
+    params: &CompositionParams,
+) -> Option<SquadComposition> {
+    let member_energy = params.member_energy;
+    // The winnability BUDGET emit_requirement assesses against = the per-member-capped CEILING force this
+    // optimizer can actually field within MAX_SIZED_MEMBERS (the same role caps assemble_force uses), so the
+    // structure/clear arms' `winnable` verdict stays conservative — but the COMMIT decision is the EV, not
+    // the verdict (D16). A pure RANGED ceiling covers immune-core / creep-clear; the structure arm's WORK
+    // budget is derived inside emit_requirement via the same parts.
+    let budget = optimizer_ceiling_budget(objective, member_energy, onsite_window);
+
+    // The per-objective requirement + weapon mix (T1). The optimizer scales THIS per rung; emit_requirement
+    // already mixes WORK/RANGED/anti-creep/heal correctly for the objective + defense.
+    let (_assessment, mut base_required) =
+        emit_requirement(objective, defense, enemy, Some(&budget), coordination, importance, params.hold_margin, params.over_power_margin);
+    // ALWAYS-FIELD doctrines (defense / operator intent / deny) keep the minimal default floor on the
+    // requirement (D11) — never field below a survivable scout force, even for a tiny scouted threat.
+    if !honor_verdict {
+        base_required.heal_parts = base_required.heal_parts.max(DEFAULT_FLOOR_PARTS);
+        base_required.anti_creep_parts = base_required.anti_creep_parts.max(DEFAULT_FLOOR_PARTS);
+    }
+
+    // The (dynamic-margin-inflated) threat the candidate must survive + kill.
+    let enemy = enemy.unwrap_or_default();
+    let incoming = (tower_dps_at_assault(&defense.towers) + enemy.dps) * params.dynamic_margin;
+    let required_kill =
+        defense.objective_hits as f32 + defense.breach_hits as f32 + enemy.hits as f32 * params.dynamic_margin;
+
+    let mut best: Option<(f32, f32, f32, usize, SquadComposition)> = None; // (ev, k, t, members, comp)
+    for &k in OVER_POWER_LADDER.iter() {
+        let scaled = base_required.scaled(k);
+        // Fighter parts the TOUGH fraction is taken against (the weapons the body fields).
+        let fighter_parts = scaled.dismantle_parts + scaled.immune_struct_parts + scaled.anti_creep_parts;
+        for &t in TOUGH_LADDER.iter() {
+            let mut req = scaled;
+            if t > 0.0 && fighter_parts > 0 {
+                req.tough_parts = (t * fighter_parts as f32).ceil() as u32;
+            }
+            let Some(comp) = assemble_force(&req, member_energy) else {
+                continue; // unfieldable / > MAX_SIZED_MEMBERS at this rung
+            };
+            let caps = comp.capabilities(member_energy);
+            let p_survive = win_probability(caps.heal_per_tick as f32, incoming);
+            let deliverable = caps.structure_dps as f32 * onsite_window as f32;
+            let p_kill = win_probability(deliverable, required_kill);
+            let p_win = p_survive * p_kill;
+            let cost = params.w_energy * comp.estimated_cost(member_energy) as f32 + params.w_creep * comp.member_count() as f32;
+            let ev = p_win * target_value - cost;
+            let members = comp.member_count();
+            // Deterministic tie-break: max EV, then lowest k, then lowest tough, then fewest members.
+            let better = match &best {
+                None => true,
+                Some((bev, bk, bt, bm, _)) => {
+                    ev > *bev + 1e-6
+                        || ((ev - *bev).abs() <= 1e-6
+                            && (k < *bk - 1e-6
+                                || ((k - *bk).abs() <= 1e-6 && (t < *bt - 1e-6 || ((t - *bt).abs() <= 1e-6 && members < *bm)))))
+                }
+            };
+            if better {
+                best = Some((ev, k, t, members, comp));
+            }
+        }
+    }
+
+    let (ev, _, _, _, comp) = best?;
+    // GATED doctrine: only commit with EV above the floor (the honest unwinnable defer, D10). ALWAYS-FIELD:
+    // field the best regardless.
+    if honor_verdict && ev <= params.commit_ev_threshold {
+        return None;
+    }
+    Some(comp)
+}
+
+/// The winnability BUDGET the optimizer assesses emit_requirement against — the per-member-capped CEILING
+/// force this optimizer can actually field (replacing `force_ceiling(member_energy, fighter).force_budget`).
+/// IDENTICAL math to the deleted `force_ceiling`: 3 fighters + 5 healers, each at its `single_role_cap`,
+/// with the kill weapon selected by the OBJECTIVE (the doctrine's old `fighter_role`): WORK for a
+/// dismantle-able ring, RANGED for an immune core / creep clear / keeper. The `winnable` verdict stays
+/// conservative (the EV commit, not the verdict, is the gate — D16). Bit-deterministic.
+pub fn optimizer_ceiling_budget(objective: DoctrineObjective, member_energy: u32, onsite_window: u32) -> ForceBudget {
     let probe = member_energy.min(PREFERRED_MEMBER_ENERGY);
+    const CEILING_FIGHTERS: u32 = 3;
+    const CEILING_HEALERS: u32 = 5;
+    // The kill weapon = the doctrine's former `fighter_role`: WORK razes a dismantle-able ring; everything
+    // else (immune core / creep clear / keeper) kills with RANGED.
+    let fighter = match objective {
+        DoctrineObjective::DismantleStructure => SquadRole::Dismantler,
+        _ => SquadRole::RangedDPS,
+    };
     let fighter_cap = single_role_cap(fighter, probe);
     let heal_cap = single_role_cap(SquadRole::Healer, probe);
-    let mut slots = Vec::new();
-    if fighter_cap > 0 {
-        for _ in 0..CEILING_FIGHTERS {
-            slots.push(SquadSlot { role: fighter, body_type: BodyType::Sized(single_role_spec(fighter, fighter_cap)) });
-        }
-    }
-    if heal_cap > 0 {
-        for _ in 0..CEILING_HEALERS {
-            slots.push(SquadSlot { role: SquadRole::Healer, body_type: BodyType::Sized(single_role_spec(SquadRole::Healer, heal_cap)) });
-        }
-    }
-    let (formation_shape, formation_mode) = formation_for(slots.len());
-    SquadComposition { label: "Force Ceiling".into(), slots, formation_shape, formation_mode, retreat_threshold: default_retreat_threshold() }
+    let fighter_power = match fighter {
+        SquadRole::Dismantler => DISMANTLE_POWER,
+        _ => RANGED_ATTACK_POWER,
+    };
+    let max_heal_per_tick = (CEILING_HEALERS * heal_cap * HEAL_POWER) as f32;
+    let max_dismantle_dps = (CEILING_FIGHTERS * fighter_cap * fighter_power) as f32;
+    // The toughest single member's HP (a pure fighter body: 2n parts × 100, unboosted) — matches
+    // `capabilities().tank_effective_hp` for the ceiling shape.
+    let tank_effective_hp = (fighter_cap * 2 * 100) as f32;
+    ForceBudget { max_heal_per_tick, max_dismantle_dps, tank_effective_hp, onsite_budget_ticks: onsite_window }
 }
 
 /// A composition's per-tick combat output + tank HP at a spawn energy — the force-sizing oracle's
@@ -544,23 +707,6 @@ mod tests {
         assert!(ranged >= 20, "ranged covers immune_struct + anti_creep = 20 parts, got {ranged}");
     }
 
-    /// `force_ceiling` (the template-free budget source, ADR 0031 P4) builds the conservative ceiling:
-    /// CEILING_FIGHTERS fighters + CEILING_HEALERS healers, each force-Sized + maxed, with a sane budget.
-    /// `Dismantler` fields WORK; `RangedDPS` fields RANGED — and the budget's structure DPS reflects it.
-    #[test]
-    fn force_ceiling_builds_the_budget_source() {
-        let siege = force_ceiling(5600, SquadRole::Dismantler);
-        assert_eq!(siege.slots.iter().filter(|s| s.role == SquadRole::Dismantler).count(), CEILING_FIGHTERS);
-        assert_eq!(siege.slots.iter().filter(|s| s.role == SquadRole::Healer).count(), CEILING_HEALERS);
-        assert!(siege.slots.iter().all(|s| matches!(s.body_type, BodyType::Sized(_))), "ceiling is all force-Sized (no catalog)");
-        let b = siege.force_budget(5600, 1400);
-        assert!(b.max_heal_per_tick > 0.0 && b.max_dismantle_dps > 0.0, "siege ceiling budget: {b:?}");
-        // Ranged ceiling fields RANGED structure DPS (immune cores / creep clear).
-        let ranged = force_ceiling(5600, SquadRole::RangedDPS);
-        assert!(ranged.slots.iter().any(|s| matches!(s.body_type, BodyType::Sized(spec) if spec.ranged_attack > 0)), "ranged ceiling fields RANGED");
-        assert!(ranged.force_budget(5600, 1400).max_dismantle_dps > 0.0, "ranged ceiling has structure DPS via RANGED");
-    }
-
     /// `None` is a TERMINAL defer (D10): a force past `MAX_SIZED_MEMBERS`, an empty requirement, or a role
     /// that can't field even one member at this energy all return None (no G4-HEAVY failover, no under-size).
     #[test]
@@ -604,5 +750,140 @@ mod tests {
         }
         // n == 0 is the degenerate 1×1 (no members).
         assert_eq!(box_footprint(0), (1, 1));
+    }
+
+    // ── D16/D17: the EV composition optimizer ──
+
+    use crate::force_sizing::TowerThreat;
+
+    /// A winnable dismantle-able ring: a thin breach + a small core, one weak far tower.
+    fn winnable_struct() -> DefenseProfile {
+        DefenseProfile {
+            towers: vec![TowerThreat { range_to_assault: 18, energy: 200 }],
+            breach_hits: 10_000,
+            objective_hits: 50_000,
+            enemy_dps: 0.0,
+            repair_per_tick: 0.0,
+            safe_mode: false,
+        }
+    }
+
+    /// The optimizer is a pure fold over two Vec-ordered ladders → run-twice-equal (the D16 determinism
+    /// fence; the optimizer is the shared composition path every gated/always-field squad is built through).
+    #[test]
+    fn optimize_composition_is_deterministic() {
+        let p = CompositionParams { member_energy: 5600, ..Default::default() };
+        let defense = winnable_struct();
+        let run = || {
+            optimize_composition(
+                DoctrineObjective::DismantleStructure,
+                &defense,
+                None,
+                100_000.0,
+                1400,
+                EnemyCoordination::Individual,
+                0.0,
+                true,
+                &p,
+            )
+            .map(|c| format!("{c:?}"))
+        };
+        assert_eq!(run(), run(), "the optimizer is deterministic");
+        assert!(run().is_some(), "a winnable ring commits at Default");
+    }
+
+    /// A GATED doctrine defers (None) when EV ≤ the commit threshold: a tiny target value can't clear a
+    /// raised threshold, so the optimizer returns None even though the target is technically winnable.
+    #[test]
+    fn optimize_composition_defers_below_commit_threshold() {
+        let defense = winnable_struct();
+        // A high commit threshold + a modest value ⇒ EV ≤ threshold ⇒ defer.
+        let strict = CompositionParams { member_energy: 5600, commit_ev_threshold: 10_000.0, ..Default::default() };
+        let deferred = optimize_composition(
+            DoctrineObjective::DismantleStructure,
+            &defense,
+            None,
+            1.0, // tiny target value
+            1400,
+            EnemyCoordination::Individual,
+            0.0,
+            true, // gated
+            &strict,
+        );
+        assert!(deferred.is_none(), "gated + EV ≤ commit threshold → defer (None)");
+
+        // The SAME bed at a high value + Default threshold commits (winnable → fielded), preserving the
+        // OracleCalibration FP/FN semantics.
+        let committed = optimize_composition(
+            DoctrineObjective::DismantleStructure,
+            &defense,
+            None,
+            100_000.0,
+            1400,
+            EnemyCoordination::Individual,
+            0.0,
+            true,
+            &CompositionParams { member_energy: 5600, ..Default::default() },
+        );
+        assert!(committed.is_some(), "winnable target commits at Default");
+    }
+
+    /// A high-value target OVER-INVESTS vs a low-value one. On a creep-clear bed (a gated raid) the
+    /// requirement is sized to the OBSERVED enemy (not the gross structure ceiling), so it leaves room below
+    /// the 8-member cap for the over-power ladder to climb: a modest enemy with a near tower sits at ~0.82
+    /// P(win) at the minimal force, so a HIGH value pays for the extra anti-creep + heal (more P(win)) while
+    /// a LOW value picks the cheaper minimal force. (When the minimal force already wins ~certainly, NOT
+    /// over-investing is correct — so the bed leaves P(win) headroom for the knob to bite.)
+    #[test]
+    fn optimize_composition_over_invests_for_high_value() {
+        // A mid-range energized tower adds incoming the heal must out-pace; a modest defender force the kill
+        // must out-power. The minimal force (×hold_margin / ×over_power) clears within 8 members.
+        let defense = DefenseProfile {
+            towers: vec![TowerThreat { range_to_assault: 14, energy: 1000 }],
+            breach_hits: 0,
+            objective_hits: 0,
+            enemy_dps: 60.0,
+            repair_per_tick: 0.0,
+            safe_mode: false,
+        };
+        let enemy = Some(EnemyForce { dps: 60.0, heal: 0.0, hits: 3_000, count: 2, boosted: false });
+        // A cost weight that makes the ladder rungs a real EV trade-off, but low enough that a modest value
+        // still commits the minimal force.
+        let p = CompositionParams { member_energy: 5600, w_energy: 0.01, ..Default::default() };
+        let opt = |value: f32| {
+            optimize_composition(DoctrineObjective::RaidCreeps, &defense, enemy, value, 1400, EnemyCoordination::Coordinated, 0.0, true, &p)
+                .expect("winnable at both values")
+        };
+        // A small value: P(win) is already good at the minimal force, so the extra over-power doesn't pay
+        // for its cost → minimal force. A huge value: the P(win) headroom is worth far more than the cost →
+        // climb the over-power ladder.
+        let low = opt(500.0);
+        let high = opt(50_000_000.0);
+        assert!(
+            high.estimated_cost(5600) > low.estimated_cost(5600),
+            "high value over-invests (more energy / parts): high {} vs low {}",
+            high.estimated_cost(5600),
+            low.estimated_cost(5600)
+        );
+    }
+
+    /// A WINNABLE target commits at Default params (the calibration-preserving floor): EV > 0 at a sensible
+    /// target value for a force that can actually take the bed.
+    #[test]
+    fn optimize_composition_commits_a_winnable_target_at_default() {
+        let comp = optimize_composition(
+            DoctrineObjective::KillImmuneStructure,
+            &DefenseProfile { towers: vec![TowerThreat { range_to_assault: 15, energy: 200 }], breach_hits: 0, objective_hits: 100_000, enemy_dps: 0.0, repair_per_tick: 0.0, safe_mode: false },
+            None,
+            100_000.0,
+            1400,
+            EnemyCoordination::Individual,
+            0.0,
+            true,
+            &CompositionParams { member_energy: 5600, ..Default::default() },
+        )
+        .expect("a winnable immune core commits at Default");
+        // An immune core is killed by RANGED, not WORK.
+        assert!(comp.slots.iter().any(|s| s.role == SquadRole::RangedDPS), "immune core fields RANGED: {}", comp.label);
     }
 }

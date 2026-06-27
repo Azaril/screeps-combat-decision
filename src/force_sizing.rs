@@ -106,8 +106,9 @@ fn ticks_for(amount: f32, rate: f32) -> u32 {
 }
 
 /// Damage/tick of the ENERGIZED towers at the assault position (the engine tower curve; drained towers
-/// contribute 0 — the fix the per-tower energy intel enables).
-fn tower_dps_at_assault(towers: &[TowerThreat]) -> f32 {
+/// contribute 0 — the fix the per-tower energy intel enables). Public so the EV optimizer
+/// ([`crate::composition::optimize_composition`]) can compute a candidate's incoming damage.
+pub fn tower_dps_at_assault(towers: &[TowerThreat]) -> f32 {
     towers
         .iter()
         .filter(|t| t.energy >= TOWER_ENERGY_COST)

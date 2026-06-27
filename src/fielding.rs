@@ -39,12 +39,14 @@ pub fn slots_to_spawn(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::composition::{force_ceiling, SquadRole};
+    use crate::composition::assemble_force;
+    use crate::force_sizing::RequiredForce;
 
-    /// A multi-slot composition (3 fighters + 5 healers) the fielding kernel can fan out, with no catalog
-    /// constructor (ADR 0031 P4b) — the force ceiling is the template-free stand-in.
+    /// A multi-slot composition the fielding kernel can fan out, with no catalog constructor (ADR 0031
+    /// P4b/D16) — assembled template-free from a requirement that yields several RANGED + several HEAL members.
     fn multi_slot_comp() -> SquadComposition {
-        force_ceiling(12_900, SquadRole::RangedDPS)
+        assemble_force(&RequiredForce { heal_parts: 60, immune_struct_parts: 30, ..Default::default() }, 3000)
+            .expect("assembles a multi-slot force at 3000 energy")
     }
 
     #[test]
