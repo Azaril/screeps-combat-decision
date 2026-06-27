@@ -19,7 +19,7 @@
 use crate::bodies::defender_heal_parts_for_dps;
 use crate::composition::SquadComposition;
 use crate::force_sizing::{
-    assess, importance_margin, AssaultMode, DefenseProfile, ForceAssessment, ForceBudget, RequiredForce, HOLD_MARGIN,
+    assess, clear_force, importance_margin, AssaultMode, DefenseProfile, ForceAssessment, ForceBudget, RequiredForce, COORDINATED_DPS_MARGIN, HOLD_MARGIN,
 };
 use screeps_combat_engine::constants::RANGED_ATTACK_POWER;
 
@@ -267,16 +267,31 @@ impl ForceDoctrine for GarrisonDefense {
     }
     fn plan(&self, ctx: &EngagementContext, _budget: Option<ForceBudget>) -> ForcePlan {
         let f = ctx.enemy_force.unwrap_or_default();
-        let comp = if (f.boosted && f.dps > 200.0) || (f.heal > 100.0 && f.dps > 150.0) || f.count >= 4 {
+        // Member COUNT from the threat (the former from_threat buckets; the §9.8 `defend_size_curve`,
+        // L6c-tunable).
+        let shape = if (f.boosted && f.dps > 200.0) || (f.heal > 100.0 && f.dps > 150.0) || f.count >= 4 {
             SquadComposition::quad_ranged()
         } else if f.dps > 60.0 || f.heal > 20.0 || f.count >= 2 || f.boosted {
             SquadComposition::duo_attack_heal()
         } else {
             SquadComposition::solo_ranged()
         };
+        // L3b — clear_force-size the shape's PARTS to the threat: out-heal the incoming AND OUT-POWER it
+        // (Coordinated over-match, so the defender clears the attackers decisively — never under-defends),
+        // falling back to the spawn-path template when the sizing can't field (no regression). `hits = 0`:
+        // defense has no kill-deadline, so the binding constraint is out-powering the incoming dps, not
+        // grinding HP. This is the FIRST LIVE use of `clear_force` (the keystone), to soak on Docker.
+        let budget = shape.force_budget(ctx.member_energy, DEFENSE_ONSITE_TICKS);
+        let (_, required) = clear_force(vec![], f.dps, 0, f.heal, &budget, COORDINATED_DPS_MARGIN, false);
+        let comp = shape.sized_for(required, ctx.member_energy).unwrap_or(shape);
         ForcePlan::fixed(comp)
     }
 }
+
+/// A defender's on-site window (≈ a creep lifetime; defense fields in-room, no travel). `clear_force`
+/// uses it only for the kill-in-time term, which is inert for defense (`hits = 0`), so the exact value
+/// is not load-bearing.
+const DEFENSE_ONSITE_TICKS: u32 = 1400;
 
 /// The standard OFFENSE doctrine collection (collection order = priority; first activator wins). Rung-1
 /// objectives are mutually exclusive (each candidate maps to one [`DoctrineObjective`]), so order is not
@@ -390,6 +405,20 @@ mod tests {
         assert_eq!(plan.required.ranged_parts, 15, "kills the keeper in the window");
         assert!(plan.required.heal_parts > 0, "out-heals the keeper melee");
         assert!(plan.composition.is_some(), "always fields the duo");
+    }
+
+    #[test]
+    fn garrison_defense_clear_force_sizes_the_defender() {
+        // L3b: a strong grouped threat → the quad's parts are clear_force-sized to OUT-POWER it (a Sized
+        // body with ranged), not the bare spawn-path template.
+        let docs = defense_doctrines();
+        let mut c = ctx(DoctrineObjective::ClearCreeps, DefenseProfile::default());
+        c.enemy_force = Some(EnemyForce { dps: 200.0, heal: 0.0, hits: 0, count: 4, boosted: false });
+        let comp = decide_doctrine(&c, &docs).unwrap().plan(&c, None).composition.expect("defense always fields");
+        assert!(
+            comp.slots.iter().any(|s| matches!(s.body_type, crate::composition::BodyType::Sized(spec) if spec.ranged_attack > 0)),
+            "defender clear_force-sized to over-power the threat"
+        );
     }
 
     #[test]
