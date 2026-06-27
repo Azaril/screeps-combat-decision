@@ -11,10 +11,12 @@
 //! scenario); the doctrine runs the force-sizing oracle ([`crate::force_sizing`]) and hands back a sized
 //! [`SquadComposition`]. The budget computation is itself shared via [`SquadComposition::force_budget`].
 //!
-//! **Rung 1 (this module) re-expresses the CURRENT arms as doctrines — behaviorally a no-op.** The
-//! `Coordinated` square-law sizing + the `PlayerDefend`/`PlayerRaid` doctrines are rungs 2–3 (ADR 0026
-//! §9.7); `GarrisonDefense` (L3) unifies the bot's defender selection onto the registry. The
-//! `coordination`/`enemy_force` context fields feed the creep-clear sizing.
+//! Doctrines (ADR 0026 §9.5/§9.10): OFFENSE (`default_doctrines`) = `NpcCore` (sized ranged quad vs a
+//! dismantle-immune core), `SiegeBreach` (sized siege quad vs a structure ring), `PlayerRaid` (L4 —
+//! clear_force-sized ranged quad vs a player room's creeps, always-field), `HarassRemote` (fixed solo).
+//! DEFENSE (`defense_doctrines`) = `GarrisonDefense` (L3 — clear_force-sized defender). SK
+//! (`sk_doctrines`) = `SkSuppression` (L7 — sized kiting duo vs a keeper). The `coordination`/
+//! `enemy_force` context fields feed the creep-clear sizing (`clear_force`).
 
 use crate::bodies::defender_heal_parts_for_dps;
 use crate::composition::SquadComposition;
@@ -209,13 +211,18 @@ impl ForceDoctrine for SiegeBreach {
     }
 }
 
-/// Clear hostile creeps (an operator attack flag / secure) → a ranged quad. Rung 1 keeps it UNSIZED (the
-/// current hardcoded `AttackFlag` behavior); the sized `Coordinated` `PlayerRaid` is rung 3 (it needs the
-/// §12.7(B) creep-target oracle the AttackFlag/Harass deferral, §12.6, called out).
-pub struct SecureRoom;
-impl ForceDoctrine for SecureRoom {
+/// Clear hostile creeps (an operator attack flag / secure a player room) → a ranged quad CLEAR_FORCE-SIZED
+/// to OUT-POWER the defenders (ADR 0026 §9.10 L4, the player-offense rung). `Coordinated` (a player squad
+/// fights together). **Size-but-ALWAYS-FIELD** (never gate-skip operator intent): with no scouted enemy
+/// (`dps == 0` — an unscouted flag room) it fields the default quad — byte-identical to the prior
+/// `SecureRoom` behavior, so the rung is a no-op until the flag room's intel is wired in; with intel it
+/// sizes the quad to out-power + out-heal. `hits = 0`: like defense, the binding constraint is out-powering
+/// the incoming dps (a raze targets the creeps first), not grinding HP. Quad-capped (the N-blob escalation
+/// is L5). Falls back to the default quad if the sizing can't field (no regression).
+pub struct PlayerRaid;
+impl ForceDoctrine for PlayerRaid {
     fn name(&self) -> &'static str {
-        "secure-room"
+        "player-raid"
     }
     fn applies(&self, ctx: &EngagementContext) -> bool {
         matches!(ctx.objective, DoctrineObjective::ClearCreeps)
@@ -224,7 +231,20 @@ impl ForceDoctrine for SecureRoom {
         SquadComposition::quad_ranged()
     }
     fn is_sized(&self) -> bool {
-        false
+        false // custom clear_force sizing (below), always-field; not the generic budget/assess path
+    }
+    fn plan(&self, ctx: &EngagementContext, _budget: Option<ForceBudget>) -> ForcePlan {
+        let f = ctx.enemy_force.unwrap_or_default();
+        // No scouted defenders → the default quad (the prior SecureRoom behavior; operator intent fields
+        // regardless). Keeps the rung a no-op until the flag room's intel is wired in.
+        if f.dps <= 0.0 {
+            return ForcePlan::fixed(SquadComposition::quad_ranged());
+        }
+        let quad = SquadComposition::quad_ranged();
+        let budget = quad.force_budget(ctx.member_energy, CLEAR_ONSITE_TICKS);
+        let (_, required) = clear_force(ctx.defense.towers.clone(), f.dps, 0, f.heal, &budget, COORDINATED_DPS_MARGIN, ctx.defense.safe_mode);
+        let comp = quad.sized_for(required, ctx.member_energy).unwrap_or_else(SquadComposition::quad_ranged);
+        ForcePlan::fixed(comp)
     }
 }
 
@@ -281,7 +301,7 @@ impl ForceDoctrine for GarrisonDefense {
         // falling back to the spawn-path template when the sizing can't field (no regression). `hits = 0`:
         // defense has no kill-deadline, so the binding constraint is out-powering the incoming dps, not
         // grinding HP. This is the FIRST LIVE use of `clear_force` (the keystone), to soak on Docker.
-        let budget = shape.force_budget(ctx.member_energy, DEFENSE_ONSITE_TICKS);
+        let budget = shape.force_budget(ctx.member_energy, CLEAR_ONSITE_TICKS);
         let (_, required) = clear_force(vec![], f.dps, 0, f.heal, &budget, COORDINATED_DPS_MARGIN, false);
         let comp = shape.sized_for(required, ctx.member_energy).unwrap_or(shape);
         ForcePlan::fixed(comp)
@@ -291,7 +311,7 @@ impl ForceDoctrine for GarrisonDefense {
 /// A defender's on-site window (≈ a creep lifetime; defense fields in-room, no travel). `clear_force`
 /// uses it only for the kill-in-time term, which is inert for defense (`hits = 0`), so the exact value
 /// is not load-bearing.
-const DEFENSE_ONSITE_TICKS: u32 = 1400;
+const CLEAR_ONSITE_TICKS: u32 = 1400;
 
 /// The standard OFFENSE doctrine collection (collection order = priority; first activator wins). Rung-1
 /// objectives are mutually exclusive (each candidate maps to one [`DoctrineObjective`]), so order is not
@@ -301,7 +321,7 @@ pub fn default_doctrines() -> Vec<Box<dyn ForceDoctrine>> {
     vec![
         Box::new(NpcCore),
         Box::new(SiegeBreach),
-        Box::new(SecureRoom),
+        Box::new(PlayerRaid),
         Box::new(HarassRemote),
     ]
 }
@@ -361,9 +381,9 @@ pub fn sk_doctrines() -> Vec<Box<dyn ForceDoctrine>> {
     vec![Box::new(SkSuppression)]
 }
 
-/// The DEFENSE doctrine collection — a separate registry so defender selection joins the doctrine layer
-/// (L3) without coupling to the offense `ClearCreeps` arm (`SecureRoom`, still rung-1 fixed pending the
-/// L4 `PlayerRaid` reachability/operator-intent call). One doctrine today; future turtle/sally variants
+/// The DEFENSE doctrine collection — a separate registry so defender selection (`GarrisonDefense`, L3) is
+/// distinct from the offense `ClearCreeps` arm (`PlayerRaid`, L4): defense picks the shape by threat and
+/// holds, a raid sizes a quad to out-power and presses. One doctrine today; future turtle/sally variants
 /// add entries here.
 pub fn defense_doctrines() -> Vec<Box<dyn ForceDoctrine>> {
     vec![Box::new(GarrisonDefense)]
@@ -405,6 +425,26 @@ mod tests {
         assert_eq!(plan.required.ranged_parts, 15, "kills the keeper in the window");
         assert!(plan.required.heal_parts > 0, "out-heals the keeper melee");
         assert!(plan.composition.is_some(), "always fields the duo");
+    }
+
+    #[test]
+    fn player_raid_sizes_when_scouted_else_default_quad() {
+        let docs = default_doctrines();
+        let mut c = ctx(DoctrineObjective::ClearCreeps, DefenseProfile::default());
+        // Scouted player defenders → clear_force-sized to out-power (a Sized ranged body).
+        c.enemy_force = Some(EnemyForce { dps: 150.0, heal: 0.0, hits: 0, count: 3, boosted: false });
+        let comp = decide_doctrine(&c, &docs).unwrap().plan(&c, None).composition.expect("always fields");
+        assert!(
+            comp.slots.iter().any(|s| matches!(s.body_type, crate::composition::BodyType::Sized(spec) if spec.ranged_attack > 0)),
+            "raid clear_force-sized to out-power the defenders"
+        );
+        // Unscouted flag room (no intel) → the default quad, no-op (the prior SecureRoom behavior).
+        c.enemy_force = Some(EnemyForce::default());
+        let comp0 = decide_doctrine(&c, &docs).unwrap().plan(&c, None).composition.expect("always fields");
+        assert!(
+            comp0.slots.iter().all(|s| !matches!(s.body_type, crate::composition::BodyType::Sized(_))),
+            "unscouted → default quad (operator intent fields regardless)"
+        );
     }
 
     #[test]
@@ -459,7 +499,7 @@ mod tests {
         let cases = [
             (DoctrineObjective::KillImmuneStructure, "npc-core"),
             (DoctrineObjective::DismantleStructure, "siege-breach"),
-            (DoctrineObjective::ClearCreeps, "secure-room"),
+            (DoctrineObjective::ClearCreeps, "player-raid"),
             (DoctrineObjective::Harass, "harass-remote"),
         ];
         for (obj, name) in cases {
