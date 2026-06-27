@@ -713,9 +713,16 @@ impl SquadComposition {
             let bt = slot.body_type;
             heal_per_tick += bt.part_count(max_energy, Part::Heal) * HEAL_POWER;
             // Structure damage: WORK dismantles (50/part), ATTACK (30/part), RANGED_ATTACK (10/part). All
-            // breach ramparts + kill the core. For a ranged-attacker role use the ranged CEILING (above)
-            // since `sized_for` builds it ranged-maximized; other roles use their template's ranged count.
-            let ranged_parts = if matches!(slot.role, SquadRole::RangedDPS) { max_ranged } else { bt.part_count(max_energy, Part::RangedAttack) };
+            // breach ramparts + kill the core. A force-`Sized` body reports its ACTUAL ranged parts (an
+            // assembled / `force_ceiling` force is already sized to its per-member cap — the assembler caps at
+            // `PREFERRED_MEMBER_ENERGY`, so the full-energy ceiling would over-state it and size a required
+            // force past the 8-member cap). A TEMPLATE RangedDPS slot uses the ranged CEILING since `sized_for`
+            // builds it ranged-maximized (the R-attack §12.6 path); other template roles use their ranged count.
+            let ranged_parts = match bt {
+                BodyType::Sized(spec) => spec.ranged_attack,
+                _ if matches!(slot.role, SquadRole::RangedDPS) => max_ranged,
+                _ => bt.part_count(max_energy, Part::RangedAttack),
+            };
             structure_dps += bt.part_count(max_energy, Part::Work) * DISMANTLE_POWER
                 + bt.part_count(max_energy, Part::Attack) * ATTACK_POWER
                 + ranged_parts * RANGED_ATTACK_POWER;
@@ -973,13 +980,15 @@ const CEILING_HEALERS: usize = 5;
 /// The template-free winnability CEILING (ADR 0031 P4) — the BUDGET source that replaces
 /// `doctrine.template().force_budget(..)`: `force_ceiling(energy, fighter).force_budget(..)` is the oracle's
 /// `ForceBudget` with NO catalog constructor in sight. `fighter` is the kill weapon role (`Dismantler` for
-/// dismantle-able rings, `RangedDPS` for immune cores / creep clear). Each member is maxed at `member_energy`
-/// via the real builder (full-energy probe — the conservative ceiling the oracle is calibrated against,
-/// matching the eval's `siege_ceiling`). Identical in shape to `siege_ceiling(energy)` for `Dismantler`, so
-/// the calibration gates that judge against the ceiling are preserved.
+/// dismantle-able rings, `RangedDPS` for immune cores / creep clear). Each member is sized at the SAME
+/// per-member cap the ASSEMBLER uses (`min(energy, PREFERRED_MEMBER_ENERGY)`) — so the ceiling represents a
+/// force the assembler can actually field within [`MAX_SIZED_MEMBERS`], NOT an over-stated full-energy blob
+/// that `assess` would size a required force past the 8-member cap to match. Conservative: the assembler can
+/// still grow toward this ceiling, so a "winnable" verdict stays safe.
 pub fn force_ceiling(member_energy: u32, fighter: SquadRole) -> SquadComposition {
-    let fighter_cap = single_role_cap(fighter, member_energy);
-    let heal_cap = single_role_cap(SquadRole::Healer, member_energy);
+    let probe = member_energy.min(PREFERRED_MEMBER_ENERGY);
+    let fighter_cap = single_role_cap(fighter, probe);
+    let heal_cap = single_role_cap(SquadRole::Healer, probe);
     let mut slots = Vec::new();
     if fighter_cap > 0 {
         for _ in 0..CEILING_FIGHTERS {

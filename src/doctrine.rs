@@ -21,7 +21,7 @@
 //! `enemy_force` context fields feed the creep-clear sizing (`clear_force`).
 
 use crate::bodies::defender_heal_parts_for_dps;
-use crate::composition::SquadComposition;
+use crate::composition::{assemble_force, force_ceiling, SquadComposition, SquadRole};
 use crate::force_sizing::{
     assess, clear_force, importance_margin, AssaultMode, DefenseProfile, ForceAssessment, ForceBudget, RequiredForce, COORDINATED_DPS_MARGIN, HOLD_MARGIN,
 };
@@ -116,23 +116,6 @@ impl ForcePlan {
     fn skip(assessment: ForceAssessment) -> Self {
         ForcePlan { composition: None, assessment, required: RequiredForce::default() }
     }
-
-    /// An UNSIZED plan — field the template as-is (the current hardcoded arms: harass solo, secure quad).
-    /// No oracle gate (preserves the current unconditional behavior of those arms).
-    fn fixed(comp: SquadComposition) -> Self {
-        ForcePlan {
-            composition: Some(comp),
-            assessment: ForceAssessment {
-                winnable: true,
-                mode: AssaultMode::Breach,
-                required_heal_per_tick: 0.0,
-                required_dismantle_dps: 0.0,
-                est_ticks: 0,
-                reason: "fixed composition (no oracle gate)",
-            },
-            required: RequiredForce::default(),
-        }
-    }
 }
 
 /// The UNIFIED requirement emitter (ADR 0031 T1) — ONE place that derives the capability vector
@@ -169,8 +152,13 @@ pub fn emit_requirement(
             // R5: over-invest by the objective's importance (a no-op at importance 0). The eval passes 0 to
             // match its base-force sizing; the bot passes the objective's priority-derived importance.
             let mut required = RequiredForce::from_assessment(&a).scaled(importance_margin(importance));
-            if matches!(objective, DoctrineObjective::DismantleStructure) {
-                required.immune_struct_parts = 0; // a dismantle-able ring uses WORK, not the RANGED immune-alt
+            // SELECT the structure weapon (the template used to do this; now the requirement does — D14).
+            // `from_assessment` sets BOTH `dismantle_parts` (WORK) and `immune_struct_parts` (RANGED) for the
+            // same structure DPS; the assembler would field BOTH, so zero the one this objective can't use.
+            match objective {
+                DoctrineObjective::DismantleStructure => required.immune_struct_parts = 0, // WORK razes a dismantle-able ring
+                DoctrineObjective::KillImmuneStructure => required.dismantle_parts = 0,     // a dismantle-IMMUNE core needs RANGED
+                _ => {}
             }
             overlay_anti_creep(&mut required, defense, enemy_force, budget, coordination);
             (a, required)
@@ -205,20 +193,15 @@ pub fn emit_requirement(
             };
             (assessment, required)
         }
-        // HARASS: no sizing math today (a fixed throwaway solo); D11's DYNAMIC anti-creep harass is a P4
-        // behavior change. `HarassRemote` does not call the emitter in P2 — this arm keeps the match total
-        // and is the seam P4 routes the dynamic harass through (a winnable/empty "fixed, no oracle gate").
-        DoctrineObjective::Harass => (
-            ForceAssessment {
-                winnable: true,
-                mode: AssaultMode::Breach,
-                required_heal_per_tick: 0.0,
-                required_dismantle_dps: 0.0,
-                est_ticks: 0,
-                reason: "harass: fixed composition (no oracle gate)",
-            },
-            RequiredForce::default(),
-        ),
+        // HARASS / deny a remote (D11): a DYNAMIC anti-creep force scaled to the room's observed creeps +
+        // margin — same `clear_force` sizing as a creep-clear (it kills/denies), not a fixed solo. Its
+        // distinction is purely TACTICAL (deny-don't-hold: retreat-happy, never gated), handled by the
+        // driver's always-field path + the tactics layer. Unscouted (`dps == 0`) → the driver's default floor.
+        DoctrineObjective::Harass => {
+            let budget = budget.expect("harass needs a ForceBudget (the room-force ceiling)");
+            let f = enemy_force.unwrap_or_default();
+            clear_force(defense.towers.clone(), f.dps, 0, f.heal, budget, COORDINATED_DPS_MARGIN, defense.safe_mode)
+        }
     }
 }
 
@@ -246,44 +229,72 @@ fn overlay_anti_creep(
     }
 }
 
-/// Run the unified emitter for a structure objective + size `template` to it (ADR 0031 P2). The SHARED
-/// sizing path the bot's InvaderCore arm and the eval's structure beds both use — now a thin wrapper over
-/// [`emit_requirement`] (the math) + `sized_for`. `budget` is the caller-computed [`ForceBudget`] for
-/// `template` (bot: over home rooms; eval: from the scenario). `None` composition ⇒ no in-range home
-/// affords the required force ⇒ defer.
-fn sized_plan(ctx: &EngagementContext, budget: &ForceBudget, template: SquadComposition) -> ForcePlan {
-    let (a, required) = emit_requirement(ctx.objective, &ctx.defense, ctx.enemy_force, Some(budget), ctx.coordination, ctx.importance);
-    if !a.winnable {
-        return ForcePlan::skip(a);
-    }
-    let composition = template.sized_for(required, ctx.member_energy);
-    ForcePlan { composition, assessment: a, required }
+/// Parts in the minimal DEFAULT capability floor an always-field doctrine fields when no winnable
+/// requirement assembles (D11/D15).
+const DEFAULT_FLOOR_PARTS: u32 = 4;
+
+/// The minimal DEFAULT capability floor an always-field doctrine (defense / operator intent / deny) fields
+/// when no winnable requirement assembles — an unscouted room (`dps == 0`) or a threat too large to fully
+/// out-power. A small balanced force expressed as a capability VECTOR (NOT a named template — D14/D15) that
+/// survives to scout + lets the bot re-size as intel arrives (D11). Gated doctrines never reach this (they
+/// defer via `None` — D10).
+fn default_floor_force() -> RequiredForce {
+    RequiredForce { heal_parts: DEFAULT_FLOOR_PARTS, anti_creep_parts: DEFAULT_FLOOR_PARTS, ..Default::default() }
 }
 
-/// A pluggable engagement doctrine (ADR 0026 §9.3) — the twin of [`crate::strategy::CombatStrategy`].
-/// A doctrine is `applies` (the classifier) + a `template` it fields, sized or fixed. The default `plan`
-/// runs the shared oracle for a sized doctrine and fields the template as-is for a fixed one, so a
-/// doctrine normally only implements `name`/`applies`/`template`/`is_sized`.
+/// The SHARED engagement driver (ADR 0031 T3a, D15) — THE one path every fielded combat squad is born
+/// through: emit the capability vector → gate on winnability (if the doctrine honors the verdict) → ASSEMBLE
+/// the force. No template, no `sized_for`, no per-doctrine sizing fork. `budget` is the caller's winnability
+/// ceiling budget (offense: travel-based via `best_force_budget(force_ceiling(..))`; `None` → the driver
+/// derives the default [`force_ceiling`] budget; ignored for `Suppress`, which sizes from the keeper).
+/// A GATED doctrine (`honor_verdict() == true`) defers to `None` when unwinnable (D10); an ALWAYS-FIELD one
+/// fields the best assembled force, falling to [`default_floor_force`] when nothing assembles (D11).
+pub fn plan_engagement(doctrine: &dyn ForceDoctrine, ctx: &EngagementContext, budget: Option<ForceBudget>) -> ForcePlan {
+    // Suppress sizes directly from the keeper (no budget); every other objective needs the ceiling budget —
+    // the caller's if given, else derived from the template-free force_ceiling at this member energy.
+    let budget = budget.or_else(|| {
+        (!matches!(ctx.objective, DoctrineObjective::Suppress))
+            .then(|| force_ceiling(ctx.member_energy, doctrine.fighter_role()).force_budget(ctx.member_energy, CLEAR_ONSITE_TICKS))
+    });
+    let (assessment, mut required) = emit_requirement(ctx.objective, &ctx.defense, ctx.enemy_force, budget.as_ref(), ctx.coordination, ctx.importance);
+    if doctrine.honor_verdict() && !assessment.winnable {
+        return ForcePlan::skip(assessment); // gated defer (D10)
+    }
+    // An ALWAYS-FIELD doctrine (operator intent / defense / deny) fields AT LEAST the minimal default floor
+    // and scales UP with the observed threat (D11) — so an unscouted room / a too-large threat still fields a
+    // survivable force that scouts + lets the bot re-size, never nothing and never a hardcoded template (D15).
+    if !doctrine.honor_verdict() {
+        let floor = default_floor_force();
+        required.heal_parts = required.heal_parts.max(floor.heal_parts);
+        required.anti_creep_parts = required.anti_creep_parts.max(floor.anti_creep_parts);
+    }
+    let retreat = doctrine.retreat_threshold();
+    let composition = assemble_force(&required, ctx.member_energy).map(|mut c| {
+        c.retreat_threshold = retreat;
+        c
+    });
+    ForcePlan { composition, assessment, required }
+}
+
+/// A pluggable engagement doctrine (ADR 0026 §9.3 / ADR 0031 T3a) — now a PURE CLASSIFIER (the twin of
+/// [`crate::strategy::CombatStrategy`]). It declares only WHAT objective it handles + the objective-shaping
+/// knobs; the shared [`plan_engagement`] driver does ALL sizing + assembly. No `template()`, no `is_sized()`,
+/// no per-doctrine `plan()` — those (and the catalogs) are gone (ADR 0031 D4/D7/D14/D15).
 pub trait ForceDoctrine: Sync {
     /// A stable identifier (telemetry / tuning).
     fn name(&self) -> &'static str;
     /// Does this doctrine apply to `ctx`? (the activator / classifier)
     fn applies(&self, ctx: &EngagementContext) -> bool;
-    /// The base composition this doctrine fields. A sized doctrine sizes this to the oracle's required
-    /// force; a fixed doctrine fields it as-is. The caller computes the [`ForceBudget`] for this template
-    /// when `is_sized()`.
-    fn template(&self) -> SquadComposition;
-    /// Whether to run the force-sizing oracle (size `template` to the defense) or field it fixed.
-    fn is_sized(&self) -> bool;
-    /// Plan the engagement. `budget` is the caller-computed force budget for `template()`, present iff
-    /// `is_sized()`; a sized doctrine assesses + sizes with it, a fixed doctrine ignores it.
-    fn plan(&self, ctx: &EngagementContext, budget: Option<ForceBudget>) -> ForcePlan {
-        if self.is_sized() {
-            let budget = budget.expect("a sized doctrine must be given a ForceBudget");
-            sized_plan(ctx, &budget, self.template())
-        } else {
-            ForcePlan::fixed(self.template())
-        }
+    /// The kill-weapon role this objective fields: [`SquadRole::Dismantler`] (a dismantle-able structure
+    /// ring) or [`SquadRole::RangedDPS`] (an immune core / creep clear / keeper). Selects the winnability
+    /// ceiling's fighter ([`force_ceiling`]).
+    fn fighter_role(&self) -> SquadRole;
+    /// HONOR the oracle's unwinnable verdict — `true` GATES (defer to `None` when unwinnable: gated offense);
+    /// `false` ALWAYS-FIELDS (defense / operator intent / deny — fields the best effort + the default floor).
+    fn honor_verdict(&self) -> bool;
+    /// Per-objective retreat tuning; SK is bursty → higher. Default 0.3.
+    fn retreat_threshold(&self) -> f32 {
+        0.3
     }
 }
 
@@ -300,11 +311,11 @@ impl ForceDoctrine for NpcCore {
     fn applies(&self, ctx: &EngagementContext) -> bool {
         matches!(ctx.objective, DoctrineObjective::KillImmuneStructure)
     }
-    fn template(&self) -> SquadComposition {
-        SquadComposition::quad_ranged()
+    fn fighter_role(&self) -> SquadRole {
+        SquadRole::RangedDPS // a dismantle-immune core is killed by RANGED
     }
-    fn is_sized(&self) -> bool {
-        true
+    fn honor_verdict(&self) -> bool {
+        true // gated offense — defer an unwinnable core
     }
 }
 
@@ -319,30 +330,11 @@ impl ForceDoctrine for SiegeBreach {
     fn applies(&self, ctx: &EngagementContext) -> bool {
         matches!(ctx.objective, DoctrineObjective::DismantleStructure)
     }
-    fn template(&self) -> SquadComposition {
-        SquadComposition::siege_quad()
+    fn fighter_role(&self) -> SquadRole {
+        SquadRole::Dismantler // a dismantle-able ring is razed by WORK (the assembler adds RANGED for guards)
     }
-    fn is_sized(&self) -> bool {
-        true
-    }
-    /// FUSION (ADR 0031 P1b, throwaway — the assembler P3 subsumes this): the requirement (assess + the
-    /// anti-creep overlay, with `immune_struct_parts` zeroed) comes from the unified [`emit_requirement`];
-    /// this wrapper only SELECTS the template — `siege_assault_quad` (a RangedDPS slot to receive the
-    /// anti-creep parts `siege_quad`'s dismantler-only roster would drop, Layer B) when defenders are
-    /// observed, else `siege_quad` — then sizes it.
-    fn plan(&self, ctx: &EngagementContext, budget: Option<ForceBudget>) -> ForcePlan {
-        let budget = budget.expect("a sized doctrine must be given a ForceBudget");
-        let (a, required) = emit_requirement(ctx.objective, &ctx.defense, ctx.enemy_force, Some(&budget), ctx.coordination, ctx.importance);
-        if !a.winnable {
-            return ForcePlan::skip(a);
-        }
-        let template = if ctx.enemy_force.is_some_and(|e| e.dps > 0.0) {
-            SquadComposition::siege_assault_quad()
-        } else {
-            SquadComposition::siege_quad()
-        };
-        let composition = template.sized_for(required, ctx.member_energy);
-        ForcePlan { composition, assessment: a, required }
+    fn honor_verdict(&self) -> bool {
+        true // gated offense — defer an unwinnable base
     }
 }
 
@@ -362,24 +354,11 @@ impl ForceDoctrine for PlayerRaid {
     fn applies(&self, ctx: &EngagementContext) -> bool {
         matches!(ctx.objective, DoctrineObjective::ClearCreeps)
     }
-    fn template(&self) -> SquadComposition {
-        SquadComposition::quad_ranged()
+    fn fighter_role(&self) -> SquadRole {
+        SquadRole::RangedDPS
     }
-    fn is_sized(&self) -> bool {
-        false // custom clear_force sizing (below), always-field; not the generic budget/assess path
-    }
-    fn plan(&self, ctx: &EngagementContext, _budget: Option<ForceBudget>) -> ForcePlan {
-        let f = ctx.enemy_force.unwrap_or_default();
-        // No scouted defenders → the default quad (the prior SecureRoom behavior; operator intent fields
-        // regardless). Keeps the rung a no-op until the flag room's intel is wired in.
-        if f.dps <= 0.0 {
-            return ForcePlan::fixed(SquadComposition::quad_ranged());
-        }
-        let quad = SquadComposition::quad_ranged();
-        let budget = quad.force_budget(ctx.member_energy, CLEAR_ONSITE_TICKS);
-        let (_, required) = emit_requirement(DoctrineObjective::ClearCreeps, &ctx.defense, ctx.enemy_force, Some(&budget), ctx.coordination, ctx.importance);
-        let comp = quad.sized_for(required, ctx.member_energy).unwrap_or_else(SquadComposition::quad_ranged);
-        ForcePlan::fixed(comp)
+    fn honor_verdict(&self) -> bool {
+        false // operator intent — always field (sizes to scouted defenders; the default floor when unscouted)
     }
 }
 
@@ -399,24 +378,11 @@ impl ForceDoctrine for GatedPlayerRaid {
     fn applies(&self, ctx: &EngagementContext) -> bool {
         matches!(ctx.objective, DoctrineObjective::RaidCreeps)
     }
-    fn template(&self) -> SquadComposition {
-        SquadComposition::quad_ranged()
+    fn fighter_role(&self) -> SquadRole {
+        SquadRole::RangedDPS
     }
-    fn is_sized(&self) -> bool {
-        true // routes through the bot's force-budget + winnability + ROI gate (defer on unwinnable)
-    }
-    fn plan(&self, ctx: &EngagementContext, budget: Option<ForceBudget>) -> ForcePlan {
-        let budget = budget.expect("a sized doctrine must be given a ForceBudget");
-        // Creep-clear sizing (NOT the structure `assess` the generic sized path runs) via the unified
-        // emitter: out-heal the towers AND the defenders × the hold margin, out-power their dps by the
-        // square-law margin, and thread `enemy.hits` (the kill-in-time term). HONOR the verdict —
-        // unwinnable ⇒ skip ⇒ the bot's gate DEFERS (the defer the always-field `PlayerRaid` lacks).
-        let (assessment, required) = emit_requirement(DoctrineObjective::RaidCreeps, &ctx.defense, ctx.enemy_force, Some(&budget), ctx.coordination, ctx.importance);
-        if !assessment.winnable {
-            return ForcePlan::skip(assessment);
-        }
-        let composition = SquadComposition::quad_ranged().sized_for(required, ctx.member_energy);
-        ForcePlan { composition, assessment, required }
+    fn honor_verdict(&self) -> bool {
+        true // the GATED resource-denial raid — DEFER a hopeless / unaffordable room (the defer PlayerRaid lacks)
     }
 }
 
@@ -429,11 +395,11 @@ impl ForceDoctrine for HarassRemote {
     fn applies(&self, ctx: &EngagementContext) -> bool {
         matches!(ctx.objective, DoctrineObjective::Harass)
     }
-    fn template(&self) -> SquadComposition {
-        SquadComposition::solo_harasser()
+    fn fighter_role(&self) -> SquadRole {
+        SquadRole::RangedDPS
     }
-    fn is_sized(&self) -> bool {
-        false
+    fn honor_verdict(&self) -> bool {
+        false // deny-don't-hold — always field, scaled to the room force + margin (D11; tactics keep it retreat-happy)
     }
 }
 
@@ -452,36 +418,15 @@ impl ForceDoctrine for GarrisonDefense {
     fn applies(&self, ctx: &EngagementContext) -> bool {
         matches!(ctx.objective, DoctrineObjective::ClearCreeps)
     }
-    fn template(&self) -> SquadComposition {
-        SquadComposition::quad_ranged()
+    fn fighter_role(&self) -> SquadRole {
+        SquadRole::RangedDPS
     }
-    fn is_sized(&self) -> bool {
+    fn honor_verdict(&self) -> bool {
+        // ADR 0029 — you can't skip defending an owned room: ALWAYS field. The assembler sizes a CONTINUOUS
+        // blob from the threat (member count emerges from `clear_force`'s out-power + out-heal — no solo/duo/
+        // quad buckets to straddle, the W9N8 1↔2 flap is structurally impossible), and the role-set floor +
+        // the driver's default floor replace the former hardcoded `duo_attack_heal` fallback.
         false
-    }
-    fn plan(&self, ctx: &EngagementContext, _budget: Option<ForceBudget>) -> ForcePlan {
-        // ADR 0029 — GENERALIZE defense onto the oracle: size a single ranged+heal BASE into a CONTINUOUS
-        // blob; the member COUNT emerges from `clear_force`'s required out-power + out-heal, NOT from
-        // solo/duo/quad buckets. The buckets straddled a HARD threshold (dps>60 / count>=2 / …) on jittery
-        // live threat → the committed roster flapped 1↔2 tick-to-tick → on a `requested=1` tick the lone
-        // creep departed into the defended room and was wiped → re-field → churn (the live W9N8 stuck-at-1/1
-        // + wipe). A continuous size cannot straddle. `clear_force` out-heals the incoming AND out-powers it
-        // (Coordinated square-law), `hits=0` (defense has no kill-deadline). Needs a REAL `member_energy`
-        // (the defense scan now passes the defended room's spawn capacity, not 0, so `sized_for` actually
-        // sizes instead of silently falling back to the bare template). BUDGET from `quad_ranged` (large
-        // enough that clear_force sizes a STRONG threat — a smaller base's budget trips the can't-out-heal
-        // guard → an under-strength default), but FLOOR from the smaller `duo_attack_heal` so a TRIVIAL
-        // threat doesn't over-spawn to 4. Decoupling the floor from the budget is the ADR 0029 forming-
-        // completion fix: the 4-member floor × N contested rooms saturated the spawn lanes so no roster ever
-        // completed. sized_for grows the duo floor for real threats; the manager deploys it immediately (FIX A).
-        let budget = SquadComposition::quad_ranged().force_budget(ctx.member_energy, CLEAR_ONSITE_TICKS);
-        // Defense is in our OWN room: no enemy towers + no enemy safe-mode (`ctx.defense` is the default
-        // profile), so the unified `ClearCreeps` emitter (which reads `defense.towers`/`defense.safe_mode`)
-        // reproduces the prior `clear_force(vec![], …, false)` exactly. The floor stays the small
-        // `duo_attack_heal` (decoupled from the quad budget — the ADR 0029 forming-completion fix).
-        let (_, required) = emit_requirement(DoctrineObjective::ClearCreeps, &ctx.defense, ctx.enemy_force, Some(&budget), ctx.coordination, ctx.importance);
-        let floor = SquadComposition::duo_attack_heal();
-        let comp = floor.sized_for(required, ctx.member_energy).unwrap_or(floor);
-        ForcePlan::fixed(comp)
     }
 }
 
@@ -523,18 +468,14 @@ impl ForceDoctrine for SkSuppression {
     fn applies(&self, ctx: &EngagementContext) -> bool {
         matches!(ctx.objective, DoctrineObjective::Suppress)
     }
-    fn template(&self) -> SquadComposition {
-        SquadComposition::duo_sk_farmer()
+    fn fighter_role(&self) -> SquadRole {
+        SquadRole::RangedDPS // the kiter grinds the keeper (a CREEP) with RANGED
     }
-    fn is_sized(&self) -> bool {
-        false // a custom kiting-suppression sizing (below), not the generic budget/assess path
+    fn honor_verdict(&self) -> bool {
+        false // the SK farm always fields its suppression duo (Suppress is always winnable by construction)
     }
-    fn plan(&self, ctx: &EngagementContext, _budget: Option<ForceBudget>) -> ForcePlan {
-        // The SK kite needs no budget (it sizes directly from the keeper) — `None` budget to the emitter.
-        let (assessment, required) = emit_requirement(DoctrineObjective::Suppress, &ctx.defense, ctx.enemy_force, None, ctx.coordination, ctx.importance);
-        let duo = SquadComposition::duo_sk_farmer();
-        let composition = Some(duo.sized_for(required, ctx.member_energy).unwrap_or_else(SquadComposition::duo_sk_farmer));
-        ForcePlan { composition, assessment, required }
+    fn retreat_threshold(&self) -> f32 {
+        0.5 // SK damage is bursty — retreat earlier so a kiting slip recovers
     }
 }
 
@@ -582,69 +523,66 @@ mod tests {
         let mut c = ctx(DoctrineObjective::Suppress, DefenseProfile::default());
         c.enemy_force = Some(EnemyForce { dps: 168.0, heal: 0.0, hits: 5000, count: 1, boosted: false });
         let doc = decide_doctrine(&c, &docs).expect("Suppress → sk-suppression");
-        let plan = doc.plan(&c, None);
+        let plan = plan_engagement(doc, &c, None);
         // Behavior-preserving vs the former SK mission sizing: 5000 HP ÷ 34t ÷ 10 = 15 ranged kill parts
         // (R-attack), and HEAL > 0 to out-heal the 168 melee × HOLD_MARGIN (R6).
         assert_eq!(plan.required.anti_creep_parts, 15, "kills the keeper (a creep) in the window");
         assert!(plan.required.heal_parts > 0, "out-heals the keeper melee");
-        assert!(plan.composition.is_some(), "always fields the duo");
+        let comp = plan.composition.expect("always fields the suppression force");
+        assert!((comp.retreat_threshold - 0.5).abs() < 1e-6, "SK retreat tuning is layered (bursty → 0.5)");
     }
 
     #[test]
-    fn player_raid_sizes_when_scouted_else_default_quad() {
+    fn player_raid_sizes_when_scouted_and_always_fields() {
         let docs = default_doctrines();
         let mut c = ctx(DoctrineObjective::ClearCreeps, DefenseProfile::default());
-        // Scouted player defenders → clear_force-sized to out-power (a Sized ranged body).
+        // Scouted defenders → clear_force-sized RANGED (assembled, no template).
         c.enemy_force = Some(EnemyForce { dps: 150.0, heal: 0.0, hits: 0, count: 3, boosted: false });
-        let comp = decide_doctrine(&c, &docs).unwrap().plan(&c, None).composition.expect("always fields");
+        let comp = plan_engagement(decide_doctrine(&c, &docs).unwrap(), &c, None).composition.expect("operator intent always fields");
         assert!(
             comp.slots.iter().any(|s| matches!(s.body_type, crate::composition::BodyType::Sized(spec) if spec.ranged_attack > 0)),
-            "raid clear_force-sized to out-power the defenders"
+            "raid sized to out-power the defenders"
         );
-        // Unscouted flag room (no intel) → the default quad, no-op (the prior SecureRoom behavior).
+        // Unscouted (no intel) → STILL fields (always-field operator intent), every member force-Sized — no
+        // catalog template anywhere (D14/D15); it sizes up as defense is identified (D11).
         c.enemy_force = Some(EnemyForce::default());
-        let comp0 = decide_doctrine(&c, &docs).unwrap().plan(&c, None).composition.expect("always fields");
-        assert!(
-            comp0.slots.iter().all(|s| !matches!(s.body_type, crate::composition::BodyType::Sized(_))),
-            "unscouted → default quad (operator intent fields regardless)"
-        );
+        let comp0 = plan_engagement(decide_doctrine(&c, &docs).unwrap(), &c, None).composition.expect("always fields a force");
+        assert!(!comp0.slots.is_empty() && comp0.slots.iter().all(|s| matches!(s.body_type, crate::composition::BodyType::Sized(_))), "unscouted → an assembled (Sized) force, never a hardcoded template");
     }
 
     #[test]
     fn gated_player_raid_sizes_when_winnable_else_defers() {
         // ADR 0029 §7/D7: the SIZED + GATED resource-denial raid. Unlike the always-field `PlayerRaid`, it
-        // HONORS `clear_force`'s verdict so the bot's gate can DEFER a hopeless room.
+        // HONORS the oracle's verdict so the bot's gate can DEFER a hopeless room.
         let docs = default_doctrines();
         let mut c = ctx(DoctrineObjective::RaidCreeps, DefenseProfile::default());
         c.enemy_force = Some(EnemyForce { dps: 120.0, heal: 0.0, hits: 0, count: 3, boosted: false });
         let doc = decide_doctrine(&c, &docs).expect("RaidCreeps → gated-player-raid");
         assert_eq!(doc.name(), "gated-player-raid");
-        assert!(doc.is_sized(), "flows through the bot's force-budget + winnability + ROI gate");
-        let budget = doc.template().force_budget(c.member_energy, 1400);
+        assert!(doc.honor_verdict(), "the gated raid DEFERS a hopeless room (vs always-field PlayerRaid)");
         // Out-powerable defenders → winnable → a clear_force-sized ranged force (NOT deferred).
-        let plan = doc.plan(&c, Some(budget.clone()));
+        let plan = plan_engagement(doc, &c, None);
         assert!(plan.winnable(), "out-powerable defenders are winnable: {}", plan.assessment.reason);
         assert!(plan.composition.is_some(), "sizes a force when affordable");
         assert!(plan.required.anti_creep_parts > 0, "sized the anti-creep kill parts");
         // Enemy safe mode → the oracle defers (the gate the always-field `PlayerRaid` lacks).
         let mut safe = ctx(DoctrineObjective::RaidCreeps, DefenseProfile { safe_mode: true, ..Default::default() });
         safe.enemy_force = c.enemy_force;
-        let plan = doc.plan(&safe, Some(budget));
+        let plan = plan_engagement(doc, &safe, None);
         assert!(!plan.winnable(), "safe mode → defer");
         assert!(plan.composition.is_none(), "deferred → no force fielded (the bot skips)");
     }
 
     #[test]
     fn garrison_defense_clear_force_sizes_the_defender() {
-        // L3b: a strong grouped threat → the quad's parts are clear_force-sized to OUT-POWER it (a Sized
-        // body with ranged), not the bare spawn-path template.
+        // L3b: a strong grouped threat → the defender is assembled to OUT-POWER it (a Sized ranged force).
         let docs = defense_doctrines();
         let mut c = ctx(DoctrineObjective::ClearCreeps, DefenseProfile::default());
         c.enemy_force = Some(EnemyForce { dps: 200.0, heal: 0.0, hits: 0, count: 4, boosted: false });
-        let comp = decide_doctrine(&c, &docs).unwrap().plan(&c, None).composition.expect("defense always fields");
+        let comp = plan_engagement(decide_doctrine(&c, &docs).unwrap(), &c, None).composition.expect("defense always fields");
         assert!(
             comp.slots.iter().any(|s| matches!(s.body_type, crate::composition::BodyType::Sized(spec) if spec.ranged_attack > 0)),
-            "defender clear_force-sized to over-power the threat"
+            "defender assembled to over-power the threat"
         );
     }
 
@@ -655,17 +593,15 @@ mod tests {
             let mut c = ctx(DoctrineObjective::ClearCreeps, DefenseProfile::default());
             c.enemy_force = Some(force);
             let doc = decide_doctrine(&c, &docs).expect("ClearCreeps → garrison-defense");
-            doc.plan(&c, None).composition.expect("defense always fields").slots.len()
+            plan_engagement(doc, &c, None).composition.expect("defense always fields").slots.len()
         };
-        // ADR 0029: no buckets, and the floor is DECOUPLED from the budget (forming-completion fix). A
-        // trivial threat floors at the small `duo_attack_heal` (2) — NOT the over-spending quad (4) that ×N
-        // contested rooms saturated the spawn lanes — yet is sized via the quad BUDGET so a strong threat
-        // still grows. No discrete shape to straddle (the W9N8 1↔2 flap is structurally impossible), and the
-        // size is MONOTONIC non-decreasing in the threat (what the hard-threshold buckets violated).
+        // ADR 0029/0031: no buckets. The member COUNT emerges continuously from the assembler's role-set
+        // floor (≥1 fighter + ≥1 healer = 2) grown by the threat — there is no discrete shape to straddle
+        // (the W9N8 1↔2 flap is structurally impossible) and the size is MONOTONIC non-decreasing in the threat.
         let trivial = size(EnemyForce { dps: 10.0, heal: 0.0, hits: 100, count: 1, boosted: false });
         let moderate = size(EnemyForce { dps: 80.0, heal: 0.0, hits: 2000, count: 2, boosted: false });
         let strong = size(EnemyForce { dps: 150.0, heal: 30.0, hits: 8000, count: 5, boosted: false });
-        assert!((2..=8).contains(&trivial), "defense floors at the small duo (2), not the over-spending quad: {trivial}");
+        assert!((2..=8).contains(&trivial), "defense floors at the role-set minimum (a fighter + a healer = 2): {trivial}");
         assert!(moderate >= trivial, "monotonic non-decreasing: {moderate} >= {trivial}");
         assert!(strong >= moderate, "monotonic non-decreasing: {strong} >= {moderate}");
     }
@@ -680,10 +616,6 @@ mod tests {
             repair_per_tick: 0.0,
             safe_mode: false,
         }
-    }
-
-    fn budget_for(d: &dyn ForceDoctrine, energy: u32) -> Option<ForceBudget> {
-        d.is_sized().then(|| d.template().force_budget(energy, 1400))
     }
 
     #[test]
@@ -703,15 +635,15 @@ mod tests {
     }
 
     #[test]
-    fn npc_core_sizes_a_ranged_quad_when_winnable() {
+    fn npc_core_assembles_a_ranged_force_when_winnable() {
         let docs = default_doctrines();
         let c = ctx(DoctrineObjective::KillImmuneStructure, core_defense());
         let doc = decide_doctrine(&c, &docs).expect("core routes");
-        let plan = doc.plan(&c, budget_for(doc, c.member_energy));
+        let plan = plan_engagement(doc, &c, None);
         assert!(plan.winnable(), "weak-tower core is winnable: {}", plan.assessment.reason);
         let comp = plan.composition.expect("a home affords it");
         assert!(plan.required.immune_struct_parts > 0, "sized ranged kill parts");
-        // The sized quad fields RANGED (the core is dismantle-immune), not WORK.
+        // The assembled force fields RANGED (the core is dismantle-immune), not WORK.
         assert!(comp.slots.iter().any(|s| s.role == crate::composition::SquadRole::RangedDPS));
     }
 
@@ -722,20 +654,21 @@ mod tests {
         d.safe_mode = true;
         let c = ctx(DoctrineObjective::KillImmuneStructure, d);
         let doc = decide_doctrine(&c, &docs).expect("core routes");
-        let plan = doc.plan(&c, budget_for(doc, c.member_energy));
+        let plan = plan_engagement(doc, &c, None);
         assert!(!plan.winnable(), "safe mode → not winnable");
-        assert!(plan.composition.is_none());
+        assert!(plan.composition.is_none(), "gated doctrine defers to None (D10)");
     }
 
     #[test]
-    fn fixed_arms_field_their_template_unconditionally() {
+    fn always_field_doctrines_field_even_unscouted() {
         let docs = default_doctrines();
-        for (obj, sized) in [(DoctrineObjective::ClearCreeps, false), (DoctrineObjective::Harass, false)] {
+        // honor_verdict == false (operator intent / deny) → field a force even with NO scouted threat.
+        for obj in [DoctrineObjective::ClearCreeps, DoctrineObjective::Harass] {
             let c = ctx(obj, DefenseProfile::default());
             let doc = decide_doctrine(&c, &docs).expect("routes");
-            assert_eq!(doc.is_sized(), sized);
-            let plan = doc.plan(&c, None);
-            assert!(plan.winnable() && plan.composition.is_some(), "fixed arm fields its template");
+            assert!(!doc.honor_verdict(), "{obj:?} is always-field");
+            let plan = plan_engagement(doc, &c, None);
+            assert!(plan.composition.is_some(), "{obj:?}: an always-field doctrine fields a force");
         }
     }
 
