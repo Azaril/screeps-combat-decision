@@ -146,7 +146,22 @@ fn sized_plan(ctx: &EngagementContext, budget: &ForceBudget, template: SquadComp
     }
     // R5: over-invest by the objective's importance (a no-op at importance 0). The eval passes 0 to match
     // its current base-force sizing; the bot passes the objective's priority-derived importance.
-    let required = RequiredForce::from_assessment(&a).scaled(importance_margin(ctx.importance));
+    let mut required = RequiredForce::from_assessment(&a).scaled(importance_margin(ctx.importance));
+    // ADR 0031 P2: anti-creep OVERLAY — when defenders are OBSERVED, size `anti_creep_parts` (clear_force)
+    // to KILL them; `assess` only OUT-HEALS them (folds their dps into `incoming`). A RANGED template
+    // (e.g. `quad_ranged` for a defended invader core, which spawns invader creeps) sizes its RangedDPS
+    // from `immune_struct_parts + anti_creep_parts` (the sum) — enough for the core AND the guards. INERT
+    // with no defenders (`enemy_force` absent / `dps == 0`), so the creep-free calibration beds are
+    // unchanged (the `OracleCalibration`/`SizingWins` invariant). A WORK-only template ignores it (no
+    // RangedDPS slot) — `SiegeBreach`'s custom plan fields `siege_assault_quad` to receive it instead.
+    if let Some(enemy) = ctx.enemy_force.filter(|e| e.dps > 0.0) {
+        let margin = if ctx.coordination == EnemyCoordination::Coordinated { COORDINATED_DPS_MARGIN } else { 1.0 };
+        let (clear, req) = clear_force(ctx.defense.towers.clone(), enemy.dps, enemy.hits, enemy.heal, budget, margin, ctx.defense.safe_mode);
+        if clear.winnable {
+            required.anti_creep_parts = req.anti_creep_parts;
+            required.heal_parts = required.heal_parts.max(req.heal_parts);
+        }
+    }
     let composition = template.sized_for(required, ctx.member_energy);
     ForcePlan { composition, assessment: a, required }
 }
