@@ -26,6 +26,28 @@ pub fn squad_ready_to_depart(member_positions: &[Option<Position>], requested_sl
     member_positions.iter().filter(|p| p.is_some()).count() >= requested_slots
 }
 
+/// Minimum viable group to commit to a fight: a lone member is picked off, a pair (a fighter + a healer) can
+/// trade and sustain. The quorum floor so we never deploy a solo to a fight it can't survive.
+pub const MIN_VIABLE_GROUP: usize = 2;
+
+/// READY to DEPLOY as a grouped bloc at a QUORUM (not the full roster). For objectives where waiting for the
+/// LAST member deadlocks — it may never spawn under spawn contention — yet committing a single member loses it
+/// under-powered (operator 2026-06-27: defenders must group up, not trickle in one-at-a-time and die). Deploy
+/// once a quorum is present: `STRICT_QUORUM_RATIO` of the requested roster, floored at `MIN_VIABLE_GROUP`,
+/// capped at the requested count (a 1-slot objective deploys its 1). The remaining members reinforce by
+/// formation-following the deployed bloc. (The all-or-nothing [`squad_ready_to_depart`] stays for an OFFENSE
+/// bloc that must cross into a contested room together; ADR 0030 will tune the quorum by lifetime/wave.)
+pub fn squad_ready_to_depart_at_quorum(member_positions: &[Option<Position>], requested_slots: usize) -> bool {
+    if requested_slots == 0 {
+        return true;
+    }
+    let present = member_positions.iter().filter(|p| p.is_some()).count();
+    let quorum = ((requested_slots as f32 * STRICT_QUORUM_RATIO).ceil() as usize)
+        .max(MIN_VIABLE_GROUP)
+        .min(requested_slots);
+    present >= quorum
+}
+
 /// Whether to HOLD the squad's virtual anchor at a room boundary for cohesion (don't advance across until
 /// enough members are gathered near the edge), instead of letting fast creeps trickle into a contested
 /// room one at a time. The P-OBJ #23 fix lives here: counts ONLY members with a resolved position — a
@@ -161,5 +183,21 @@ mod tests {
         // An EXTRA still-spawning member (requested oscillated down 2→1) must NOT jam the gate: the
         // requested count IS present, so depart (orphaning the surplus). The live W9N8 stuck-at-1/1 bug.
         assert!(squad_ready_to_depart(&[Some(p), None], 1), "requested present + surplus spawning → depart");
+    }
+
+    /// Quorum deploy (operator 2026-06-27): a defender deploys when GROUPED (a quorum), not one-at-a-time
+    /// (picked off under-powered) and not strictly full (the N-1 deadlock when the last member never spawns).
+    #[test]
+    fn quorum_deploys_grouped_not_solo_not_full() {
+        let p = pos(25, 25, "W1N1");
+        // 4-member roster: deploy at the 3/4 quorum (don't wait for the unspawnable 4th); hold below it.
+        assert!(!squad_ready_to_depart_at_quorum(&[Some(p), None, None, None], 4), "1/4 lone trickle → hold");
+        assert!(!squad_ready_to_depart_at_quorum(&[Some(p), Some(p), None, None], 4), "2/4 below quorum → hold");
+        assert!(squad_ready_to_depart_at_quorum(&[Some(p), Some(p), Some(p), None], 4), "3/4 quorum → deploy");
+        // Small rosters: a duo deploys at the min viable group; a solo deploys its 1; a lone-of-2 holds.
+        assert!(squad_ready_to_depart_at_quorum(&[Some(p), Some(p)], 2), "2/2 → deploy");
+        assert!(!squad_ready_to_depart_at_quorum(&[Some(p), None], 2), "1/2 below the min viable group → hold");
+        assert!(squad_ready_to_depart_at_quorum(&[Some(p)], 1), "1/1 single-slot objective → deploy");
+        assert!(squad_ready_to_depart_at_quorum(&[], 0), "unknown roster → do not gate");
     }
 }
