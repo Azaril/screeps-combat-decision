@@ -310,11 +310,26 @@ fn single_role_cap(role: SquadRole, probe_energy: u32) -> u32 {
         .unwrap_or(0)
 }
 
-/// Formation for an assembled force of `count` members — the shape is DERIVED from the member count: a lone
-/// member roams loose, a 2-member force holds a strict line ([`FormationShape::Line`]), ≥3 hold a strict box
-/// ([`FormationShape::Box2x2`]). (Line/Box2x2 are the current [`FormationShape`] variants in use here,
-/// pending the deferred footprint cleanup.)
-fn formation_for(count: usize) -> (FormationShape, FormationMode) {
+/// The COMPACT W×H footprint that holds `n` members (ADR 0031 D14) — the single source of truth for the
+/// formation footprint, derived purely from the member count so every consumer (bot `box_formation`, agent
+/// `footprint()`, rover `moving_maximum` input) sizes the same box. `width = ⌈√n⌉`, `height = ⌈n / width⌉`:
+/// N=1→1×1, 2→2×1, 3-4→2×2, 5-6→3×2, 7-8→3×3 — generalizing the old hardcoded 2×2. Member offsets are the
+/// first `n` cells of this box, row-major from the anchor (slot 0 = `(0,0)`), so members never overlap and
+/// the footprint is exactly the bounding box. `n == 0` ⇒ `(1, 1)` (degenerate, no members).
+pub fn box_footprint(n: usize) -> (u8, u8) {
+    let n = n.max(1);
+    let width = (1..).find(|w| w * w >= n).unwrap_or(1);
+    let height = n.div_ceil(width);
+    (width as u8, height as u8)
+}
+
+/// Formation for an assembled force of `count` members — the shape is DERIVED from the member count (ADR
+/// 0031 D14): a lone member roams loose, a 2-member force holds a strict line ([`FormationShape::Line`]),
+/// ≥3 hold a strict COMPACT box ([`FormationShape::Box2x2`], which now means "the ⌈√N⌉ × ⌈N/⌈√N⌉⌉ box from
+/// [`box_footprint`]", NOT literally 2×2 — N=4→2×2, 5-6→3×2, 7-8→3×3). Total + explicit over
+/// `0..=MAX_SIZED_MEMBERS`; the catch-all keeps the box for any larger count the caller might pass.
+/// The downstream footprint is `box_footprint(count)` for the box arm (the geometry lives in ONE place).
+pub fn formation_for(count: usize) -> (FormationShape, FormationMode) {
     match count {
         0 | 1 => (FormationShape::None, FormationMode::Loose),
         2 => (FormationShape::Line, FormationMode::Strict),
@@ -556,5 +571,38 @@ mod tests {
         assert!(assemble_force(&RequiredForce { heal_parts: 400, ..Default::default() }, 5600).is_none(), "force past the 8-member cap → None");
         // Energy below a single HEAL+MOVE member's cost → can't field even one → None.
         assert!(assemble_force(&RequiredForce { heal_parts: 4, ..Default::default() }, 100).is_none(), "unaffordable role → None");
+    }
+
+    // ── D14: formation footprint derivation (ADR 0031) ──
+
+    /// `formation_for` is total + explicit over the fieldable member counts: 0|1 roams loose, 2 holds a
+    /// strict Line, ≥3 hold a strict (compact-box) Box2x2 — pinned for every N=1..=MAX_SIZED_MEMBERS so a
+    /// 5-8-member force gets the box intent (not the old "Default(None) ⇒ everyone stacks on one tile" hole).
+    #[test]
+    fn formation_for_is_total_over_fieldable_counts() {
+        assert_eq!(formation_for(0), (FormationShape::None, FormationMode::Loose));
+        assert_eq!(formation_for(1), (FormationShape::None, FormationMode::Loose));
+        assert_eq!(formation_for(2), (FormationShape::Line, FormationMode::Strict));
+        for n in 3..=MAX_SIZED_MEMBERS {
+            assert_eq!(formation_for(n), (FormationShape::Box2x2, FormationMode::Strict), "N={n} holds the compact box");
+        }
+    }
+
+    /// `box_footprint(n)` is the ONE source of the formation footprint: a compact ⌈√n⌉ × ⌈n/⌈√n⌉⌉ box that
+    /// holds exactly n members (generalizing the old hardcoded 2×2). Pinned for N=1..=8: width ≥ height,
+    /// the area holds n (`w*h >= n`), and the box is minimal (dropping a row would no longer hold n).
+    #[test]
+    fn box_footprint_is_a_compact_box_for_each_count() {
+        let expected = [(1, (1u8, 1u8)), (2, (2, 1)), (3, (2, 2)), (4, (2, 2)), (5, (3, 2)), (6, (3, 2)), (7, (3, 3)), (8, (3, 3))];
+        for (n, want) in expected {
+            let (w, h) = box_footprint(n);
+            assert_eq!((w, h), want, "box_footprint({n})");
+            assert!((w as usize) * (h as usize) >= n, "box holds all {n} members");
+            assert!(w >= h, "width ≥ height (anchor top-left, fills right then down)");
+            // Minimal: a box one row shorter could not hold n.
+            assert!((w as usize) * (h as usize - 1) < n, "box is minimal for {n}");
+        }
+        // n == 0 is the degenerate 1×1 (no members).
+        assert_eq!(box_footprint(0), (1, 1));
     }
 }
