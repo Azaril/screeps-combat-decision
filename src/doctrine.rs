@@ -265,12 +265,13 @@ impl ForceDoctrine for HarassRemote {
     }
 }
 
-/// Garrison defense (ADR 0026 §9.10 L3) — hold an owned/remote room against a present threat. UNIFIES the
-/// bot's former `DefenseEscalation::from_threat` 3-bucket selection onto the registry: selects the defender
-/// SHAPE by the threat and fields it spawn-path-sized (no oracle sizing — `clear_force`-based threat-
-/// proportional defender sizing is the §9.8/L6 enhancement, which is why this is `is_sized() == false`).
-/// Always-fields (you can't skip defending an owned room). The shape thresholds are the §9.8 `defend_size_
-/// curve` (L6-tunable); kept as the former `from_threat` constants so the unification is behavior-preserving.
+/// Garrison defense (ADR 0026 §9.10 L3, generalized ADR 0029) — hold an owned room against a present threat.
+/// Sizes a single ranged+heal base (`quad_ranged`) CONTINUOUSLY through the force-sizing oracle
+/// (`clear_force` → `sized_for`): the member count emerges from the threat, NOT from solo/duo/quad buckets.
+/// The buckets (the former `DefenseEscalation::from_threat`) straddled a hard threshold on jittery live
+/// threat → the committed roster flapped 1↔2 tick-to-tick → wipe (see `plan`). Always-fields (you can't skip
+/// defending an owned room) — falls back to the bare base if the oracle can't size. `is_sized() == false`
+/// only because it runs `clear_force` (creep-clear) in its own `plan`, not the structure-assess default.
 pub struct GarrisonDefense;
 impl ForceDoctrine for GarrisonDefense {
     fn name(&self) -> &'static str {
@@ -287,23 +288,22 @@ impl ForceDoctrine for GarrisonDefense {
     }
     fn plan(&self, ctx: &EngagementContext, _budget: Option<ForceBudget>) -> ForcePlan {
         let f = ctx.enemy_force.unwrap_or_default();
-        // Member COUNT from the threat (the former from_threat buckets; the §9.8 `defend_size_curve`,
-        // L6c-tunable).
-        let shape = if (f.boosted && f.dps > 200.0) || (f.heal > 100.0 && f.dps > 150.0) || f.count >= 4 {
-            SquadComposition::quad_ranged()
-        } else if f.dps > 60.0 || f.heal > 20.0 || f.count >= 2 || f.boosted {
-            SquadComposition::duo_attack_heal()
-        } else {
-            SquadComposition::solo_ranged()
-        };
-        // L3b — clear_force-size the shape's PARTS to the threat: out-heal the incoming AND OUT-POWER it
-        // (Coordinated over-match, so the defender clears the attackers decisively — never under-defends),
-        // falling back to the spawn-path template when the sizing can't field (no regression). `hits = 0`:
-        // defense has no kill-deadline, so the binding constraint is out-powering the incoming dps, not
-        // grinding HP. This is the FIRST LIVE use of `clear_force` (the keystone), to soak on Docker.
-        let budget = shape.force_budget(ctx.member_energy, CLEAR_ONSITE_TICKS);
+        // ADR 0029 — GENERALIZE defense onto the oracle: size a single ranged+heal BASE into a CONTINUOUS
+        // blob; the member COUNT emerges from `clear_force`'s required out-power + out-heal, NOT from
+        // solo/duo/quad buckets. The buckets straddled a HARD threshold (dps>60 / count>=2 / …) on jittery
+        // live threat → the committed roster flapped 1↔2 tick-to-tick → on a `requested=1` tick the lone
+        // creep departed into the defended room and was wiped → re-field → churn (the live W9N8 stuck-at-1/1
+        // + wipe). A continuous size cannot straddle. `clear_force` out-heals the incoming AND out-powers it
+        // (Coordinated square-law), `hits=0` (defense has no kill-deadline). Needs a REAL `member_energy`
+        // (the defense scan now passes the defended room's spawn capacity, not 0, so `sized_for` actually
+        // sizes instead of silently falling back to the bare template). Base = the ranged+heal `quad_ranged`:
+        // its `force_budget` is large enough to size a STRONG threat (a smaller base under-budgets clear_force
+        // → defer/fallback), and sized_for grows it from there — defense over-spends a trivial threat to the
+        // 4-member floor, the safe side (you can never UNDER-defend an owned room).
+        let base = SquadComposition::quad_ranged();
+        let budget = base.force_budget(ctx.member_energy, CLEAR_ONSITE_TICKS);
         let (_, required) = clear_force(vec![], f.dps, 0, f.heal, &budget, COORDINATED_DPS_MARGIN, false);
-        let comp = shape.sized_for(required, ctx.member_energy).unwrap_or(shape);
+        let comp = base.sized_for(required, ctx.member_energy).unwrap_or(base);
         ForcePlan::fixed(comp)
     }
 }
@@ -462,19 +462,24 @@ mod tests {
     }
 
     #[test]
-    fn garrison_defense_selects_shape_by_threat() {
+    fn garrison_defense_sizes_continuously_no_straddle() {
         let docs = defense_doctrines();
-        let shape = |force: EnemyForce| {
+        let size = |force: EnemyForce| {
             let mut c = ctx(DoctrineObjective::ClearCreeps, DefenseProfile::default());
             c.enemy_force = Some(force);
             let doc = decide_doctrine(&c, &docs).expect("ClearCreeps → garrison-defense");
             doc.plan(&c, None).composition.expect("defense always fields").slots.len()
         };
-        // Solo (1 slot) for a trivial threat; Duo (2) for moderate; Quad (4) for count ≥ 4 — the former
-        // DefenseEscalation::from_threat buckets, now on the registry.
-        assert_eq!(shape(EnemyForce { dps: 10.0, heal: 0.0, hits: 100, count: 1, boosted: false }), 1, "solo");
-        assert_eq!(shape(EnemyForce { dps: 80.0, heal: 0.0, hits: 2000, count: 2, boosted: false }), 2, "duo");
-        assert_eq!(shape(EnemyForce { dps: 50.0, heal: 0.0, hits: 8000, count: 5, boosted: false }), 4, "quad");
+        // ADR 0029: no buckets. The defender floors at the base (≥4 — over-spend a trivial threat, the safe
+        // side: never solo, so there is no small count to straddle to → the W9N8 1↔2 flap is structurally
+        // impossible), and the size is MONOTONIC non-decreasing in the threat (a stronger threat is never
+        // fielded smaller — what the hard-threshold buckets violated as the live threat jittered).
+        let trivial = size(EnemyForce { dps: 10.0, heal: 0.0, hits: 100, count: 1, boosted: false });
+        let moderate = size(EnemyForce { dps: 80.0, heal: 0.0, hits: 2000, count: 2, boosted: false });
+        let strong = size(EnemyForce { dps: 150.0, heal: 30.0, hits: 8000, count: 5, boosted: false });
+        assert!((4..=8).contains(&trivial), "defense floors at the base, never solo/duo: {trivial}");
+        assert!(moderate >= trivial, "monotonic non-decreasing: {moderate} >= {trivial}");
+        assert!(strong >= moderate, "monotonic non-decreasing: {strong} >= {moderate}");
     }
 
     /// A winnable core defense: one weak tower, the core's hits, reachable.
