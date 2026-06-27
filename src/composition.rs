@@ -30,6 +30,16 @@ const MAX_SIZED_MEMBERS: usize = 8;
 /// per-member capacity search in [`SquadComposition::sized_for`].
 const MAX_SINGLE_ROLE_PARTS: u32 = 25;
 
+/// Preferred per-member energy ceiling for force-sized members — kept BELOW the 50-part / 25-role-part
+/// hard max so a sized member is reliably bankable at HIGH spawn priority while CRITICAL economy creeps
+/// drain the home. This splits a force across MORE, SMALLER members instead of one un-spawnable ~5000e
+/// blob that re-queues forever and never departs (the live W7N7 25-RANGED / W7N4 16-HEAL bug: a 5000e
+/// member is ~90% of an RCL7 spawn's capacity and never accumulates while miners drain it). At ~3000 a
+/// member is ~half an RCL7 capacity — easily banked — yet counts stay within [`MAX_SIZED_MEMBERS`] for
+/// normal targets. The 50-part engine cap and [`MAX_SINGLE_ROLE_PARTS`] remain the hard CEILING; this
+/// only ever LOWERS the capacity probe. (~3000 ⇒ 15 RANGED+15 MOVE = 3000e, or 10 HEAL+10 MOVE = 3000e.)
+const PREFERRED_MEMBER_ENERGY: u32 = 3000;
+
 /// Role a creep plays within a squad.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SquadRole {
@@ -724,10 +734,13 @@ impl SquadComposition {
         // Largest single-role part count one member can carry at this energy — reuses the real builder
         // (incl. the per-member MOVE ratio + 50-part cap) so the cap can't drift from what actually
         // spawns. 0 ⇒ can't field even one member of this role at this energy.
+        // Probe at the SMALLER of the home's capacity and the preferred per-member ceiling, so a force is
+        // split into more, smaller, bankable members rather than one ~5000e blob the home can never bank.
+        let probe_energy = max_member_energy.min(PREFERRED_MEMBER_ENERGY);
         let cap_for = |role: SquadRole| -> u32 {
             (1..=MAX_SINGLE_ROLE_PARTS)
                 .rev()
-                .find(|&n| bodies::build_combat_body(&spec_for(role, n), bodies::MoveProfile::Plains, max_member_energy).is_some())
+                .find(|&n| bodies::build_combat_body(&spec_for(role, n), bodies::MoveProfile::Plains, probe_energy).is_some())
                 .unwrap_or(0)
         };
         let template_count = |r: SquadRole| self.slots.iter().filter(|s| s.role == r).count() as u32;
@@ -751,6 +764,7 @@ impl SquadComposition {
                 return None; // can't field even one member of this role at this energy → defer
             }
             // Grow the member count so each member's even share fits; never below the template count.
+            // (per_member = div_ceil(total, count) ≤ cap always holds, since count ≥ div_ceil(total, cap).)
             let count = total.div_ceil(cap).max(template_count(role));
             let per_member = total.div_ceil(count); // ceil ⇒ Σ over members ≥ total (never under-sizes)
             sized_roles.push((role, count, spec_for(role, per_member)));
@@ -837,15 +851,16 @@ mod tests {
     #[test]
     fn sized_for_grows_member_count_when_template_count_is_insufficient() {
         // D3 (ADR 0022): a force needing more HEAL than the template's 2 healers can carry GROWS the
-        // healer count instead of deferring. 65 heal parts at RCL7 (≤18 HEAL/member) ⇒ ceil(65/18)=4
-        // healers, each ~17 HEAL — the squad is fielded (not deferred) and out-heals the requirement.
+        // healer count instead of deferring. 40 heal parts at RCL7, capped to ≤10 HEAL/member by the
+        // per-member energy ceiling ⇒ ceil(40/10)=4 healers, each 10 HEAL — the squad is fielded (not
+        // deferred) and out-heals the requirement.
         let sized = SquadComposition::siege_quad()
-            .sized_for(RequiredForce { heal_parts: 65, dismantle_parts: 12, ranged_parts: 0, tough_parts: 0 }, 5600)
+            .sized_for(RequiredForce { heal_parts: 40, dismantle_parts: 12, ranged_parts: 0, tough_parts: 0 }, 5600)
             .expect("grows healers to meet the force at RCL7");
         let healers = sized.slots.iter().filter(|s| s.role == SquadRole::Healer).count();
-        assert_eq!(healers, 4, "the 2-healer template grew to 4 to carry 65 HEAL parts");
+        assert_eq!(healers, 4, "the 2-healer template grew to 4 to carry 40 HEAL parts");
         // The fielded force meets-or-exceeds the requirement (ceil distribution never under-sizes).
-        assert!(sized.capabilities(5600).heal_per_tick >= 65 * 12, "fielded HEAL ≥ required (12 HEAL/part)");
+        assert!(sized.capabilities(5600).heal_per_tick >= 40 * 12, "fielded HEAL ≥ required (12 HEAL/part)");
         // Dismantlers stay at the template count (12 WORK fits 2 dismantlers at RCL7).
         assert_eq!(sized.slots.iter().filter(|s| s.role == SquadRole::Dismantler).count(), 2);
     }
@@ -909,14 +924,16 @@ mod tests {
         let sized = SquadComposition::duo_sk_farmer()
             .sized_for(required, 12_900)
             .expect("RCL8 affords the sized SK healer");
-        let healer = sized.slots.iter().find(|s| s.role == SquadRole::Healer).unwrap();
-        match healer.body_type {
-            BodyType::Sized(spec) => assert!(
-                spec.heal as f32 * 12.0 >= 168.0 * HOLD_MARGIN,
-                "the sized SK healer out-heals a keeper with the hold margin"
-            ),
-            other => panic!("the SK healer should be force-sized, got {other:?}"),
-        }
+        // The healer role is force-sized (not the bare template) and — under the per-member energy cap —
+        // SPLIT across multiple bankable members, so the squad AGGREGATE out-heals the keeper with margin.
+        assert!(
+            sized.slots.iter().any(|s| matches!(s.body_type, BodyType::Sized(spec) if spec.heal > 0)),
+            "the SK healer role is force-sized, not the bare template"
+        );
+        assert!(
+            sized.capabilities(12_900).heal_per_tick as f32 >= 168.0 * HOLD_MARGIN,
+            "the sized SK healers aggregate-out-heal a keeper with the hold margin"
+        );
         let ranged = sized.slots.iter().find(|s| s.role == SquadRole::RangedDPS).unwrap();
         assert_eq!(ranged.body_type, BodyType::SkRangedAttacker, "the ranged kiter stays the proven template");
         // Very low energy (RCL2, ~1 HEAL/member) → the keeper-holding heal needs more members than one
