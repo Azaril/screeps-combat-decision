@@ -48,9 +48,9 @@ pub mod damage;
 pub mod bodies;
 /// The force-sizing oracle (`assess`, `RequiredForce`) — whether/how/how-much to commit a squad.
 pub mod force_sizing;
-/// Squad composition + role model (`SquadRole`, `BodyType`, `SquadComposition`, `sized_for`) — the
-/// data-driven squad blueprint + force-driven sizing, shared so the sim/eval field the bot's real
-/// composition.
+/// Squad composition + role model (`SquadRole`, `BodyType`, `SquadComposition`, `assemble_force`) — the
+/// data-driven squad blueprint + the deterministic capability-vector assembler, shared so the sim/eval
+/// field the bot's real composition.
 pub mod composition;
 /// ADR 0026 — the objective/information-dependent combat strategy-selection layer (`CombatStrategy` trait
 /// registry + `decide_strategy`); picks the per-squad `SquadTacticParams` weight profile by objective.

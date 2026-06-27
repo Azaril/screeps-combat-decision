@@ -215,13 +215,13 @@ pub fn assess(profile: &DefenseProfile, budget: &ForceBudget) -> ForceAssessment
 /// - **Coordinated** (a player squad fighting together): pass the AGGREGATE force + `dps_margin =`
 ///   [`COORDINATED_DPS_MARGIN`] (out-power, don't merely match).
 ///
-/// This is the pure sizing primitive both the offense (`PlayerRaid`) and defense (`PlayerDefend`) doctrines
-/// will use, so the bot and sim size a creep-clear through ONE path (the §9 parity, extended to creeps).
-/// The kill weapon is RANGED/ATTACK: `RequiredForce.immune_struct_parts` sizes a ranged-attacker role (the comp's
-/// role structure picks WORK vs RANGED). Unwinnable ⇒ all-zero required.
+/// This is the pure sizing primitive the creep-clear doctrines (`PlayerRaid`/`GatedPlayerRaid`/
+/// `GarrisonDefense`/`HarassRemote`) use, so the bot and sim size a creep-clear through ONE path (the §9
+/// parity, extended to creeps). The kill is anti-creep RANGED: it sets `RequiredForce.anti_creep_parts`,
+/// which [`crate::composition::assemble_force`] distributes across the RangedDPS role. Unwinnable ⇒ all-zero required.
 ///
-/// **NOT YET WIRED into a live path** — the doctrines + their bot/defense wiring + the tournament bed that
-/// tunes `dps_margin` are the §9.10 ledger's next rungs.
+/// WIRED via [`crate::doctrine::emit_requirement`] (the unified emitter every creep-clear objective flows
+/// through); the tournament bed that tunes `dps_margin` is the §9.10 ledger's next rung.
 pub fn clear_force(
     towers: Vec<TowerThreat>,
     enemy_dps: f32,
@@ -281,14 +281,14 @@ pub fn clear_force(
 // ─── R2: required-force → part counts (ADR 0020 §12.6) ───────────────────────
 //
 // The inverse of the composition's `capabilities()`: turn the oracle's required CAPABILITIES into the
-// total PARTS a squad must field. The composition's `sized_for` distributes these across the role
-// structure and builds member bodies via `build_combat_body`; the gate then becomes "can an in-range
+// total PARTS a squad must field. `assemble_force` distributes these across the squad's roles
+// and builds member bodies via `build_combat_body`; the gate then becomes "can an in-range
 // home afford these parts?". Reuses the heal-part math (`defender_heal_parts_for_dps`) so heal sizing
 // is consistent across defense and offense.
 
 /// WORK dismantle per part/tick (engine `DISMANTLE_POWER`).
-/// Total parts a squad must field to satisfy a [`ForceAssessment`] (R2). `sized_for` splits these
-/// across the composition's roles + builds bodies.
+/// Total parts a squad must field to satisfy a [`ForceAssessment`] (R2). `assemble_force` distributes these
+/// across the squad's roles + builds bodies.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RequiredForce {
     /// Σ HEAL parts — out-heal the assault position (`required_heal_per_tick`).
@@ -296,15 +296,15 @@ pub struct RequiredForce {
     /// Σ WORK parts — breach + kill a DISMANTLE-able structure (`required_dismantle_dps`).
     pub dismantle_parts: u32,
     /// Σ RANGED_ATTACK parts — the SAME required structure-DPS as `dismantle_parts`, expressed in RANGED
-    /// parts (it takes `DISMANTLE_POWER/RANGED_ATTACK_POWER` = 5× as many). `sized_for` sizes ranged-
-    /// attacker roles (`RangedDPS`/`DuoRangedAttacker`/`SkRangedAttacker`) from this and WORK roles from
-    /// `dismantle_parts` — the comp's role structure picks the weapon. REQUIRED for a dismantle-IMMUNE
-    /// target (an invader core / a Source Keeper) that only ranged/melee can kill (R-attack, §12.6).
+    /// parts (it takes `DISMANTLE_POWER/RANGED_ATTACK_POWER` = 5× as many). `assemble_force` sizes the
+    /// RangedDPS role from this and the Dismantler (WORK) role from `dismantle_parts` — the emitter zeroes
+    /// the weapon the objective can't use. REQUIRED for a dismantle-IMMUNE target (an invader core / a
+    /// Source Keeper) that only ranged/melee can kill (R-attack, §12.6).
     pub immune_struct_parts: u32,
     /// Σ RANGED/ATTACK parts to KILL blocking DEFENDER CREEPS (ADR 0031 Layer C) — distinct from
     /// `immune_struct_parts` (anti-structure). A force facing a guarded structure needs BOTH at once (raze
     /// the core AND clear the guard), so they are separate, not `max`-ed. Sized via `clear_force` over the
-    /// observed `enemy_force`; both feed `sized_for`'s RangedDPS role (the SUM). Zero when no defenders seen.
+    /// observed `enemy_force`; both feed `assemble_force`'s RangedDPS role (the SUM). Zero when no defenders seen.
     pub anti_creep_parts: u32,
     /// Σ TOUGH parts — the effective-HP buffer. v1 = 0 (role bodies carry their own HP); the
     /// margin-driven EHP buffer is R5/D2.
@@ -321,8 +321,8 @@ impl RequiredForce {
         RequiredForce {
             heal_parts: defender_heal_parts_for_dps(a.required_heal_per_tick, false),
             dismantle_parts: parts_for_rate(a.required_dismantle_dps, DISMANTLE_POWER),
-            // Same required structure-DPS, in RANGED parts — for a dismantle-immune target. `sized_for`
-            // applies whichever the comp's role structure uses (WORK vs RANGED). (R-attack §12.6.)
+            // Same required structure-DPS, in RANGED parts — for a dismantle-immune target. The emitter
+            // zeroes one weapon per objective; `assemble_force` sizes the surviving one (WORK vs RANGED). (R-attack §12.6.)
             immune_struct_parts: parts_for_rate(a.required_dismantle_dps, RANGED_ATTACK_POWER),
             // assess() is structure-only — defender DPS folds into heal, not a kill req. The unified emitter
             // (P2) adds anti-creep via clear_force over enemy_force; here it stays 0.
@@ -331,11 +331,11 @@ impl RequiredForce {
         }
     }
 
-    /// As a single-creep [`CombatBodySpec`] — the solo case + the round-trip seam. `sized_for` splits
-    /// the totals across the squad's members instead of stacking them on one creep.
+    /// As a single-creep [`CombatBodySpec`] — the single-member case + the round-trip seam. `assemble_force`
+    /// splits the totals across the squad's members instead of stacking them on one creep.
     pub fn as_solo_spec(&self) -> CombatBodySpec {
-        // The solo case is a dismantler (WORK); `ranged_parts` is the ALTERNATIVE weapon a ranged-attacker
-        // SQUAD role uses (sized via `sized_for`), not stacked onto the solo (that would double the kill
+        // The single-member case is a dismantler (WORK); `ranged_parts` is the ALTERNATIVE weapon a
+        // ranged-attacker SQUAD role uses (sized via `assemble_force`), not stacked onto one member (that would double the kill
         // weapon + blow the 50-part cap). So the solo spec stays heal+work+tough.
         CombatBodySpec {
             heal: self.heal_parts,
@@ -573,7 +573,7 @@ mod tests {
     fn required_dismantle_is_gross_not_net_of_repair() {
         // A repairing rampart: the fielded squad must out-pace repair, so the required dismantle is the
         // GROSS the winnability was computed at (the budget's full dismantle), NOT the net-of-repair
-        // rate — else `sized_for` under-sizes WORK by `repair` and the squad stalls at the wall (the
+        // rate — else `assemble_force` under-sizes WORK by `repair` and the squad stalls at the wall (the
         // oracle bug the offline oracle-calibration tournament caught).
         let profile = DefenseProfile { breach_hits: 50_000, objective_hits: 100_000, repair_per_tick: 200.0, ..Default::default() };
         let a = assess(&profile, &strong_budget());

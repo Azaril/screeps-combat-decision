@@ -1,23 +1,27 @@
-//! ADR 0026 §9 — the OBJECTIVE + FORCE-COMPOSITION selection layer, a pluggable **doctrine registry**
-//! that is the structural twin of the strategy registry ([`crate::strategy`]) one layer up: each
-//! doctrine is a named ACTIVATOR (`applies` — the classifier) + a `plan` that returns the objective's
-//! sized force. [`decide_doctrine`] returns the first doctrine whose activator fires (collection order =
-//! priority). Adding / removing a doctrine is one entry — the bot's `war.rs` and the eval are untouched.
+//! ADR 0026 §9 / ADR 0031 — the OBJECTIVE + FORCE-COMPOSITION selection layer, a pluggable **doctrine
+//! registry** that is the structural twin of the strategy registry ([`crate::strategy`]) one layer up.
+//! Each doctrine is a PURE CLASSIFIER (`applies` — the activator) + a few objective-shaping knobs; it
+//! carries NO sizing code of its own (D14/D15). [`decide_doctrine`] returns the first doctrine whose
+//! activator fires (collection order = priority). Adding / removing a doctrine is one entry — the bot's
+//! `war.rs` and the eval are untouched.
 //!
 //! Pure + host-shared so the BOT (war.rs offense) and the SIM (the eval's force-fielding) select and
 //! size compositions through THE SAME code — no divergent inline selection in either (the parity the ADR
-//! requires). Each caller projects its world into an [`EngagementContext`] and computes the
-//! [`ForceBudget`] for the doctrine's template (bot: `best_force_budget` over home rooms; eval: from the
-//! scenario); the doctrine runs the force-sizing oracle ([`crate::force_sizing`]) and hands back a sized
-//! [`SquadComposition`]. The budget computation is itself shared via [`SquadComposition::force_budget`].
+//! requires). Each caller projects its world into an [`EngagementContext`] and a winnability ceiling
+//! budget ([`ForceBudget`], from [`crate::composition::force_ceiling`]; bot: `best_force_budget` over
+//! home rooms, eval: from the scenario), then runs the ONE shared driver [`plan_engagement`]: it emits
+//! the capability vector + oracle verdict ([`emit_requirement`]), gates on winnability if the doctrine
+//! honors the verdict, and ASSEMBLES the force ([`crate::composition::assemble_force`]). There is no
+//! per-doctrine `plan()` and no template — composition is continuous and capability-driven.
 //!
-//! Doctrines (ADR 0026 §9.5/§9.10): OFFENSE (`default_doctrines`) = `NpcCore` (sized ranged quad vs a
-//! dismantle-immune core), `SiegeBreach` (sized siege quad vs a structure ring), `PlayerRaid` (L4 —
-//! clear_force-sized ranged quad vs a player room's creeps, always-field), `GatedPlayerRaid` (ADR 0029
-//! §7/D7 — the SIZED + GATED resource-denial raid: same clear_force sizing, but DEFERS a hopeless room
-//! through the bot's winnability + ROI gate), `HarassRemote` (fixed solo).
-//! DEFENSE (`defense_doctrines`) = `GarrisonDefense` (L3 — clear_force-sized defender). SK
-//! (`sk_doctrines`) = `SkSuppression` (L7 — sized kiting duo vs a keeper). The `coordination`/
+//! Doctrines (ADR 0026 §9.5/§9.10) — all sized by the assembler from the emitter's requirement (no
+//! per-doctrine templates): OFFENSE (`default_doctrines`) = `NpcCore` (vs a dismantle-immune core,
+//! RANGED), `SiegeBreach` (vs a dismantle-able structure ring, WORK), `PlayerRaid` (L4 — clear_force-
+//! sized vs a player room's creeps, always-field), `GatedPlayerRaid` (ADR 0029 §7/D7 — the SIZED + GATED
+//! resource-denial raid: same clear_force sizing, but DEFERS a hopeless room through the bot's
+//! winnability + ROI gate), `HarassRemote` (a DYNAMIC anti-creep deny force scaled to the room's creeps,
+//! always-field). DEFENSE (`defense_doctrines`) = `GarrisonDefense` (L3 — clear_force-sized defender).
+//! SK (`sk_doctrines`) = `SkSuppression` (L7 — kiting out-heal + kill vs a keeper). The `coordination`/
 //! `enemy_force` context fields feed the creep-clear sizing (`clear_force`).
 
 use crate::bodies::defender_heal_parts_for_dps;
@@ -76,8 +80,8 @@ pub struct EnemyForce {
 
 /// What a doctrine activator reads: the objective intent + the expected opposing force + the sizing
 /// ceiling. Bot-agnostic — the bot and the eval each project their world into this (ADR 0026 §9.3/§9.6).
-/// The [`ForceBudget`] is NOT here: it is template-specific, so the caller computes it for the chosen
-/// doctrine's `template()` and passes it to [`ForceDoctrine::plan`].
+/// The [`ForceBudget`] is NOT here: the caller derives it from the template-free [`force_ceiling`] (or
+/// lets [`plan_engagement`] derive it) and passes it to the driver.
 #[derive(Clone, Debug)]
 pub struct EngagementContext {
     pub objective: DoctrineObjective,
@@ -89,21 +93,21 @@ pub struct EngagementContext {
     pub enemy_force: Option<EnemyForce>,
     /// Objective importance ∈ [0,1] → [`importance_margin`] over-investment (0 = base force, no scaling).
     pub importance: f32,
-    /// Strongest in-range spawn energy — the sizing ceiling passed to [`SquadComposition::sized_for`].
+    /// Strongest in-range spawn energy — the per-member sizing ceiling [`assemble_force`] sizes each
+    /// member to (and that [`force_ceiling`] derives the default winnability budget from).
     pub member_energy: u32,
 }
 
-/// The doctrine's output: the sized force + the oracle verdict (ADR 0026 §9.3).
+/// The driver's output: the assembled force + the oracle verdict (ADR 0026 §9.3 / ADR 0031).
 #[derive(Clone, Debug)]
 pub struct ForcePlan {
-    /// The SIZED composition to field. `None` = defer: unwinnable, or no in-range home affords the
-    /// required force (the caller skips / defers to a heavier path).
+    /// The ASSEMBLED composition to field. `None` = defer: the doctrine honors an unwinnable verdict, or
+    /// no in-range home affords the required force (the caller skips / defers to a heavier path).
     pub composition: Option<SquadComposition>,
-    /// The oracle verdict (winnable / mode / est_ticks / reason) — `winnable: true` + a "no oracle gate"
-    /// reason for a FIXED (unsized) doctrine.
+    /// The oracle verdict (winnable / mode / est_ticks / reason).
     pub assessment: ForceAssessment,
-    /// The required parts the sized composition was built to (for the caller's win-confidence log);
-    /// all-zero for a fixed doctrine.
+    /// The required capability vector the composition was assembled to (for the caller's win-confidence
+    /// log); all-zero when the engagement is deferred unwinnable.
     pub required: RequiredForce,
 }
 
@@ -121,9 +125,10 @@ impl ForcePlan {
 /// The UNIFIED requirement emitter (ADR 0031 T1) — ONE place that derives the capability vector
 /// ([`RequiredForce`]) + the oracle verdict ([`ForceAssessment`]) for an objective, folding the three
 /// formerly divergent sizing maths: [`assess`] (structure breach/drain), [`clear_force`] (creep
-/// square-law clear), and the SK kite terms. Each doctrine `plan()` becomes a thin caller — it computes
-/// the budget, then selects/sizes a template and wraps the result; the sizing MATH lives HERE (the parity
-/// seam the bot's `war.rs` and the eval both run, so they size identically). `budget` is `None` only for
+/// square-law clear), and the SK kite terms. The shared [`plan_engagement`] driver calls this for every
+/// objective and feeds the result straight to [`assemble_force`] — there is no per-doctrine sizing fork;
+/// the sizing MATH lives HERE (the parity seam the bot's `war.rs` and the eval both run, so they size
+/// identically). `budget` is `None` only for
 /// the SK kite (it sizes directly from the keeper — no winnability-against-budget check); the structure +
 /// creep-clear paths require it.
 ///
@@ -133,7 +138,7 @@ impl ForcePlan {
 /// WORK). The CREEP-CLEAR objectives size via `clear_force` at the coordinated over-match (the binding
 /// constraint is out-powering the defenders, NOT importance, so they do not scale — preserving the prior
 /// per-doctrine behavior); `RaidCreeps` additionally threads `enemy.hits` (the kill-in-time term).
-/// `Suppress` sizes the keeper kill window. The assembler (P3) consumes this vector instead of `sized_for`.
+/// `Suppress` sizes the keeper kill window. [`assemble_force`] consumes this capability vector directly.
 pub fn emit_requirement(
     objective: DoctrineObjective,
     defense: &DefenseProfile,
@@ -300,7 +305,7 @@ pub trait ForceDoctrine: Sync {
 
 // ── the starter doctrine set (ADR 0026 §9.5) — rung 1 re-expresses the current arms ──────────────────
 
-/// Invader core (dismantle-IMMUNE) → oracle-sized RANGED quad. `Individual` (one core). The bot's
+/// Invader core (dismantle-IMMUNE) → oracle-sized RANGED force. `Individual` (one core). The bot's
 /// current InvaderCore arm (R-attack §12.6 sizes the ranged kill parts + the out-heal). Safe-mode is
 /// handled by the oracle (`assess` returns unwinnable), so no separate veto doctrine is needed.
 pub struct NpcCore;
@@ -319,7 +324,7 @@ impl ForceDoctrine for NpcCore {
     }
 }
 
-/// A dismantle-ABLE structure ring (a base raze) → oracle-sized WORK siege quad. The eval's structure
+/// A dismantle-ABLE structure ring (a base raze) → oracle-sized WORK force. The eval's structure
 /// beds + the future G4-HEAVY bot path. `Individual` for an undefended raze; a defended player base is
 /// the `Coordinated` `PlayerRaid` (rung 3).
 pub struct SiegeBreach;
@@ -338,14 +343,14 @@ impl ForceDoctrine for SiegeBreach {
     }
 }
 
-/// Clear hostile creeps (an operator attack flag / secure a player room) → a ranged quad CLEAR_FORCE-SIZED
+/// Clear hostile creeps (an operator attack flag / secure a player room) → a ranged force CLEAR_FORCE-SIZED
 /// to OUT-POWER the defenders (ADR 0026 §9.10 L4, the player-offense rung). `Coordinated` (a player squad
 /// fights together). **Size-but-ALWAYS-FIELD** (never gate-skip operator intent): with no scouted enemy
-/// (`dps == 0` — an unscouted flag room) it fields the default quad — byte-identical to the prior
-/// `SecureRoom` behavior, so the rung is a no-op until the flag room's intel is wired in; with intel it
-/// sizes the quad to out-power + out-heal. `hits = 0`: like defense, the binding constraint is out-powering
-/// the incoming dps (a raze targets the creeps first), not grinding HP. Quad-capped (the N-blob escalation
-/// is L5). Falls back to the default quad if the sizing can't field (no regression).
+/// (`dps == 0` — an unscouted flag room) the driver fields the default floor; with intel `clear_force`
+/// sizes the force to out-power + out-heal and the assembler grows the member count to match. `hits = 0`:
+/// like defense, the binding constraint is out-powering the incoming dps (a raze targets the creeps first),
+/// not grinding HP. The member count emerges continuously (bounded by `MAX_SIZED_MEMBERS`; the multi-squad
+/// N-blob escalation is L5). Falls back to the default floor if the sizing can't field (no regression).
 pub struct PlayerRaid;
 impl ForceDoctrine for PlayerRaid {
     fn name(&self) -> &'static str {
@@ -366,10 +371,10 @@ impl ForceDoctrine for PlayerRaid {
 /// [`PlayerRaid`]. It runs the SAME `clear_force` creep-clear sizing (out-power + out-heal the defenders
 /// AND their towers), but unlike `PlayerRaid` (always-field operator intent) it HONORS the oracle's
 /// verdict: a hopeless room (enemy safe mode / can't out-heal the towers / their heal out-paces a feasible
-/// kill) returns [`ForcePlan::skip`], so the bot's winnability + ROI gate DEFERS it instead of feeding a
-/// doomed squad to a tower (the prior solo-harasser death). `is_sized() == true` so it flows through the
-/// bot's force-budget + winnability + ROI gate (the structural arms' path); the custom `plan` swaps the
-/// structure `assess` for creep `clear_force`. `Coordinated` (a player's creeps fight together).
+/// kill) makes [`plan_engagement`] defer to `None`, so the bot's winnability + ROI gate DEFERS it instead
+/// of feeding a doomed squad to a tower (the prior solo-harasser death). `honor_verdict() == true` so it
+/// flows through the bot's force-budget + winnability + ROI gate (the gated-offense path); the emitter
+/// sizes it via creep `clear_force` (not the structure `assess`). `Coordinated` (a player's creeps fight together).
 pub struct GatedPlayerRaid;
 impl ForceDoctrine for GatedPlayerRaid {
     fn name(&self) -> &'static str {
@@ -386,7 +391,10 @@ impl ForceDoctrine for GatedPlayerRaid {
     }
 }
 
-/// Harass / deny a hostile remote → a throwaway solo. LOW priority, no oracle gate (current behavior).
+/// Harass / deny a hostile remote → a DYNAMIC anti-creep deny force `clear_force`-sized to the room's
+/// observed creeps + margin (D11), NOT a fixed solo. LOW priority + always-field (no oracle gate); its
+/// distinction is purely TACTICAL (deny-don't-hold, retreat-happy — see `retreat`/tactics), and the
+/// member count emerges from the assembler. Unscouted (`dps == 0`) → the driver's default floor.
 pub struct HarassRemote;
 impl ForceDoctrine for HarassRemote {
     fn name(&self) -> &'static str {
@@ -404,12 +412,11 @@ impl ForceDoctrine for HarassRemote {
 }
 
 /// Garrison defense (ADR 0026 §9.10 L3, generalized ADR 0029) — hold an owned room against a present threat.
-/// Sizes a single ranged+heal base (`quad_ranged`) CONTINUOUSLY through the force-sizing oracle
-/// (`clear_force` → `sized_for`): the member count emerges from the threat, NOT from solo/duo/quad buckets.
-/// The buckets (the former `DefenseEscalation::from_threat`) straddled a hard threshold on jittery live
-/// threat → the committed roster flapped 1↔2 tick-to-tick → wipe (see `plan`). Always-fields (you can't skip
-/// defending an owned room) — falls back to the bare base if the oracle can't size. `is_sized() == false`
-/// only because it runs `clear_force` (creep-clear) in its own `plan`, not the structure-assess default.
+/// Sizes a ranged+heal force CONTINUOUSLY through the force-sizing oracle (`clear_force` → `assemble_force`):
+/// the member count emerges from the threat, NOT from fixed buckets. The buckets (the former
+/// `DefenseEscalation::from_threat`) straddled a hard threshold on jittery live threat → the committed
+/// roster flapped 1↔2 tick-to-tick → wipe. Always-fields (you can't skip defending an owned room) — falls
+/// back to the driver's default floor if the oracle can't size.
 pub struct GarrisonDefense;
 impl ForceDoctrine for GarrisonDefense {
     fn name(&self) -> &'static str {
@@ -423,9 +430,9 @@ impl ForceDoctrine for GarrisonDefense {
     }
     fn honor_verdict(&self) -> bool {
         // ADR 0029 — you can't skip defending an owned room: ALWAYS field. The assembler sizes a CONTINUOUS
-        // blob from the threat (member count emerges from `clear_force`'s out-power + out-heal — no solo/duo/
-        // quad buckets to straddle, the W9N8 1↔2 flap is structurally impossible), and the role-set floor +
-        // the driver's default floor replace the former hardcoded `duo_attack_heal` fallback.
+        // blob from the threat (member count emerges from `clear_force`'s out-power + out-heal — no fixed
+        // buckets to straddle, the W9N8 1↔2 flap is structurally impossible), and the role-set floor +
+        // the driver's default floor replace the former hardcoded fallback force.
         false
     }
 }
@@ -449,17 +456,18 @@ pub fn default_doctrines() -> Vec<Box<dyn ForceDoctrine>> {
     ]
 }
 
-/// SK kill window: ticks to grind a keeper's HP at the proven full-template suppression rate (~150 DPS,
+/// SK kill window: ticks to grind a keeper's HP at the proven full-strength suppression rate (~150 DPS,
 /// R6 + R-attack). A keeper does NOT self-heal (engine-fixed body), so net kill == gross ranged DPS.
 const SK_KEEPER_KILL_TICKS: u32 = 34;
 
-/// Source-Keeper suppression (ADR 0026 §9.10 L7) — the SK farm's duo, UNIFIED onto the registry from the
-/// SK mission's former inline sizing. Sizes the HEALER to out-heal the keeper's melee (× `HOLD_MARGIN`, so
+/// Source-Keeper suppression (ADR 0026 §9.10 L7) — the SK farm's suppression force, UNIFIED onto the
+/// registry from the SK mission's former inline sizing. Sizes the HEALER to out-heal the keeper's melee (× `HOLD_MARGIN`, so
 /// a kiting slip recovers, not dies) AND the KITER's RANGED to KILL the keeper in the kill window (a dead
 /// keeper clears the source for the respawn). `Individual` (one keeper per source) + KITED, so this is NOT
-/// `clear_force` — the duo kites and out-heals rather than trading blows, so there is no square-law
-/// over-power term. The keeper's stats arrive as the observed `enemy_force`. Sizes `duo_sk_farmer`, falling
-/// back to the template when no home affords the sized duo (behavior-identical to the prior SK sizing).
+/// `clear_force` — the force kites and out-heals rather than trading blows, so there is no square-law
+/// over-power term. The keeper's stats arrive as the observed `enemy_force`. The emitter sizes the heal +
+/// kill parts directly from the keeper and the assembler fields the force (member count emerges; falls
+/// back to the driver's default floor when no home affords the sized force).
 pub struct SkSuppression;
 impl ForceDoctrine for SkSuppression {
     fn name(&self) -> &'static str {
@@ -486,8 +494,8 @@ pub fn sk_doctrines() -> Vec<Box<dyn ForceDoctrine>> {
 }
 
 /// The DEFENSE doctrine collection — a separate registry so defender selection (`GarrisonDefense`, L3) is
-/// distinct from the offense `ClearCreeps` arm (`PlayerRaid`, L4): defense picks the shape by threat and
-/// holds, a raid sizes a quad to out-power and presses. One doctrine today; future turtle/sally variants
+/// distinct from the offense `ClearCreeps` arm (`PlayerRaid`, L4): defense sizes to the threat and holds,
+/// a raid sizes to out-power and presses. One doctrine today; future turtle/sally variants
 /// add entries here.
 pub fn defense_doctrines() -> Vec<Box<dyn ForceDoctrine>> {
     vec![Box::new(GarrisonDefense)]
@@ -673,8 +681,8 @@ mod tests {
     }
 
     /// ADR 0031 P2 determinism fence: the unified [`emit_requirement`] is a pure fold over Vec-ordered
-    /// inputs, so run-twice-equal must hold for EVERY objective (the standing sim fence only covers the
-    /// hardcoded `quad_ranged`; the emitter is the new shared path). (ADR 0031 §5.)
+    /// inputs, so run-twice-equal must hold for EVERY objective (the emitter is the shared sizing path
+    /// every objective now flows through). (ADR 0031 §5.)
     #[test]
     fn emit_requirement_is_deterministic_over_objectives() {
         let defense = DefenseProfile {
@@ -686,7 +694,7 @@ mod tests {
             safe_mode: false,
         };
         let enemy = Some(EnemyForce { dps: 120.0, heal: 20.0, hits: 4000, count: 3, boosted: false });
-        let budget = SquadComposition::quad_ranged().force_budget(5600, 1400);
+        let budget = force_ceiling(5600, SquadRole::RangedDPS).force_budget(5600, 1400);
         for obj in [
             DoctrineObjective::KillImmuneStructure,
             DoctrineObjective::DismantleStructure,
@@ -709,11 +717,11 @@ mod tests {
     #[test]
     fn emit_requirement_reproduces_per_objective_semantics() {
         // A guard but NO towers, so the anti-creep overlay's `clear_force` is out-heal-feasible against the
-        // siege budget (towers + a guard exceed a siege quad's heal — that's a correct defer, tested elsewhere).
+        // siege budget (towers + a guard exceed the siege ceiling's heal — that's a correct defer, tested elsewhere).
         let guarded = DefenseProfile { towers: vec![], breach_hits: 10_000, objective_hits: 100_000, enemy_dps: 90.0, repair_per_tick: 0.0, safe_mode: false };
         let undefended = DefenseProfile { breach_hits: 10_000, objective_hits: 100_000, ..Default::default() };
         let guard = Some(EnemyForce { dps: 90.0, heal: 0.0, hits: 3000, count: 2, boosted: false });
-        let budget = SquadComposition::siege_quad().force_budget(5600, 1400);
+        let budget = force_ceiling(5600, SquadRole::Dismantler).force_budget(5600, 1400);
 
         // DismantleStructure vs a guard: WORK to raze (dismantle_parts), anti-creep to clear the guard, and
         // the RANGED immune-alt is zeroed (a dismantle-able ring uses WORK).

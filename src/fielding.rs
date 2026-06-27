@@ -39,10 +39,17 @@ pub fn slots_to_spawn(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::composition::{force_ceiling, SquadRole};
+
+    /// A multi-slot composition (3 fighters + 5 healers) the fielding kernel can fan out, with no catalog
+    /// constructor (ADR 0031 P4b) — the force ceiling is the template-free stand-in.
+    fn multi_slot_comp() -> SquadComposition {
+        force_ceiling(12_900, SquadRole::RangedDPS)
+    }
 
     #[test]
     fn queues_every_unfilled_slot_capped_to_the_per_member_energy() {
-        let comp = SquadComposition::quad_ranged();
+        let comp = multi_slot_comp();
         let n = comp.slots.len();
         let none_filled = vec![false; n];
         let reqs = slots_to_spawn(&comp, &none_filled, 12_900, 3000, 75.0, MoveProfile::Plains);
@@ -55,7 +62,7 @@ mod tests {
 
     #[test]
     fn skips_filled_slots_and_maps_ids_to_slot_indices() {
-        let comp = SquadComposition::quad_ranged();
+        let comp = multi_slot_comp();
         let n = comp.slots.len();
         let mut filled = vec![false; n];
         filled[0] = true; // slot 0 already has a member
@@ -68,7 +75,7 @@ mod tests {
     #[test]
     fn unbuildable_slots_are_skipped_the_stall() {
         // A home far too small to build any member → no requests (the live roster-stall: nothing queues).
-        let comp = SquadComposition::quad_ranged();
+        let comp = multi_slot_comp();
         let none_filled = vec![false; comp.slots.len()];
         let reqs = slots_to_spawn(&comp, &none_filled, 100, 3000, 75.0, MoveProfile::Plains);
         assert!(reqs.is_empty(), "no in-range home can build a member at 100e → the roster can't field");
