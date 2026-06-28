@@ -48,6 +48,39 @@ pub fn squad_ready_to_depart_at_quorum(member_positions: &[Option<Position>], re
     present >= quorum
 }
 
+/// Whether a target room is PROVEN UNCONTESTED — safe to deploy a sub-roster quorum into rather than
+/// holding the full all-or-nothing rally bloc. The classification (rally-stall fix): an undefended,
+/// towerless, not-safe-moded room that we can currently SEE. The visibility flag is LOAD-BEARING — an
+/// `unseen` target room reports empty hostiles/structures DTOs simply because we have no vision, NOT
+/// because it is clear; gating on `no_hostiles` alone would mis-classify a defended-but-unseen room as
+/// uncontested and trickle a sub-roster into it to be picked off. So we require POSITIVE room visibility
+/// (computed live via `game::rooms().get(room).is_some()` at the call site) AND no hostiles AND no hostile
+/// towers AND no enemy safe mode. Any of those false ⇒ keep the hard full-roster rally.
+pub fn target_is_uncontested(room_visible: bool, no_hostiles: bool, no_hostile_towers: bool, no_enemy_safe_mode: bool) -> bool {
+    room_visible && no_hostiles && no_hostile_towers && no_enemy_safe_mode
+}
+
+/// Select the rally/deploy gate (rally-stall fix). For a PROVEN-uncontested target the squad need not wait
+/// for the LAST member (which may lose the within-tier spawn race on a young colony, deadlocking the
+/// all-or-nothing gate forever — the live W7N7 stall) — an oversized force advancing + dismantling as
+/// members arrive is HARMLESS against an undefended objective. So deploy at the MIN-VIABLE group: enough to
+/// not send a lone creep that could get unluckily picked off (`MIN_VIABLE_GROUP`), but NOT 0.75 of the
+/// roster (the survival-axis quorum, which is for a DEFENDED room and would re-introduce the very deadlock
+/// against an undefended one — 3/5 < ceil(0.75·5)=4 would still hold). Capped at the requested count so a
+/// 1-slot objective deploys its 1. For ANY contested or UNSEEN target keep the full-roster
+/// [`squad_ready_to_depart`] (the hard-rally protection: a defended room must be entered together).
+pub fn ready_to_depart_gate(member_positions: &[Option<Position>], requested_slots: usize, uncontested: bool) -> bool {
+    if !uncontested {
+        return squad_ready_to_depart(member_positions, requested_slots);
+    }
+    if requested_slots == 0 {
+        return true;
+    }
+    let present = member_positions.iter().filter(|p| p.is_some()).count();
+    let min_viable = MIN_VIABLE_GROUP.min(requested_slots);
+    present >= min_viable
+}
+
 /// Whether to HOLD the squad's virtual anchor at a room boundary for cohesion (don't advance across until
 /// enough members are gathered near the edge), instead of letting fast creeps trickle into a contested
 /// room one at a time. The P-OBJ #23 fix lives here: counts ONLY members with a resolved position — a
@@ -199,5 +232,43 @@ mod tests {
         assert!(!squad_ready_to_depart_at_quorum(&[Some(p), None], 2), "1/2 below the min viable group → hold");
         assert!(squad_ready_to_depart_at_quorum(&[Some(p)], 1), "1/1 single-slot objective → deploy");
         assert!(squad_ready_to_depart_at_quorum(&[], 0), "unknown roster → do not gate");
+    }
+
+    /// FIX 1 (rally-stall): a 3/5-present force DEPLOYS when the target is proven-uncontested (the
+    /// quorum gate) but HOLDS for the full roster when the target is contested/unseen (the W7N7 stall:
+    /// member 4/5 loses the spawn race forever, so the all-or-nothing gate never releases against an
+    /// undefended core). Mirrors `squad_ready_only_when_full_roster_present` + the quorum test.
+    #[test]
+    fn gate_quorum_when_uncontested_full_roster_when_contested() {
+        let p = pos(25, 25, "W7N7");
+        let three_of_five = [Some(p), Some(p), Some(p), None, None];
+        assert!(
+            ready_to_depart_gate(&three_of_five, 5, true),
+            "3/5 present + UNCONTESTED → deploy at quorum (advance + dismantle as members arrive)"
+        );
+        assert!(
+            !ready_to_depart_gate(&three_of_five, 5, false),
+            "3/5 present + CONTESTED/UNSEEN → hold for the full roster (enter together or be picked off)"
+        );
+        // Full roster departs either way; the gate never blocks a complete squad.
+        let full = [Some(p), Some(p), Some(p), Some(p), Some(p)];
+        assert!(ready_to_depart_gate(&full, 5, true), "5/5 uncontested → depart");
+        assert!(ready_to_depart_gate(&full, 5, false), "5/5 contested → depart (full roster present)");
+    }
+
+    /// FIX 1 visibility guard: `target_is_uncontested` is true ONLY with POSITIVE room visibility. An
+    /// UNSEEN room (empty DTOs because no vision, not because clear) is NEVER uncontested even though its
+    /// hostiles/towers read empty — preventing a defended-but-unseen room from mis-classifying as clear
+    /// and trickling a sub-roster in to be picked off.
+    #[test]
+    fn uncontested_requires_positive_visibility() {
+        // Seen + clear + no towers + no safe mode → uncontested.
+        assert!(target_is_uncontested(true, true, true, true), "visible + clear → uncontested");
+        // Unseen: empty DTOs (no_hostiles/no_towers read true) must NOT count as uncontested.
+        assert!(!target_is_uncontested(false, true, true, true), "UNSEEN room (empty DTOs) → NOT uncontested");
+        // Each contesting condition vetoes uncontested on a visible room.
+        assert!(!target_is_uncontested(true, false, true, true), "hostiles present → not uncontested");
+        assert!(!target_is_uncontested(true, true, false, true), "hostile tower present → not uncontested");
+        assert!(!target_is_uncontested(true, true, true, false), "enemy safe mode → not uncontested");
     }
 }

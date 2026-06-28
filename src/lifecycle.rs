@@ -26,6 +26,13 @@ pub struct ReconcileSnapshot {
     pub in_target_room: bool,
     /// Any living member at all.
     pub has_members: bool,
+    /// The squad is still ASSEMBLING its roster (has members but has not yet engaged and is not at the
+    /// full requested count) — a legitimate forming/rallying state, not a stuck-en-route one.
+    pub forming: bool,
+    /// The squad made spawn progress THIS reconcile (its present-member count increased since the manager
+    /// last looked). True only on the exact tick a new member appears, so it is self-bounding: a roster
+    /// can increase at most `requested_slots` times, after which progress stays false and the lease lapses.
+    pub forming_progress: bool,
 }
 
 /// Why a squad is being retired (drives logging + backoff).
@@ -69,9 +76,21 @@ pub enum ReconcileAction {
 ///
 /// Otherwise keep — refreshing the lease while a focus is held so a long fight or a brief vision gap
 /// never lets the objective lapse underneath the squad.
+///
+/// FORMING-PROGRESS lease refresh (ADR 0028 follow-up, the rally-stall fix): a squad that legitimately
+/// sits at home assembling its roster has no focus, so the base lease lapses at +400 → it would be
+/// retired mid-assembly (and re-fielded → Generation churn that orphans the already-spawned members).
+/// While the squad is `forming` AND `forming_progress` (its present-member count just increased), refresh
+/// the lease so the assembly is not torn down. This is BOUNDED by construction: `forming_progress` is true
+/// only on the tick a new member appears, and a roster grows at most `requested_slots` times — once the
+/// count stops increasing (a genuinely-unfieldable squad that can never bank enough energy for the next
+/// member) `forming_progress` stays false, the lease lapses, and the squad gives up + frees the slot.
 pub fn reconcile(s: ReconcileSnapshot) -> ReconcileAction {
     let resolved = s.engaged_once && s.in_target_room && !s.has_focus && s.has_members;
-    let gave_up = s.deadline_lapsed && !s.has_focus && !resolved;
+    // A forming squad that is still gaining members keeps its lease alive past the deadline (bounded — see
+    // the doc comment). It must NOT count as a give-up even though it has no focus and the lease lapsed.
+    let forming_progressing = s.forming && s.forming_progress && s.has_members;
+    let gave_up = s.deadline_lapsed && !s.has_focus && !resolved && !forming_progressing;
 
     if s.objective_gone || s.duplicate || s.wiped || resolved || gave_up {
         // Precedence: a clean clear (Resolved) is the most informative + drives withdraw; then the
@@ -97,7 +116,9 @@ pub fn reconcile(s: ReconcileSnapshot) -> ReconcileAction {
         };
     }
 
-    if s.has_focus {
+    // Refresh the lease while actively engaging (a long fight / vision gap) OR while a forming squad is
+    // still making spawn progress (the rally-stall fix — the assembly is not torn down mid-form).
+    if s.has_focus || forming_progressing {
         ReconcileAction::KeepRefreshLease
     } else {
         ReconcileAction::Keep
@@ -120,6 +141,8 @@ mod tests {
             engaged_once: false,
             in_target_room: false,
             has_members: true,
+            forming: false,
+            forming_progress: false,
         }
     }
 
@@ -199,6 +222,27 @@ mod tests {
         assert_eq!(
             reconcile(s),
             ReconcileAction::Retire { reason: RetireReason::ObjectiveGone, withdraw: false, mark_unwinnable: false }
+        );
+    }
+
+    /// FIX 2 (rally-stall): a forming squad PAST its lease that is still making spawn progress (a member
+    /// just appeared) must be KEPT (lease refreshed), not retired mid-assembly → no re-field/Generation
+    /// churn. Mirrors the live "RALLY present=4/5, last member just spawned at tick 401" case.
+    #[test]
+    fn forming_progressing_past_lease_is_kept_not_retired() {
+        let s = ReconcileSnapshot { deadline_lapsed: true, forming: true, forming_progress: true, ..forming() };
+        assert_eq!(reconcile(s), ReconcileAction::KeepRefreshLease);
+    }
+
+    /// FIX 2 bound: a forming squad PAST its lease that has STOPPED making progress (can never bank energy
+    /// for the next member — present count flat) must STILL give up + free the slot. The forming exemption
+    /// is bounded by progress, so a genuinely-unfieldable squad is never immortal.
+    #[test]
+    fn forming_non_progressing_past_lease_still_gives_up() {
+        let s = ReconcileSnapshot { deadline_lapsed: true, forming: true, forming_progress: false, ..forming() };
+        assert_eq!(
+            reconcile(s),
+            ReconcileAction::Retire { reason: RetireReason::GaveUp, withdraw: false, mark_unwinnable: true }
         );
     }
 
