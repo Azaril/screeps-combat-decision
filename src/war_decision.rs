@@ -139,6 +139,68 @@ where
     out.into_iter().map(|(e, _)| e).collect()
 }
 
+/// One room the live defense scan OBSERVED (a visible, non-owned neighbour candidate), reduced to the two
+/// plain facts the neighbour-threat decision needs. The bot adapter builds these from `game::rooms()` /
+/// the room intel (the only non-pure step); the harness builds synthetic ones.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ObservedRoom<R> {
+    /// The room the hostiles were seen in.
+    pub room: R,
+    /// Whether ANY hostile in the room warrants a defender (the caller folds `hostile_warrants_defender`
+    /// over the bodies). A room with only unarmed scouts/haulers is `false`.
+    pub armed: bool,
+    /// The danger estimate (summed DPS, etc.) the caller folded over the armed hostiles — passed straight
+    /// through to `Threat::danger` for the within-band tie-break.
+    pub danger: f32,
+}
+
+/// PURE neighbour-threat builder (ADR 0027 v1 LIVE SEAM). Given the owned rooms, the observed visible
+/// neighbour rooms, the leash, and the Chebyshev room-distance fn, produce the `Vec<Threat>` to feed
+/// alongside the owned-room threats into [`emit_defense`].
+///
+/// A neighbour room becomes a single `Threat{room, danger}` IFF it is ARMED (the caller already folded
+/// `hostile_warrants_defender` → `ObservedRoom::armed`) AND it is WITHIN the leash of the nearest owned
+/// room (we don't even gather beyond the leash — the kernel would drop it, but bounding here keeps the fed
+/// list tight). A swarm of N hostiles in one neighbour is ONE `ObservedRoom` → ONE `Threat` (the danger is
+/// already summed) → ONE `Secure` objective downstream — never N. Owned rooms are excluded (dist 0): owned
+/// threats are gathered on the existing owned-room path, so this builder covers only the dist 1..=leash
+/// band and never double-counts a room the owned scan already fed.
+///
+/// Deterministic: a `Vec` in → a `Vec` out in the caller's stable input order; no `HashMap`, no `game::*`.
+pub fn neighbour_threats<R, D>(owned: &[OwnedRoom<R>], observed: &[ObservedRoom<R>], policy: DefensePolicy, dist: D) -> Vec<Threat<R>>
+where
+    R: Copy + PartialEq,
+    D: Fn(R, R) -> u32,
+{
+    let mut out: Vec<Threat<R>> = Vec::new();
+
+    for obs in observed {
+        // Bounded #1: only an ARMED room (a hostile that warrants a defender) becomes a threat.
+        if !obs.armed {
+            continue;
+        }
+
+        // Distance to the NEAREST owned room. With no owned rooms there is nothing to defend.
+        let Some(nearest_dist) = owned.iter().map(|o| dist(o.room, obs.room)).min() else {
+            continue;
+        };
+
+        // Owned rooms (dist 0) are handled by the existing owned-room scan — never double-count one here.
+        if nearest_dist == 0 {
+            continue;
+        }
+
+        // Bounded #2: within the leash. We don't even gather beyond it (the kernel would drop it anyway).
+        if nearest_dist > policy.leash {
+            continue;
+        }
+
+        out.push(Threat { room: obs.room, danger: obs.danger });
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,5 +299,77 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].room, (-1, 0), "higher danger ranks first on a priority tie");
         assert_eq!(out[1].room, (1, 0));
+    }
+
+    // ── neighbour_threats (ADR 0027 v1 LIVE SEAM) ──────────────────────────────────────────────────────
+
+    fn obs(r: Room, armed: bool, danger: f32) -> ObservedRoom<Room> {
+        ObservedRoom { room: r, armed, danger }
+    }
+
+    /// An ARMED hostile in a VISIBLE neighbour WITHIN the leash becomes one `Threat` at that neighbour, with
+    /// the folded danger passed straight through.
+    #[test]
+    fn neighbour_armed_visible_within_leash_becomes_a_threat() {
+        let owned_rooms = [owned((0, 0), 1.0)];
+        // dist 1 (adjacent) and dist 2 (within default leash) — both armed → both fed.
+        let observed = [obs((1, 0), true, 5.0), obs((2, 0), true, 3.0)];
+        let out = neighbour_threats(&owned_rooms, &observed, DefensePolicy::default(), cheby);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0], threat((1, 0), 5.0), "adjacent armed neighbour fed with its danger");
+        assert_eq!(out[1], threat((2, 0), 3.0), "within-leash armed neighbour fed with its danger");
+    }
+
+    /// UNARMED (a scout/hauler, `armed=false`), INVISIBLE (never appears in `observed` at all), and
+    /// BEYOND-LEASH neighbours each produce NO threat — the three bounds.
+    #[test]
+    fn neighbour_unarmed_invisible_or_beyond_leash_yields_none() {
+        let owned_rooms = [owned((0, 0), 1.0)];
+        let observed = [
+            obs((1, 0), false, 5.0), // armed=false (unarmed scout/hauler) → dropped
+            obs((3, 0), true, 9.0),  // beyond default leash=2 → dropped
+            // an INVISIBLE neighbour is simply absent from `observed` (the scan never saw it) → nothing.
+        ];
+        let out = neighbour_threats(&owned_rooms, &observed, DefensePolicy::default(), cheby);
+        assert!(out.is_empty(), "unarmed/beyond-leash dropped; invisible never present");
+    }
+
+    /// A SWARM of N hostiles in ONE neighbour room is ONE `ObservedRoom` (the caller summed the danger) →
+    /// ONE `Threat` → ONE `Secure` objective downstream — never N. (The bot folds the swarm into a single
+    /// `ObservedRoom` per room; this asserts the helper preserves that one-room-one-threat contract.)
+    #[test]
+    fn neighbour_swarm_is_one_threat_room() {
+        let owned_rooms = [owned((0, 0), 1.0)];
+        // One room, danger already summed across the swarm (e.g. 5 attackers ⇒ 150 dps).
+        let observed = [obs((1, 0), true, 150.0)];
+        let out = neighbour_threats(&owned_rooms, &observed, DefensePolicy::default(), cheby);
+        assert_eq!(out.len(), 1, "a swarm in one room is a single threat-room");
+        assert_eq!(out[0], threat((1, 0), 150.0));
+    }
+
+    /// An owned room (dist 0) accidentally fed as an `ObservedRoom` is skipped — owned threats come from the
+    /// existing owned-room scan, so the neighbour builder never double-counts one.
+    #[test]
+    fn neighbour_excludes_owned_rooms_no_double_count() {
+        let owned_rooms = [owned((0, 0), 1.0)];
+        let observed = [obs((0, 0), true, 5.0)];
+        let out = neighbour_threats(&owned_rooms, &observed, DefensePolicy::default(), cheby);
+        assert!(out.is_empty(), "owned rooms are covered by the owned-room scan, not the neighbour builder");
+    }
+
+    /// No owned rooms → nothing to defend → no neighbour threats (the leash is measured from an owned room).
+    #[test]
+    fn neighbour_no_owned_rooms_yields_none() {
+        let out = neighbour_threats(&[], &[obs((1, 0), true, 5.0)], DefensePolicy::default(), cheby);
+        assert!(out.is_empty());
+    }
+
+    /// Deterministic: same input → same output, in the caller's stable order.
+    #[test]
+    fn neighbour_threats_are_deterministic() {
+        let owned_rooms = [owned((0, 0), 1.0)];
+        let observed = [obs((1, 0), true, 5.0), obs((-1, 0), true, 7.0), obs((2, 0), true, 3.0)];
+        let out = neighbour_threats(&owned_rooms, &observed, DefensePolicy::default(), cheby);
+        assert_eq!(out, neighbour_threats(&owned_rooms, &observed, DefensePolicy::default(), cheby));
     }
 }
