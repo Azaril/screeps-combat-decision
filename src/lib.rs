@@ -94,6 +94,13 @@ pub mod war_decision;
 /// kinds map to their income/ROI/denial. Feeds the EV-of-pairing helper + the per-squad assignment gate.
 pub mod objective_value;
 
+/// ADR 0032 v1.2 — the GLOBAL EV-maximizing squad↔objective matching (`build_ev_matrix` +
+/// `solve_assignment`): a deterministic rectangular Hungarian/Kuhn-Munkres over the integer-quantized
+/// EV matrix (rows = assignable squads, cols = top-C objectives + StayPut + Recycle). Replaces the
+/// v1.1 per-squad greedy `best_by_ev` selection with one global solve per scan. Host-shared so the bot
+/// (`squad_manager`) and the eval (`run_auction_flow`) optimize through the same kernel (no fork).
+pub mod assignment;
+
 use screeps::local::LocalCostMatrix;
 use screeps::{Direction, Part, Position, RawObjectId, RoomCoordinate, RoomName, RoomXY, StructureType};
 
