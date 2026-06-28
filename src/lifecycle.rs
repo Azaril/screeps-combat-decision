@@ -54,6 +54,15 @@ pub struct ReconcileSnapshot {
     /// The travel exemption budget has not yet been exhausted (an absolute travel-time bound). False ⇒ the
     /// travel refresh stops and a squad that can never arrive gives up.
     pub travel_budget_remaining: bool,
+    /// FIX B2 (defender garrison hold-station): a `Defend` squad that has ARRIVED in its owned room
+    /// (`in_target_room`) and finds NO in-room focus (`!has_focus` — the threat roams a NEIGHBOR room, the
+    /// owned room itself is clear) must GARRISON its room — refresh its lease while its Defend objective
+    /// persists — instead of `GaveUp`+RE-FIELD (the dominant live waste, Gen churn: arrive → no focus →
+    /// give up → Phase C immediately re-fields the SAME defender → repeat). Set by the manager as
+    /// `is_defend && in_target_room && !has_focus`; the kernel ORs it into the keep/refresh path. BOUNDED by
+    /// the OBJECTIVE lifecycle, not an infinite lease: when the threat clears, war.rs stops asserting the
+    /// Defend objective → `objective_gone` fires → the garrison retires cleanly (no infinite garrison).
+    pub holding_station: bool,
 }
 
 /// Why a squad is being retired (drives logging + backoff).
@@ -130,7 +139,12 @@ pub fn reconcile(s: ReconcileSnapshot) -> ReconcileAction {
     // progress (closing distance), bounded by `travel_budget_remaining` — so the lease does not lapse
     // mid-hop (the W7N7 travel-phase lapse) but a squad that can never arrive still gives up.
     let traveling_progressing = s.traveling && s.travel_progress && s.travel_budget_remaining && !s.engaged_once;
-    let gave_up = s.deadline_lapsed && !s.has_focus && !resolved && !forming_progressing && !traveling_progressing;
+    // FIX B2: a Defend squad GARRISONING its clear owned room (arrived, no in-room focus) is doing its job —
+    // it must not GaveUp+refield while the Defend objective persists. Bounded by the objective lifecycle:
+    // when the threat clears, war.rs drops the Defend objective → `objective_gone` retires the garrison.
+    let holding_station = s.holding_station && s.is_defend && s.in_target_room && !s.has_focus && s.has_members;
+    let gave_up =
+        s.deadline_lapsed && !s.has_focus && !resolved && !forming_progressing && !traveling_progressing && !holding_station;
 
     if s.objective_gone || s.duplicate || s.wiped || resolved || gave_up {
         // Precedence: a clean clear (Resolved) is the most informative + drives withdraw; then the
@@ -159,7 +173,7 @@ pub fn reconcile(s: ReconcileSnapshot) -> ReconcileAction {
     // Refresh the lease while actively engaging (a long fight / vision gap), while a forming squad is still
     // making spawn progress / has a member in flight (the rally-stall fix — the assembly is not torn down
     // mid-form), OR while a full-roster squad is traveling + closing on the target (the mid-hop lapse fix).
-    if s.has_focus || forming_progressing || traveling_progressing {
+    if s.has_focus || forming_progressing || traveling_progressing || holding_station {
         ReconcileAction::KeepRefreshLease
     } else {
         ReconcileAction::Keep
@@ -189,6 +203,7 @@ mod tests {
             traveling: false,
             travel_progress: false,
             travel_budget_remaining: true,
+            holding_station: false,
         }
     }
 
@@ -358,6 +373,70 @@ mod tests {
         assert_eq!(
             reconcile(over_budget),
             ReconcileAction::Retire { reason: RetireReason::GaveUp, withdraw: false, mark_unwinnable: true }
+        );
+    }
+
+    /// FIX B2 (defender garrison hold-station): a Defend squad that has ARRIVED in its owned room, found NO
+    /// in-room focus (the threat roams a neighbour), and whose lease lapsed must NOT GaveUp — it GARRISONS
+    /// (lease refreshed) while the Defend objective persists. Pre-fix (no `holding_station` signal): a
+    /// focus-less in-room defender past its lease gave up → Phase C re-fielded the SAME defender → Gen churn.
+    #[test]
+    fn defender_garrisons_clear_owned_room_does_not_give_up() {
+        let s = ReconcileSnapshot {
+            is_defend: true,
+            in_target_room: true,
+            has_focus: false,        // owned room itself is clear (threat is in a neighbour)
+            engaged_once: false,     // never fought — so this is NOT a Resolved clean clear
+            deadline_lapsed: true,   // lease lapsed sitting in the empty owned room
+            holding_station: true,   // the manager's is_defend && in_target_room && !has_focus signal
+            ..forming()
+        };
+        assert_eq!(
+            reconcile(s),
+            ReconcileAction::KeepRefreshLease,
+            "a Defend squad garrisoning its clear owned room holds its lease, not GaveUp+refield"
+        );
+    }
+
+    /// FIX B2 bound: the garrison is bounded by the OBJECTIVE lifecycle, not an infinite lease. Once the
+    /// threat clears and war.rs drops the Defend objective, `objective_gone` retires the garrison cleanly
+    /// (no backoff — not a loss). The garrison never holds forever after the objective is gone.
+    #[test]
+    fn defender_garrison_retires_when_objective_dropped() {
+        let s = ReconcileSnapshot {
+            is_defend: true,
+            in_target_room: true,
+            has_focus: false,
+            holding_station: true,
+            objective_gone: true, // war.rs stopped asserting the Defend objective (threat cleared)
+            deadline_lapsed: true,
+            ..forming()
+        };
+        assert_eq!(
+            reconcile(s),
+            ReconcileAction::Retire { reason: RetireReason::ObjectiveGone, withdraw: false, mark_unwinnable: false },
+            "the garrison retires cleanly once its Defend objective is dropped (bounded by the objective, not the lease)"
+        );
+    }
+
+    /// FIX B2 scope guard: `holding_station` is gated on `is_defend` in the kernel — an OFFENSE squad sitting
+    /// in the target room with no focus past its lease still GaveUp (it is not garrisoning an owned room; an
+    /// arrived offense squad that never finds a focus is a stuck clear, not a hold). Only DEFEND garrisons.
+    #[test]
+    fn holding_station_only_applies_to_defend() {
+        let s = ReconcileSnapshot {
+            is_defend: false, // OFFENSE
+            in_target_room: true,
+            has_focus: false,
+            engaged_once: false,
+            holding_station: true, // even if mis-set, the kernel re-gates on is_defend
+            deadline_lapsed: true,
+            ..forming()
+        };
+        assert_eq!(
+            reconcile(s),
+            ReconcileAction::Retire { reason: RetireReason::GaveUp, withdraw: false, mark_unwinnable: true },
+            "an offense squad does not garrison — it still gives up when its lease lapses focus-less in-room"
         );
     }
 
