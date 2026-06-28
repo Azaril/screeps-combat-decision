@@ -84,6 +84,11 @@ pub mod fielding;
 /// Pure claim-pacing kernel (P-OBJ harness / ADR 0028 K4): Phase C "how many new objectives to claim".
 pub mod claim_pacing;
 
+/// Pure threat-centric defense-emission kernel (ADR 0027 v1 — "Defending the wrong room"): given owned
+/// rooms + observed threats, decide which Secure objectives to emit (at the threat's CURRENT room, with the
+/// asset-priority boost + over-extension leash). war.rs is a thin adapter; the harness drives the same kernel.
+pub mod war_decision;
+
 use screeps::local::LocalCostMatrix;
 use screeps::{Direction, Part, Position, RawObjectId, RoomCoordinate, RoomName, RoomXY, StructureType};
 

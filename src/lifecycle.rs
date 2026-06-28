@@ -63,6 +63,17 @@ pub struct ReconcileSnapshot {
     /// the OBJECTIVE lifecycle, not an infinite lease: when the threat clears, war.rs stops asserting the
     /// Defend objective → `objective_gone` fires → the garrison retires cleanly (no infinite garrison).
     pub holding_station: bool,
+    /// ADR 0027 v1 (whole-squad REASSIGN): a sibling objective is available for THIS squad to take over
+    /// (a manager-computed snapshot, fed in EXACTLY like `holding_station` so the kernel stays pure —
+    /// `best_unclaimed_near_excluding(exclude=[current])` filtered through the capability gate, true ⇒ a
+    /// compatible target exists). When a squad reaches a NON-LOSS terminal (`Resolved` — target cleared —
+    /// or `ObjectiveGone` — target vanished) AND `reassign_available`, the kernel returns
+    /// [`ReconcileAction::Reassign`] instead of `Retire` so the manager REBINDS the squad in place (bodies
+    /// reused, no Generation churn) rather than retiring + re-fielding. A LOSS terminal (`Wiped` /
+    /// `GaveUp`) still retires — don't chain a wiped/unwinnable-backed-off squad straight into another
+    /// fight. `Duplicate` still retires (it is being consolidated, not freed). `false` => the existing
+    /// retire behaviour (no sibling, or capability mismatch) — reassignment is strictly ADDITIVE.
+    pub reassign_available: bool,
 }
 
 /// Why a squad is being retired (drives logging + backoff).
@@ -92,6 +103,12 @@ pub enum ReconcileAction {
         withdraw: bool,
         mark_unwinnable: bool,
     },
+    /// ADR 0027 v1: REBIND this squad IN PLACE to a sibling objective instead of retiring it (a non-loss
+    /// terminal — `Resolved`/`ObjectiveGone` — with a compatible sibling available). The bodies are reused
+    /// (no `retire_squad`/`field_new_squad`, no Generation churn). `withdraw_old` clears the OLD objective
+    /// from the queue the same way a `Retire` would have: `true` for a `Resolved` clean win (record it so no
+    /// one re-fields the cleared target), `false` for `ObjectiveGone` (already gone — nothing to withdraw).
+    Reassign { withdraw_old: bool },
 }
 
 /// The SquadManager Phase-A reconcile decision (ADR 0027). Pure: snapshot in, action out.
@@ -163,6 +180,20 @@ pub fn reconcile(s: ReconcileSnapshot) -> ReconcileAction {
         };
         let withdraw = resolved;
         let mark_unwinnable = (s.wiped || gave_up) && !s.objective_gone && !s.is_defend;
+        // ADR 0027 v1: on a NON-LOSS terminal (a clean clear, or the target simply vanished) with a
+        // compatible sibling objective available, REASSIGN the squad in place instead of retiring it —
+        // reuse the invested bodies (no Generation churn). A LOSS terminal (`Wiped`/`GaveUp`) or a
+        // `Duplicate` (consolidated, not freed) still retires; don't chain a tired/unwinnable squad into
+        // another fight. `withdraw_old` mirrors the retire's `withdraw` (clean-clear → withdraw the old).
+        // The NON-LOSS terminals: a clean clear (Resolved), or the objective simply vanishing
+        // (ObjectiveGone). A genuine give-up is a LOSS only when the objective is NOT gone — a vanished
+        // objective that also lapsed its lease is still `ObjectiveGone` (the retire-reason precedence
+        // already ranks ObjectiveGone above GaveUp). Wiped/Duplicate are never non-loss. Reassign only on a
+        // non-loss terminal with a compatible sibling available.
+        let non_loss_terminal = resolved || (s.objective_gone && !s.wiped && !s.duplicate);
+        if s.reassign_available && non_loss_terminal {
+            return ReconcileAction::Reassign { withdraw_old: resolved };
+        }
         return ReconcileAction::Retire {
             reason,
             withdraw,
@@ -204,6 +235,7 @@ mod tests {
             travel_progress: false,
             travel_budget_remaining: true,
             holding_station: false,
+            reassign_available: false,
         }
     }
 
@@ -444,6 +476,82 @@ mod tests {
     #[test]
     fn duplicate_retires_quietly() {
         let s = ReconcileSnapshot { duplicate: true, ..forming() };
+        assert_eq!(
+            reconcile(s),
+            ReconcileAction::Retire { reason: RetireReason::Duplicate, withdraw: false, mark_unwinnable: false }
+        );
+    }
+
+    // ── ADR 0027 v1: whole-squad REASSIGN (reuse a freed squad's bodies, no Generation churn) ──
+
+    /// REASSIGN-ON-RESOLVE: a squad that fought + CLEARED its target (Resolved) with a compatible sibling
+    /// available REBINDS in place (`withdraw_old=true` — record the clean win) instead of retiring. The
+    /// withdraw mirrors the `Retire{Resolved}` it replaces, so the cleared target is still removed.
+    #[test]
+    fn resolved_with_sibling_reassigns_and_withdraws_old() {
+        let s = ReconcileSnapshot {
+            engaged_once: true,
+            in_target_room: true,
+            has_focus: false, // cleared
+            reassign_available: true,
+            ..forming()
+        };
+        assert_eq!(reconcile(s), ReconcileAction::Reassign { withdraw_old: true });
+    }
+
+    /// REASSIGN-ON-EXPIRE/GONE: a squad whose objective VANISHED (ObjectiveGone) with a compatible sibling
+    /// available REBINDS in place (`withdraw_old=false` — the old target is already gone, nothing to
+    /// withdraw) instead of retiring.
+    #[test]
+    fn objective_gone_with_sibling_reassigns_no_withdraw() {
+        let s = ReconcileSnapshot { objective_gone: true, deadline_lapsed: true, reassign_available: true, ..forming() };
+        assert_eq!(reconcile(s), ReconcileAction::Reassign { withdraw_old: false });
+    }
+
+    /// REASSIGN is ADDITIVE — the no-sibling CONTROL falls back to the existing retire. Resolved → withdraw,
+    /// ObjectiveGone → no backoff: byte-identical to the pre-reassign behaviour when `reassign_available=false`.
+    #[test]
+    fn no_sibling_falls_back_to_existing_retire() {
+        let resolved = ReconcileSnapshot { engaged_once: true, in_target_room: true, has_focus: false, reassign_available: false, ..forming() };
+        assert_eq!(
+            reconcile(resolved),
+            ReconcileAction::Retire { reason: RetireReason::Resolved, withdraw: true, mark_unwinnable: false }
+        );
+        let gone = ReconcileSnapshot { objective_gone: true, deadline_lapsed: true, reassign_available: false, ..forming() };
+        assert_eq!(
+            reconcile(gone),
+            ReconcileAction::Retire { reason: RetireReason::ObjectiveGone, withdraw: false, mark_unwinnable: false }
+        );
+    }
+
+    /// A WIPED squad NEVER reassigns even with a sibling available — it has no members to reuse, and we
+    /// don't chain a wave-wiped force into another fight. It still retires (+ backs off, non-Defend).
+    #[test]
+    fn wiped_never_reassigns() {
+        let s = ReconcileSnapshot { wiped: true, has_members: false, reassign_available: true, ..forming() };
+        assert_eq!(
+            reconcile(s),
+            ReconcileAction::Retire { reason: RetireReason::Wiped, withdraw: false, mark_unwinnable: true }
+        );
+    }
+
+    /// A GAVE-UP squad NEVER reassigns even with a sibling available — it just `mark_unwinnable`'d its room
+    /// (stuck/abandoned); chaining it straight into another fight is exactly the thrash reassignment avoids
+    /// for clean terminals. It still retires + backs off.
+    #[test]
+    fn gave_up_never_reassigns() {
+        let s = ReconcileSnapshot { deadline_lapsed: true, reassign_available: true, ..forming() };
+        assert_eq!(
+            reconcile(s),
+            ReconcileAction::Retire { reason: RetireReason::GaveUp, withdraw: false, mark_unwinnable: true }
+        );
+    }
+
+    /// A DUPLICATE squad NEVER reassigns even with a sibling available — it is being consolidated (another
+    /// squad already covers its objective), not freed; it retires quietly.
+    #[test]
+    fn duplicate_never_reassigns() {
+        let s = ReconcileSnapshot { duplicate: true, reassign_available: true, ..forming() };
         assert_eq!(
             reconcile(s),
             ReconcileAction::Retire { reason: RetireReason::Duplicate, withdraw: false, mark_unwinnable: false }
