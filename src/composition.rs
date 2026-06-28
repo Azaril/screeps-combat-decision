@@ -656,6 +656,99 @@ pub fn optimizer_ceiling_budget(objective: DoctrineObjective, member_energy: u32
     ForceBudget { max_heal_per_tick, max_dismantle_dps, tank_effective_hp, onsite_budget_ticks: onsite_window }
 }
 
+// ═══ ADR 0032 v1.1 — the EV-of-pairing helper (P(win) on the EXISTING squad caps) ═══════════════════════
+//
+// The auction (ADR 0032 §"EV of a (squad, objective) pairing") scores `EV(S, O) = P(win | caps(S) vs
+// O.defense) · value_e(O) − cost`, reusing the ADR 0031 P(win) DECOMPOSITION (`win_probability` for survive
+// + the undefended-binary `p_kill` branch from `optimize_composition`) — but fed the EXISTING squad's
+// `capabilities()` (already-fielded surviving capability, read once), NOT an `optimize_composition` candidate
+// search. This is the v1.1 lift: the same probability model `optimize_composition` uses internally, exposed
+// over a fixed `SquadCapabilities` so the manager can rank reassign/claim/stay targets by EV. Travel is
+// priced via the SHRINKING on-site window (a farther objective → fewer on-site ticks → less deliverable →
+// lower `p_kill`) PLUS a small linear penalty (replacing the ad-hoc proximity tie-break, ADR 0032 line 37).
+
+/// The tunables for the EV-of-pairing helper (ADR 0032 v1.1). Transient (never serialized — no WFV bump),
+/// like [`CompositionParams`]. [`Default`] = trust the snapshot, a small travel penalty.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PairingParams {
+    /// Linear EV penalty per room of travel (the reach delay/exposure cost, ADR 0032 line 30) — added on top
+    /// of the on-site-window shrink. Small so it only breaks near-EV ties (replacing the proximity tie-break).
+    pub w_travel: f32,
+    /// Inflate the observed incoming damage so a GROWING threat still loses (mirrors
+    /// [`CompositionParams::dynamic_margin`]). 1.0 = trust the snapshot.
+    pub dynamic_margin: f32,
+}
+
+impl Default for PairingParams {
+    fn default() -> Self {
+        PairingParams { w_travel: 1.0, dynamic_margin: 1.0 }
+    }
+}
+
+/// P(win) for an EXISTING squad's `caps` against `defense` + `enemy`, over an `onsite_window` (ADR 0032
+/// v1.1). REUSES the ADR 0031 decomposition VERBATIM (the same `p_survive · p_kill` split, the same
+/// undefended-binary `p_kill` branch [`optimize_composition`] uses) — but on a FIXED capability vector, not
+/// a candidate search. `p_survive = win_probability(heal, incoming)`; `p_kill` is BINARY (1.0 iff we clear
+/// within the window) for a zero-attrition (undefended) target, else the logistic kill-speed curve for a
+/// defended one. Pure + deterministic.
+pub fn pairing_p_win(
+    caps: SquadCapabilities,
+    defense: &DefenseProfile,
+    enemy: Option<EnemyForce>,
+    onsite_window: u32,
+    params: &PairingParams,
+) -> f32 {
+    if defense.safe_mode {
+        return 0.0; // safe mode → zero damage possible → can never win (the assess() veto)
+    }
+    let enemy = enemy.unwrap_or_default();
+    let tower_dps = tower_dps_at_assault(&defense.towers);
+    let incoming = (tower_dps + enemy.dps) * params.dynamic_margin;
+    let required_kill = defense.objective_hits as f32 + defense.breach_hits as f32 + enemy.hits as f32 * params.dynamic_margin;
+
+    let p_survive = win_probability(caps.heal_per_tick as f32, incoming);
+    let deliverable = caps.structure_dps as f32 * onsite_window as f32;
+    // The SAME undefended-binary vs logistic split optimize_composition uses (FIX 3): a zero-attrition target
+    // is a certain win for any force that clears in the window; a defended one uses the kill-speed logistic.
+    let undefended = tower_dps == 0.0 && incoming == 0.0;
+    let p_kill = if undefended {
+        if required_kill <= 0.0 || (deliverable >= required_kill && caps.structure_dps > 0) {
+            1.0
+        } else {
+            0.0
+        }
+    } else {
+        win_probability(deliverable, required_kill)
+    };
+    p_survive * p_kill
+}
+
+/// THE EV of pairing the EXISTING squad (`caps`) with an objective (ADR 0032 §"EV of a (squad, objective)
+/// pairing"): `EV = P(win | caps vs defense) · value_e − cost`. `value_e` is the energy-equivalent objective
+/// value ([`crate::objective_value::value_e`]); `travel_rooms` prices reach via BOTH the caller's shrinking
+/// `onsite_window` (folded into `pairing_p_win`) AND a small linear `w_travel · travel_rooms` penalty. The
+/// squad's bodies are already spawned (a reassign/stay choice), so there is no spawn cost — the only `cost`
+/// is the travel penalty. Pure + deterministic.
+pub fn pairing_ev(
+    caps: SquadCapabilities,
+    defense: &DefenseProfile,
+    enemy: Option<EnemyForce>,
+    value_e: f32,
+    onsite_window: u32,
+    travel_rooms: u32,
+    params: &PairingParams,
+) -> f32 {
+    let p_win = pairing_p_win(caps, defense, enemy, onsite_window, params);
+    p_win * value_e - params.w_travel * travel_rooms as f32
+}
+
+/// Quantize an EV to a stable integer (ADR 0032 §Determinism / ADR 0020 §6 no-float-into-a-discrete-branch):
+/// `(ev · 1000)` rounded, clamped to `i64`. The auction's max-by / threshold comparisons run on THIS, never
+/// the raw `f32`, so a result-affecting branch is bit-reproducible.
+pub fn quantize_ev(ev: f32) -> i64 {
+    (ev * 1000.0).round() as i64
+}
+
 /// A composition's per-tick combat output + tank HP at a spawn energy — the force-sizing oracle's
 /// `ForceBudget` inputs (ADR 0020 §12.2).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1038,5 +1131,103 @@ mod tests {
             "undefended stays minimal even at huge value: {} members",
             undef.member_count()
         );
+    }
+
+    // ═══ ADR 0032 v1.1 — the EV-of-pairing helper + the EV-positive gate ═══════════════════════════════
+
+    /// A real fielded squad's caps: assemble a ranged+heal force at `energy` and read its `capabilities`.
+    fn squad_caps(ranged: u32, heal: u32, energy: u32) -> SquadCapabilities {
+        let req = RequiredForce { immune_struct_parts: ranged, heal_parts: heal, ..Default::default() };
+        assemble_force(&req, energy).expect("fieldable").capabilities(energy)
+    }
+
+    /// `pairing_p_win` REUSES the ADR 0031 decomposition: an undefended target the squad clears in the window
+    /// is a CERTAIN win (1.0); a heavily-defended target the squad can't out-heal is a near-certain LOSS.
+    #[test]
+    fn pairing_p_win_reuses_the_decomposition() {
+        let caps = squad_caps(10, 5, 5600);
+        let p = PairingParams::default();
+        // Undefended small core, ample window → certain win.
+        let undef = DefenseProfile { objective_hits: 5_000, ..Default::default() };
+        assert_eq!(pairing_p_win(caps, &undef, None, 1400, &p), 1.0, "undefended in-window = certain win");
+        // Safe mode → can never win.
+        let safe = DefenseProfile { objective_hits: 5_000, safe_mode: true, ..Default::default() };
+        assert_eq!(pairing_p_win(caps, &safe, None, 1400, &p), 0.0, "safe mode vetoes the win");
+        // Heavy tower fire the small squad can't out-heal → low survive probability.
+        let towered = DefenseProfile { towers: vec![TowerThreat { range_to_assault: 5, energy: 1000 }, TowerThreat { range_to_assault: 5, energy: 1000 }], objective_hits: 5_000, ..Default::default() };
+        assert!(pairing_p_win(caps, &towered, None, 1400, &p) < 0.5, "an out-healed squad has a low P(win)");
+    }
+
+    /// `pairing_ev` = P(win) · value_e − travel cost. A high-value winnable objective beats a low-value one;
+    /// a farther objective scores lower (the travel penalty replaces the proximity tie-break).
+    #[test]
+    fn pairing_ev_ranks_value_and_penalizes_travel() {
+        let caps = squad_caps(10, 5, 5600);
+        let p = PairingParams::default();
+        let undef = DefenseProfile { objective_hits: 5_000, ..Default::default() };
+        let near_high = pairing_ev(caps, &undef, None, 100_000.0, 1400, 1, &p);
+        let near_low = pairing_ev(caps, &undef, None, 1_000.0, 1400, 1, &p);
+        assert!(near_high > near_low, "higher value_e ⇒ higher EV");
+        let far_high = pairing_ev(caps, &undef, None, 100_000.0, 1400, 5, &p);
+        assert!(near_high > far_high, "the same objective farther away scores lower (travel penalty)");
+    }
+
+    /// THE EV-POSITIVE GATE + the dps=0 fix (ADR 0032 §EV-positive gate): a HARMLESS / LOW-VALUE objective is
+    /// NOT taken — its EV does not beat StayPut by the commit threshold. Using `value_e` for a dps=0 defend
+    /// objective (≈0 value) the reassign EV is ~0, far below a real current fight's EV → the gate holds.
+    #[test]
+    fn ev_positive_gate_rejects_a_harmless_low_value_objective() {
+        use crate::objective_value::{value_e, ObjectiveIntel, ObjectiveValueKind};
+        let caps = squad_caps(10, 5, 5600);
+        let p = PairingParams::default();
+        let undef = DefenseProfile { objective_hits: 5_000, ..Default::default() };
+
+        // A dps=0 harmless threat in an owned room: value_e ≈ 0 → the pairing EV is ~0 (minus travel).
+        let harmless_value = value_e(ObjectiveValueKind::Defend, &ObjectiveIntel { asset_value: 1_000_000.0, threat_danger: 0.0, ..Default::default() });
+        let ev_harmless = pairing_ev(caps, &undef, None, harmless_value, 1400, 1, &p);
+
+        // StayPut on a genuinely dangerous current objective (high value_e).
+        let dangerous_value = value_e(ObjectiveValueKind::Defend, &ObjectiveIntel { asset_value: 1_000_000.0, threat_danger: 300.0, ..Default::default() });
+        let ev_stay = pairing_ev(caps, &undef, None, dangerous_value, 1400, 0, &p);
+
+        let commit_ev_threshold = 1.0; // the ADR 0031 knob, reused
+        let should_reassign = quantize_ev(ev_harmless) - quantize_ev(ev_stay) > quantize_ev(commit_ev_threshold);
+        assert!(!should_reassign, "a harmless dps=0 objective must NOT pull the squad off a real fight (ev_harmless={ev_harmless}, ev_stay={ev_stay})");
+        assert!(ev_harmless <= 0.0, "a dps=0 defend objective has ~zero EV (the over-response fix): {ev_harmless}");
+    }
+
+    /// The gate must NOT starve REAL defense: a genuinely dangerous (high-dps) threat with a high value_e
+    /// IS taken over a StayPut on nothing (EV beats the threshold).
+    #[test]
+    fn ev_positive_gate_still_fields_a_genuinely_dangerous_threat() {
+        use crate::objective_value::{value_e, ObjectiveIntel, ObjectiveValueKind};
+        let caps = squad_caps(10, 5, 5600);
+        let p = PairingParams::default();
+        let undef = DefenseProfile { objective_hits: 5_000, ..Default::default() };
+        let dangerous_value = value_e(ObjectiveValueKind::Defend, &ObjectiveIntel { asset_value: 1_000_000.0, threat_danger: 300.0, ..Default::default() });
+        let ev_new = pairing_ev(caps, &undef, None, dangerous_value, 1400, 1, &p);
+        let ev_idle = 0.0; // StayPut on no objective is worth nothing
+        let commit_ev_threshold = 1.0;
+        let should_take = quantize_ev(ev_new) - quantize_ev(ev_idle) > quantize_ev(commit_ev_threshold);
+        assert!(should_take, "a dangerous threat must still field a defender (ev_new={ev_new})");
+    }
+
+    /// `quantize_ev` is stable + deterministic (ADR 0032 §Determinism / ADR 0020 §6).
+    #[test]
+    fn quantize_ev_is_stable() {
+        assert_eq!(quantize_ev(1.2344), 1234);
+        assert_eq!(quantize_ev(1.2345), quantize_ev(1.2345));
+        assert_eq!(quantize_ev(0.0), 0);
+    }
+
+    /// The pairing helpers are deterministic (run twice → identical).
+    #[test]
+    fn pairing_is_deterministic() {
+        let caps = squad_caps(8, 4, 4000);
+        let p = PairingParams::default();
+        let def = DefenseProfile { towers: vec![TowerThreat { range_to_assault: 10, energy: 500 }], objective_hits: 20_000, ..Default::default() };
+        let a = pairing_ev(caps, &def, Some(EnemyForce { dps: 30.0, ..Default::default() }), 50_000.0, 900, 3, &p);
+        let b = pairing_ev(caps, &def, Some(EnemyForce { dps: 30.0, ..Default::default() }), 50_000.0, 900, 3, &p);
+        assert_eq!(quantize_ev(a), quantize_ev(b));
     }
 }

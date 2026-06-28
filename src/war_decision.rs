@@ -201,6 +201,110 @@ where
     out
 }
 
+// ── observe_neighbours (ADR 0027 P0 — the LAST live-only glue, now a PURE kernel) ────────────────────────
+//
+// Before P0 the neighbour OBSERVATION decision lived inline in `war.rs::run_defense_scan`: the armed-check
+// (`hostile_warrants_defender`), the per-part danger estimate (Attack=30 / RangedAttack=10), the
+// visible/non-owned/within-leash filter, and the swarm→one-`ObservedRoom`-per-room fold were all done over
+// `game::*` reads — so the whole observation LAYER was un-sim-able (ADR 0027 "Update 2026-06-28 — sim-able
+// layers", line 343-358 / the P0 migration item line 324-328). This lifts that DECISION into a pure fn:
+// given the raw per-room hostile bodies + the visibility/ownership/distance facts, decide which rooms become
+// `ObservedRoom`s. `war.rs` keeps ONLY the raw `game::rooms()` → (room, hostile parts) read, then calls this
+// kernel, so the full observation decision is pure + deterministic + offline-provable (`run_v1_flow`).
+
+/// Whether a hostile creep warrants dispatching a defender (lifted from `war.rs::hostile_warrants_defender`,
+/// ADR 0027 P0). `RoomDynamicVisibilityData::hostile_creeps()` only flags Attack/RangedAttack/Work, so an
+/// enemy CLAIM creep neutralising a controller (carrying neither) slips through it — in a towerless RCL1-2
+/// room nothing else engages it, so it silently declaims us. This keys on body parts instead: armed creeps
+/// (Attack/RangedAttack), dismantlers (Work), controller-attackers (Claim), and healers sustaining them
+/// (Heal) are all worth a defender; pure scouts/haulers (only Move/Carry/Tough) are not. Pure.
+pub fn hostile_warrants_defender(parts: &[screeps::Part]) -> bool {
+    use screeps::Part;
+    parts
+        .iter()
+        .any(|p| matches!(p, Part::Attack | Part::RangedAttack | Part::Work | Part::Claim | Part::Heal))
+}
+
+/// The coarse danger estimate (summed DPS) over a hostile's live body parts (lifted from the war.rs inline
+/// fold, ADR 0027 P0): Attack=30, RangedAttack=10, everything else 0. The within-band tie-break currency
+/// (`Threat::danger` / `ObservedRoom::danger`), NOT the priority band (that comes from the asset boost). The
+/// caller passes only LIVE parts (`hits() > 0`). Pure + deterministic (a fold over a slice, no `HashMap`).
+pub fn estimate_danger(parts: &[screeps::Part]) -> f32 {
+    use screeps::Part;
+    parts
+        .iter()
+        .map(|p| match p {
+            Part::Attack => 30.0,
+            Part::RangedAttack => 10.0,
+            _ => 0.0,
+        })
+        .sum()
+}
+
+/// One RAW per-room observation the live scan gathered (the only non-pure step left in war.rs): a room, the
+/// hostile bodies seen in it (each a slice of LIVE parts), and the visibility/ownership/distance facts. The
+/// bot builds these from `game::rooms()` / room intel (excluding Source Keepers before this point); the
+/// harness builds synthetic ones. `R` is generic so the harness drives integer rooms.
+#[derive(Clone, Debug)]
+pub struct RawObservation<'a, R> {
+    /// The room the hostiles were seen in.
+    pub room: R,
+    /// One entry per hostile creep in the room — its LIVE body parts (`hits() > 0`). The kernel folds the
+    /// armed-check + the danger estimate over these (a swarm of N hostiles ⇒ N entries ⇒ ONE `ObservedRoom`).
+    pub hostile_bodies: &'a [Vec<screeps::Part>],
+    /// The room is VISIBLE this scan (the bot read it from `game::rooms()`); an invisible room is simply
+    /// absent from the input.
+    pub visible: bool,
+    /// We own this room (its threats are covered by the owned-room scan — never double-counted here).
+    pub is_owned: bool,
+    /// Chebyshev room-distance to the NEAREST owned room (`None` ⇒ no owned rooms → nothing to defend).
+    pub nearest_owned_dist: Option<u32>,
+}
+
+/// THE pure OBSERVATION decision (ADR 0027 P0). Given the raw per-room hostile observations + the leash,
+/// decide which rooms become a single `ObservedRoom` to feed [`neighbour_threats`]. A raw observation
+/// becomes ONE `ObservedRoom{room, armed, danger}` IFF it is VISIBLE, NON-OWNED, WITHIN the leash of the
+/// nearest owned room, and has ≥1 hostile that warrants a defender (the armed fold). A swarm of N hostiles in
+/// one room is ONE `ObservedRoom` (danger summed across the bodies), never N. Owned rooms (dist 0 / `is_owned`)
+/// are excluded — covered by the owned-room scan. Deterministic: a `Vec` in → a `Vec` out in the caller's
+/// stable input order; no `HashMap`, no `game::*`.
+pub fn observe_neighbours<R>(observations: &[RawObservation<R>], policy: DefensePolicy) -> Vec<ObservedRoom<R>>
+where
+    R: Copy,
+{
+    let mut out: Vec<ObservedRoom<R>> = Vec::new();
+
+    for obs in observations {
+        // VISIBLE + NON-OWNED only (the live filter). Owned rooms are covered by the owned-room scan.
+        if !obs.visible || obs.is_owned {
+            continue;
+        }
+        // Within the leash of the nearest owned room (and there IS an owned room). dist 0 = owned → excluded.
+        let Some(nearest) = obs.nearest_owned_dist else {
+            continue;
+        };
+        if nearest == 0 || nearest > policy.leash {
+            continue;
+        }
+        // Fold the armed-check + the danger estimate over the swarm (N bodies → one room verdict).
+        let mut armed = false;
+        let mut danger: f32 = 0.0;
+        for body in obs.hostile_bodies {
+            if hostile_warrants_defender(body) {
+                armed = true;
+            }
+            danger += estimate_danger(body);
+        }
+        // A room with only unarmed scouts/haulers warrants no defender.
+        if !armed {
+            continue;
+        }
+        out.push(ObservedRoom { room: obs.room, armed, danger });
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,5 +475,101 @@ mod tests {
         let observed = [obs((1, 0), true, 5.0), obs((-1, 0), true, 7.0), obs((2, 0), true, 3.0)];
         let out = neighbour_threats(&owned_rooms, &observed, DefensePolicy::default(), cheby);
         assert_eq!(out, neighbour_threats(&owned_rooms, &observed, DefensePolicy::default(), cheby));
+    }
+
+    // ── observe_neighbours (ADR 0027 P0 — the lifted OBSERVATION decision) ───────────────────────────────
+
+    use screeps::Part;
+
+    /// Build a `RawObservation` from owned `(0,0)`: compute the Chebyshev nearest-owned distance for `r`.
+    fn raw<'a>(r: Room, bodies: &'a [Vec<Part>], visible: bool, is_owned: bool) -> RawObservation<'a, Room> {
+        RawObservation {
+            room: r,
+            hostile_bodies: bodies,
+            visible,
+            is_owned,
+            nearest_owned_dist: Some(cheby((0, 0), r)),
+        }
+    }
+
+    /// The lifted armed-check: armed creeps (Attack/RangedAttack), dismantlers (Work), controller-attackers
+    /// (Claim), healers (Heal) all warrant a defender; pure scouts/haulers (Move/Carry/Tough) do not.
+    #[test]
+    fn observe_armed_check_matches_lifted_predicate() {
+        assert!(hostile_warrants_defender(&[Part::Attack, Part::Move]));
+        assert!(hostile_warrants_defender(&[Part::RangedAttack, Part::Move]));
+        assert!(hostile_warrants_defender(&[Part::Work, Part::Move]));
+        assert!(hostile_warrants_defender(&[Part::Claim, Part::Move])); // controller-attacker
+        assert!(hostile_warrants_defender(&[Part::Heal, Part::Move]));
+        assert!(!hostile_warrants_defender(&[Part::Move, Part::Carry]));
+        assert!(!hostile_warrants_defender(&[Part::Tough, Part::Move]));
+        assert!(!hostile_warrants_defender(&[]));
+    }
+
+    /// The lifted per-part danger estimate (Attack=30, RangedAttack=10, else 0).
+    #[test]
+    fn observe_danger_estimate_matches_lifted_fold() {
+        assert_eq!(estimate_danger(&[Part::Attack, Part::Attack, Part::Move]), 60.0);
+        assert_eq!(estimate_danger(&[Part::RangedAttack, Part::Move]), 10.0);
+        assert_eq!(estimate_danger(&[Part::Heal, Part::Work, Part::Claim, Part::Move]), 0.0);
+    }
+
+    /// An ARMED hostile in a VISIBLE, NON-OWNED, within-leash room becomes one `ObservedRoom` with the
+    /// folded armed flag + summed danger — the core P0 decision the live path used to do inline.
+    #[test]
+    fn observe_armed_visible_within_leash_becomes_one_observed_room() {
+        let attacker = vec![Part::Attack, Part::Attack, Part::Move]; // danger 60
+        let bodies = [attacker];
+        let observations = [raw((1, 0), &bodies, true, false)];
+        let out = observe_neighbours(&observations, DefensePolicy::default());
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0], obs((1, 0), true, 60.0));
+    }
+
+    /// UNARMED (scout-only), INVISIBLE, OWNED, and BEYOND-LEASH rooms each produce NO `ObservedRoom` — the
+    /// four filters the live path applied inline.
+    #[test]
+    fn observe_drops_unarmed_invisible_owned_and_beyond_leash() {
+        let scout = vec![Part::Move, Part::Carry];
+        let attacker = vec![Part::Attack, Part::Move];
+        let scout_bodies = [scout];
+        let attacker_bodies = [attacker];
+        let observations = [
+            raw((1, 0), &scout_bodies, true, false),    // unarmed → dropped
+            raw((1, 1), &attacker_bodies, false, false), // invisible → dropped
+            raw((0, 0), &attacker_bodies, true, true),   // owned → dropped (owned-room scan covers it)
+            raw((3, 0), &attacker_bodies, true, false),  // beyond default leash=2 → dropped
+        ];
+        let out = observe_neighbours(&observations, DefensePolicy::default());
+        assert!(out.is_empty(), "all four filters drop their room");
+    }
+
+    /// A SWARM of N armed hostiles in ONE room is ONE `ObservedRoom` (danger SUMMED across the bodies), never
+    /// N — so it produces one threat → one Secure downstream.
+    #[test]
+    fn observe_swarm_is_one_room_with_summed_danger() {
+        let bodies = vec![
+            vec![Part::Attack, Part::Move],        // 30
+            vec![Part::Attack, Part::Move],        // 30
+            vec![Part::RangedAttack, Part::Move],  // 10
+        ];
+        let observations = [raw((1, 0), &bodies, true, false)];
+        let out = observe_neighbours(&observations, DefensePolicy::default());
+        assert_eq!(out.len(), 1, "a swarm in one room is a single ObservedRoom");
+        assert_eq!(out[0], obs((1, 0), true, 70.0), "danger summed across the swarm");
+    }
+
+    /// Deterministic: same input → same output, in the caller's stable order.
+    #[test]
+    fn observe_neighbours_is_deterministic() {
+        let a = vec![Part::Attack, Part::Move];
+        let ab = [a];
+        let observations = [
+            raw((1, 0), &ab, true, false),
+            raw((-1, 0), &ab, true, false),
+            raw((2, 0), &ab, true, false),
+        ];
+        let out = observe_neighbours(&observations, DefensePolicy::default());
+        assert_eq!(out, observe_neighbours(&observations, DefensePolicy::default()));
     }
 }

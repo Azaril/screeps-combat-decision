@@ -89,6 +89,11 @@ pub mod claim_pacing;
 /// asset-priority boost + over-extension leash). war.rs is a thin adapter; the harness drives the same kernel.
 pub mod war_decision;
 
+/// Pure energy-equivalent objective valuation (`value_e`) — the cross-goal EV currency (ADR 0032 v1.1).
+/// A DEFENSE objective's value scales with the threat's danger (the dps=0 over-response fix); farm/denial
+/// kinds map to their income/ROI/denial. Feeds the EV-of-pairing helper + the per-squad assignment gate.
+pub mod objective_value;
+
 use screeps::local::LocalCostMatrix;
 use screeps::{Direction, Part, Position, RawObjectId, RoomCoordinate, RoomName, RoomXY, StructureType};
 
