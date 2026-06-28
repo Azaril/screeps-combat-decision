@@ -708,6 +708,7 @@ pub fn decide_movement(view: &CombatView) -> Vec<CombatIntent> {
     match view.squad.movement {
         SquadMovement::Advance { goal, range } => return move_to_or_hold(me.pos, goal, range),
         SquadMovement::Kite { goal } => return move_to_or_hold(me.pos, goal, 0),
+        SquadMovement::Drain { goal, standoff_range } => return move_to_drain_standoff(me.pos, goal, standoff_range),
         SquadMovement::Hold => {
             // (4) Managed squad, "hold optimal": rejoin if strayed past K, else hold. A solo/unmanaged
             //     creep (cohesion_radius 0) has no squad goal → fall through to the per-creep fallback.
@@ -728,6 +729,22 @@ pub fn decide_movement(view: &CombatView) -> Vec<CombatIntent> {
 fn move_to_or_hold(from: Position, goal: Position, range: u8) -> Vec<CombatIntent> {
     if from.get_range_to(goal) > range as u32 {
         vec![CombatIntent::MoveTo { target: goal, range }]
+    } else {
+        Vec::new()
+    }
+}
+
+/// ADR 0031 #39 — DRAIN standoff movement: hold exactly at `standoff_range` of the nest. A member farther
+/// out closes to the band (`MoveTo` range `standoff_range`); a member that has drifted INSIDE the band
+/// (closer than the standoff → into the steeper tower falloff) steps back OUT to it (`Flee` from the nest,
+/// `range = standoff_range`); one already in-band holds. This keeps the tank at the falloff range where the
+/// heal sustains while the towers bleed, rather than charging into the optimal-range tower dps.
+fn move_to_drain_standoff(from: Position, goal: Position, standoff_range: u8) -> Vec<CombatIntent> {
+    let r = from.get_range_to(goal);
+    if r > standoff_range as u32 {
+        vec![CombatIntent::MoveTo { target: goal, range: standoff_range }]
+    } else if r < standoff_range as u32 {
+        vec![CombatIntent::Flee { from: vec![goal], range: standoff_range }]
     } else {
         Vec::new()
     }
@@ -840,6 +857,12 @@ pub enum SquadMovement {
     Advance { goal: Position, range: u8 },
     /// Kite/flee the block to a pathfinding-scored safe + cohesive + value-preserving `goal` tile.
     Kite { goal: Position },
+    /// ADR 0031 #39 — DRAIN standoff: hold the block at `standoff_range` of `goal` (the tower nest /
+    /// objective), the minimum tower-falloff range at which the squad's heal sustains against the falloff
+    /// tower dps. The tank soaks at the standoff while the finite towers bleed energy; once they're dry the
+    /// squad layer drops this for the normal breach `Advance`. A member outside the band closes to it; a
+    /// member already at/inside it holds (no further closing into the optimal-range tower dps).
+    Drain { goal: Position, standoff_range: u8 },
     /// Hold position (already optimal / nothing to move toward this tick).
     #[default]
     Hold,
@@ -909,6 +932,15 @@ pub struct SquadView<'a> {
     /// lost for N ticks"). With `Destroy` intent + a non-winning balance this flips the squad to
     /// `Retreating` so it doesn't burn `CREEP_LIFE_TIME` on an un-closable standoff. Ignored under `Hold`.
     pub enemy_stalled: bool,
+    /// ADR 0031 #39 — this squad is fielded in a TOWER-DRAIN stance (the oracle picked
+    /// [`AssaultMode::Drain`](crate::force_sizing::AssaultMode::Drain)): a TOUGH+HEAL tank soaks the
+    /// FINITE-energy towers from the falloff standoff until they run dry, then the squad advances and
+    /// breaches the dead base. When set, [`decide_squad`] (a) does NOT count the finite towers as
+    /// irremovable in the unwinnable veto **while the drain sustains** (heal ≥ falloff tower dps), so it
+    /// holds the standoff instead of retreating, and (b) once the live towers are dry, drops the standoff
+    /// and uses the normal breach/engage advance. **Scoped to this flag** — a breach/normal-engage squad
+    /// (`drain_stance == false`) takes the byte-unchanged winnability + retreat path. Default `false`.
+    pub drain_stance: bool,
 }
 
 /// What a squad intends toward the enemy creeps (drives close-to-finish vs hold-the-standoff).
@@ -1006,6 +1038,94 @@ struct EngageAssessment {
     enemy_strength: u64,
 }
 
+/// ADR 0031 #39 — the live hostile FINITE-energy towers (energized now, but with a bounded energy pool
+/// that runs dry under sustained fire — 10 energy/shot). The drain bleeds exactly these to 0. A tower with
+/// `u32::MAX`-ish energy (the "effectively infinite" eval/foreman fixtures use 100_000) is NOT a drain
+/// target — it never empties on a fight's timescale, so the veto must still treat it as irremovable.
+fn finite_drain_towers(structures: &[CombatStructureDto]) -> Vec<&CombatStructureDto> {
+    use screeps_combat_engine::constants::TOWER_ENERGY_COST;
+    structures
+        .iter()
+        .filter(|s| {
+            s.structure_type == StructureType::Tower
+                && s.ownership == Ownership::Hostile
+                && s.hits > 0
+                && s.energy >= TOWER_ENERGY_COST
+                && (s.energy as u64) < DRAIN_INFINITE_TOWER_ENERGY
+        })
+        .collect()
+}
+
+/// Energy at/above which a tower is treated as "infinite" (never drains on a fight's timescale) — the
+/// foreman/eval fixtures use 100_000 to mean "always firing". A drain only makes sense below this.
+const DRAIN_INFINITE_TOWER_ENERGY: u64 = 50_000;
+
+/// ADR 0031 #39 — the SUSTAIN MARGIN the drain standoff requires: the squad's heal/tick must beat the
+/// falloff tower dps by this factor (per-mille) before a range counts as a sustainable standoff. Mirrors
+/// `force_sizing::HOLD_MARGIN` — a break-even standoff (heal == dps, net 0) is fragile to positioning
+/// jitter and degrades as front parts die, so we demand headroom (heal ≥ 1.2× dps). Integer per-mille
+/// keeps the comparison bit-deterministic (no float).
+const DRAIN_SUSTAIN_MARGIN_PERMILLE: u64 = 1200;
+
+/// ADR 0031 #39 — the minimum tower-falloff standoff range at which the squad's `heal_out` (HP/tick) beats
+/// the AGGREGATE finite-tower falloff dps from the nest WITH the sustain margin. The tank holds here so the
+/// heal out-paces the damage (with headroom) while the towers bleed. Returns `None` if there are no finite
+/// towers, or if no range in `[OPTIMAL, FALLOFF]` sustains (the falloff floor at range ≥20 still out-damages
+/// our heal → drain infeasible — defer to a bigger force).
+fn drain_standoff_range(towers: &[&CombatStructureDto], nest: Position, heal_out: u64) -> Option<u8> {
+    use screeps_combat_engine::constants::{TOWER_FALLOFF_RANGE, TOWER_OPTIMAL_RANGE};
+    if towers.is_empty() {
+        return None;
+    }
+    // Falloff is monotonic non-increasing in range, so scan from the optimal edge outward and take the
+    // FIRST (closest) range that sustains — minimal standoff = maximal drain pressure (the towers stay in
+    // our weapon/soak range longest, and dismantle reach after the drain is shortest).
+    for r in TOWER_OPTIMAL_RANGE..=TOWER_FALLOFF_RANGE {
+        let dps: u64 = towers
+            .iter()
+            .map(|t| {
+                // Damage a tower deals to a tank standing `r` from the nest. Use the tower's own range to
+                // the nest as the offset so an off-centre tower's falloff is honoured (conservative: a
+                // tank at `r` from the nest may be slightly nearer/farther from each tower; the nest is the
+                // aggregate frame the standoff is held against).
+                let tank_range = (r as i32 - nest.get_range_to(t.pos) as i32).unsigned_abs().max(r);
+                screeps_combat_engine::damage::tower_attack_damage_at_range(tank_range) as u64
+            })
+            .sum();
+        // heal_out ≥ dps × margin (rearranged to integer: heal_out × 1000 ≥ dps × margin_permille).
+        if heal_out.saturating_mul(1000) >= dps.saturating_mul(DRAIN_SUSTAIN_MARGIN_PERMILLE) {
+            return Some(r as u8);
+        }
+    }
+    None
+}
+
+/// ADR 0031 #39 — does a drain SUSTAIN against these structures' finite towers given `heal_out` (HP/tick)?
+/// True iff there is ≥1 finite tower AND a falloff standoff range exists where the heal out-paces the
+/// aggregate falloff dps. This is the predicate the unwinnable-veto exception is scoped on.
+fn drain_sustains(structures: &[CombatStructureDto], heal_out: u64) -> bool {
+    let towers = finite_drain_towers(structures);
+    if towers.is_empty() {
+        return false;
+    }
+    let nest = tower_nest_centroid(&towers);
+    drain_standoff_range(&towers, nest, heal_out).is_some()
+}
+
+/// The centroid of a set of towers (the drain's standoff frame). Deterministic (integer mean over the
+/// Vec-ordered towers).
+fn tower_nest_centroid(towers: &[&CombatStructureDto]) -> Position {
+    let n = towers.len().max(1) as u32;
+    let sx = towers.iter().map(|t| t.pos.x().u8() as u32).sum::<u32>() / n;
+    let sy = towers.iter().map(|t| t.pos.y().u8() as u32).sum::<u32>() / n;
+    let room = towers[0].pos.room_name();
+    Position::new(
+        RoomCoordinate::new(sx.clamp(0, 49) as u8).expect("clamped 0..=49"),
+        RoomCoordinate::new(sy.clamp(0, 49) as u8).expect("clamped 0..=49"),
+        room,
+    )
+}
+
 /// Assess engage-vs-retreat by Lanchester fighting strength over the **killable** enemy force, plus the
 /// hard vetoes the kill calc surfaces (ADR 0020 §8.2): out-healed/shielded enemies can't be cleared, and
 /// energized hostile towers + unkillable creeps are irremovable damage — if that exceeds our heal
@@ -1044,8 +1164,18 @@ fn assess_engage(view: &SquadView, centroid: Option<Position>) -> EngageAssessme
             .map(|t| screeps_combat_engine::damage::tower_attack_damage_at_range(ctr.get_range_to(t.pos)) as u64)
             .sum()
     });
+    // ADR 0031 #39 DRAIN exception — SCOPED to `drain_stance` (a breach/normal squad takes the byte-
+    // unchanged veto below). When this squad is fielded to drain AND the towers are FINITE-energy (they
+    // WILL run dry) AND the squad's heal sustains against the FALLOFF tower dps at the drain standoff
+    // (heal ≥ falloff dps), the towers are NOT irremovable — they bleed to 0 under the soak, then the
+    // squad breaches the dead base. So we drop their `tower_dps` from the unwinnable accounting (we hold
+    // the standoff instead of retreating). If the drain does NOT sustain (heal < falloff dps) or the
+    // towers are infinite, the standard veto applies (no free pass). The non-tower irremovable damage
+    // (`unkillable_dps`) is unaffected — a creep we can't out-heal still vetoes.
+    let drain_exempt_tower_dps = view.drain_stance && drain_sustains(view.structures, our_heal);
+    let counted_tower_dps = if drain_exempt_tower_dps { 0 } else { tower_dps };
     // We bleed out if damage we can neither kill nor out-heal is positive.
-    let unwinnable = unkillable_dps + tower_dps > our_heal;
+    let unwinnable = unkillable_dps + counted_tower_dps > our_heal;
 
     // No enemy creep deals damage (e.g. a STRUCTURE SIEGE — dismantle/raze, whose offense isn't
     // melee/ranged) ⇒ there's no creep attrition race to lose, so the Lanchester μ doesn't apply;
@@ -1159,13 +1289,40 @@ pub fn decide_squad(view: &SquadView) -> SquadDecision {
     // (ranged 3, else 1); retreat/idle hold. `decide_squad_with_pathing` overrides engage-vs-melee +
     // retreat with the pathfinding-scored kite goal.
     let squad_has_ranged = view.members.iter().any(|m| m.has_ranged);
-    let movement = match (state, focus) {
+    let mut movement = match (state, focus) {
         (SquadOrderState::Engaged, Some(f)) => SquadMovement::Advance {
             goal: f.pos,
             range: if squad_has_ranged { 3 } else { 1 },
         },
         _ => SquadMovement::Hold,
     };
+
+    // ADR 0031 #39 DRAIN — standoff vs DRY→advance. SCOPED to `drain_stance` (a breach/normal squad keeps
+    // the Advance above byte-unchanged). While the live finite towers are NOT yet dry AND the drain
+    // sustains, override the directive with a `Drain` standoff at the falloff range where the heal
+    // out-paces the tower dps — the tank soaks there while the towers bleed energy, instead of charging
+    // to weapon range into the optimal-range tower dps. Once Σ live finite-tower energy == 0 (drained),
+    // this drops away and the squad uses the normal Advance/breach directive above to close + kill.
+    if view.drain_stance && state != SquadOrderState::Retreating {
+        let drain_towers = finite_drain_towers(view.structures);
+        let our_heal: u64 = view
+            .members
+            .iter()
+            .filter(|m| m.hits > 0)
+            .map(|m| m.heal_power as u64 * screeps_combat_engine::constants::HEAL_POWER as u64)
+            .sum();
+        if !drain_towers.is_empty() {
+            let nest = tower_nest_centroid(&drain_towers);
+            if let Some(standoff) = drain_standoff_range(&drain_towers, nest, our_heal) {
+                // Towers still live + drain sustains → hold the standoff (drain phase).
+                movement = SquadMovement::Drain { goal: nest, standoff_range: standoff };
+            }
+            // else: drain no longer sustains at any falloff range (shouldn't happen mid-drain since the
+            // veto exception gated entry) → leave the normal directive (let the HP floor / veto govern).
+        }
+        // drain_towers empty ⇒ all finite towers are dry → keep the normal Advance/breach directive (the
+        // DRY→ADVANCE transition): the squad closes on the dead base and breaches it.
+    }
 
     let heal_assignments = assign_heals(view.members, &kite_threats(view.hostiles), &kite_towers(view.structures));
     // Damage spill (ADR 0020 §4.2): per-member focus so combined fire doesn't over-damage one creep.
@@ -1504,6 +1661,16 @@ pub fn decide_squad_with_pathing(
         None => return decision, // no positioned members → nothing to kite
     };
     let room = centroid.room_name();
+
+    // ADR 0031 #39 DRAIN phase — when `decide_squad` set a `Drain` standoff (drain stance + live finite
+    // towers that the heal sustains against), the squad HOLDS the falloff standoff and the per-creep
+    // `decide_movement`/`decide_combat` handle the standoff step + self-heal. Bypass the kite/engage
+    // positioning + the EV kernel (which would otherwise re-aim the tank into the towers or emit goals):
+    // the drain directive governs. Once the towers run dry `decide_squad` no longer emits `Drain` and the
+    // normal Advance/breach path resumes (this guard is skipped).
+    if matches!(decision.movement, SquadMovement::Drain { .. }) {
+        return decision;
+    }
 
     // O3 — layered dismantle: if the focus is a structure shielded by a rampart/wall, redirect to the
     // breach blocker on the path (break it first) and re-aim an Advance at it. Runs only in the
@@ -2257,7 +2424,7 @@ mod tests {
         hostiles: &'a [CombatCreepDto],
         current_state: SquadOrderState,
     ) -> SquadView<'a> {
-        SquadView { members, hostiles, structures: &[], retreat_threshold: 0.3, current_state, enemy_safe_mode: false, engage_objective: EngageObjective::Destroy, enemy_stalled: false }
+        SquadView { members, hostiles, structures: &[], retreat_threshold: 0.3, current_state, enemy_safe_mode: false, engage_objective: EngageObjective::Destroy, enemy_stalled: false, drain_stance: false }
     }
 
     #[test]
@@ -2320,7 +2487,7 @@ mod tests {
             structure(26, 25, StructureType::Spawn, Ownership::Hostile),
         ];
         let mk = |members: &[SquadMemberView], st| {
-            decide_squad(&SquadView { members, hostiles: &[], structures: &base, retreat_threshold: 0.3, current_state: st, enemy_safe_mode: false, engage_objective: EngageObjective::Destroy, enemy_stalled: false }).state
+            decide_squad(&SquadView { members, hostiles: &[], structures: &base, retreat_threshold: 0.3, current_state: st, enemy_safe_mode: false, engage_objective: EngageObjective::Destroy, enemy_stalled: false, drain_stance: false }).state
         };
         // 14 HEAL ×12 = 168 > 150 tower → sustained, no loss → siege the base.
         assert_eq!(mk(&[tank, healer(14)], SquadOrderState::Engaged), SquadOrderState::Engaged, "out-heal the towers → dismantle, don't retreat");
@@ -2346,7 +2513,7 @@ mod tests {
             ]
         };
         let state = |members: &[SquadMemberView]| {
-            decide_squad(&SquadView { members, hostiles: &[], structures: &base, retreat_threshold: 0.3, current_state: SquadOrderState::Engaged, enemy_safe_mode: false, engage_objective: EngageObjective::Destroy, enemy_stalled: false }).state
+            decide_squad(&SquadView { members, hostiles: &[], structures: &base, retreat_threshold: 0.3, current_state: SquadOrderState::Engaged, enemy_safe_mode: false, engage_objective: EngageObjective::Destroy, enemy_stalled: false, drain_stance: false }).state
         };
         // Sized to out-heal with margin (17 HEAL ×12 = 204 ≥ 150 × 1.3 = 195): holds at full HP …
         assert_eq!(state(&squad(2000, 17)), SquadOrderState::Engaged, "margin-sized squad holds at full HP");
@@ -2358,13 +2525,114 @@ mod tests {
         assert_eq!(state(&squad(2000, 10)), SquadOrderState::Retreating, "under-sized (can't out-heal) → retreat");
     }
 
+    /// A hostile tower at `(x,y)` with explicit `energy` (the `structure` helper hardcodes 1000).
+    fn tower_e(x: u8, y: u8, energy: u32) -> CombatStructureDto {
+        CombatStructureDto { pos: pos(x, y), structure_type: StructureType::Tower, hits: 3000, hits_max: 3000, ownership: Ownership::Hostile, energy }
+    }
+
+    #[test]
+    fn multi_tower_point_blank_vetoes_a_breach_squad_but_a_drain_holds() {
+        // ADR 0031 #39 P1 — the CRUX of the veto exception, SCOPED to the drain stance.
+        // A nest of FOUR finite-energy towers (1500 each) at the core. A TOUGH+HEAL tank + healers sized
+        // to ~600 heal/tick. At point-blank (≤5) the four towers deal 4×600 = 2400/tick — our 600 heal
+        // can't out-heal it, so a BREACH squad is vetoed (unwinnable → retreat). But the towers are
+        // FINITE: a DRAIN squad stands off at the falloff range where 4× falloff dps ≤ our heal and bleeds
+        // them dry. The exception must fire ONLY for the drain stance.
+        let towers = vec![tower_e(24, 24, 1500), tower_e(26, 24, 1500), tower_e(24, 26, 1500), tower_e(26, 26, 1500)];
+        let spawn = vec![structure(25, 25, StructureType::Spawn, Ownership::Hostile)];
+        let structures: Vec<CombatStructureDto> = towers.into_iter().chain(spawn).collect();
+        // Tank near the nest (point-blank) + two strong healers. Aggregate heal = 2×40 ×12 = 960/tick,
+        // which beats the four-tower falloff FLOOR (4×150 = 600) with the 1.2× sustain margin (600×1.2 =
+        // 720 ≤ 960) → a standoff exists. Placed adjacent to the nest so the point-blank veto sees the full
+        // optimal-range tower dps when NOT draining (the breach case).
+        let members = vec![
+            SquadMemberView { hits: 6000, hits_max: 6000, pos: Some(pos(25, 22)), ..Default::default() }, // TOUGH tank
+            SquadMemberView { hits: 2000, hits_max: 2000, heal_power: 40, pos: Some(pos(25, 21)), ..Default::default() },
+            SquadMemberView { hits: 2000, hits_max: 2000, heal_power: 40, pos: Some(pos(24, 21)), ..Default::default() },
+        ];
+        let mk = |drain: bool| SquadView {
+            members: &members,
+            hostiles: &[],
+            structures: &structures,
+            retreat_threshold: 0.3,
+            current_state: SquadOrderState::Engaged,
+            enemy_safe_mode: false,
+            engage_objective: EngageObjective::Destroy,
+            enemy_stalled: false,
+            drain_stance: drain,
+        };
+        // BREACH squad (drain_stance=false): the point-blank multi-tower dps is irremovable + out-heals us
+        // → unwinnable veto → retreat. This is TODAY's behaviour (the P0 baseline at the tactic layer).
+        assert_eq!(decide_squad(&mk(false)).state, SquadOrderState::Retreating, "breach squad is vetoed by the point-blank tower nest");
+        // DRAIN squad (drain_stance=true): the finite towers will run dry + the drain sustains at the
+        // falloff standoff → the veto exception fires → NOT retreating, and the movement is a Drain standoff.
+        let d = decide_squad(&mk(true));
+        assert_ne!(d.state, SquadOrderState::Retreating, "drain squad is NOT vetoed — it holds the standoff");
+        match d.movement {
+            SquadMovement::Drain { standoff_range, .. } => {
+                assert!((5..=20).contains(&standoff_range), "standoff is in the tower-falloff band, got {standoff_range}");
+            }
+            other => panic!("drain squad should emit a Drain standoff directive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drain_exception_is_scoped_infinite_towers_still_veto() {
+        // The exception must NOT fire for "infinite" towers (100_000 energy = always-firing fixtures) —
+        // they never run dry, so even a drain stance is vetoed (no free pass for a non-drainable nest).
+        let structures = vec![
+            tower_e(24, 24, 100_000),
+            tower_e(26, 24, 100_000),
+            tower_e(24, 26, 100_000),
+            tower_e(26, 26, 100_000),
+            structure(25, 25, StructureType::Spawn, Ownership::Hostile),
+        ];
+        let members = vec![
+            SquadMemberView { hits: 6000, hits_max: 6000, pos: Some(pos(25, 22)), ..Default::default() },
+            SquadMemberView { hits: 2000, hits_max: 2000, heal_power: 25, pos: Some(pos(25, 21)), ..Default::default() },
+            SquadMemberView { hits: 2000, hits_max: 2000, heal_power: 25, pos: Some(pos(24, 21)), ..Default::default() },
+        ];
+        let view = SquadView {
+            members: &members, hostiles: &[], structures: &structures, retreat_threshold: 0.3,
+            current_state: SquadOrderState::Engaged, enemy_safe_mode: false,
+            engage_objective: EngageObjective::Destroy, enemy_stalled: false, drain_stance: true,
+        };
+        assert_eq!(decide_squad(&view).state, SquadOrderState::Retreating, "infinite towers never drain → still vetoed even in a drain stance");
+    }
+
+    #[test]
+    fn drain_dry_towers_resume_the_normal_advance() {
+        // The DRY→ADVANCE transition: once the finite towers are at 0 energy (drained), the Drain standoff
+        // drops and the squad uses the normal Advance/breach directive to close + kill the dead base.
+        let structures = vec![
+            tower_e(24, 24, 0), // drained
+            tower_e(26, 24, 0),
+            structure(25, 25, StructureType::Spawn, Ownership::Hostile),
+        ];
+        let members = vec![
+            SquadMemberView { hits: 6000, hits_max: 6000, pos: Some(pos(25, 22)), dismantle_power: 30, ..Default::default() },
+            SquadMemberView { hits: 2000, hits_max: 2000, heal_power: 25, pos: Some(pos(25, 21)), ..Default::default() },
+        ];
+        let view = SquadView {
+            members: &members, hostiles: &[], structures: &structures, retreat_threshold: 0.3,
+            current_state: SquadOrderState::Engaged, enemy_safe_mode: false,
+            engage_objective: EngageObjective::Destroy, enemy_stalled: false, drain_stance: true,
+        };
+        let d = decide_squad(&view);
+        assert_ne!(d.state, SquadOrderState::Retreating, "dry towers → engageable");
+        // Focus falls back to the hostile structure (the spawn / dead towers); movement is a normal Advance
+        // toward it (NOT a Drain standoff — the drain phase is over).
+        assert!(!matches!(d.movement, SquadMovement::Drain { .. }), "no Drain standoff once the towers are dry");
+        assert!(matches!(d.movement, SquadMovement::Advance { .. }), "resumes the normal Advance/breach, got {:?}", d.movement);
+    }
+
     #[test]
     fn safe_mode_vetoes_engagement() {
         // A trivially-winnable matchup, but the enemy room is in safe mode → our combat is nullified →
         // never engage (ADR 0020 §8 engage-veto).
         let members = vec![ranged_member_at(700, 700, 25, 25)];
         let hostiles = vec![creep(1, 26, 25, 100, &[(Part::Attack, 1)])];
-        let view = SquadView { members: &members, hostiles: &hostiles, structures: &[], retreat_threshold: 0.3, current_state: SquadOrderState::Engaged, enemy_safe_mode: true, engage_objective: EngageObjective::Destroy, enemy_stalled: false };
+        let view = SquadView { members: &members, hostiles: &hostiles, structures: &[], retreat_threshold: 0.3, current_state: SquadOrderState::Engaged, enemy_safe_mode: true, engage_objective: EngageObjective::Destroy, enemy_stalled: false, drain_stance: false };
         assert_eq!(decide_squad(&view).state, SquadOrderState::Retreating, "safe mode nullifies our combat → never engage");
     }
 
@@ -2383,6 +2651,7 @@ mod tests {
             enemy_safe_mode: false,
             engage_objective: EngageObjective::Destroy,
             enemy_stalled: false,
+            drain_stance: false,
         };
         let d = decide_squad(&view);
         assert_eq!(d.state, SquadOrderState::Engaged);
@@ -2485,6 +2754,7 @@ mod tests {
             enemy_safe_mode: false,
             engage_objective: EngageObjective::Destroy,
             enemy_stalled: false,
+            drain_stance: false,
         };
 
         let d = decide_squad_with_pathing(&view, None, kite::SquadTacticParams::default(), &mut cb, kite::MAX_KITE_OPS);
@@ -2510,6 +2780,7 @@ mod tests {
             enemy_safe_mode: false,
             engage_objective: EngageObjective::Destroy,
             enemy_stalled: false,
+            drain_stance: false,
         };
         let mut cb = |_r| Some(LocalCostMatrix::new());
         let d = decide_squad_with_pathing(&view, None, kite::SquadTacticParams::default(), &mut cb, kite::MAX_KITE_OPS);
@@ -2544,7 +2815,7 @@ mod tests {
         // arbitrary tie resolution).
         let members = vec![ranged_member_at(700, 700, 25, 25), ranged_member_at(700, 700, 26, 25)];
         let hostiles = vec![creep(9, 24, 25, 600, &[(Part::Attack, 6), (Part::Move, 6)])];
-        let view = SquadView { members: &members, hostiles: &hostiles, structures: &[], retreat_threshold: 0.3, current_state: SquadOrderState::Engaged, enemy_safe_mode: false, engage_objective: EngageObjective::Destroy, enemy_stalled: false };
+        let view = SquadView { members: &members, hostiles: &hostiles, structures: &[], retreat_threshold: 0.3, current_state: SquadOrderState::Engaged, enemy_safe_mode: false, engage_objective: EngageObjective::Destroy, enemy_stalled: false, drain_stance: false };
         let mut cb1 = |_r| Some(LocalCostMatrix::new());
         let mut cb2 = |_r| Some(LocalCostMatrix::new());
         let a = decide_squad_with_pathing(&view, None, kite::SquadTacticParams::default(), &mut cb1, kite::MAX_KITE_OPS);
@@ -2568,6 +2839,7 @@ mod tests {
             enemy_safe_mode: false,
             engage_objective: EngageObjective::Destroy,
             enemy_stalled: false,
+            drain_stance: false,
         });
         // The healer (idx 1) is assigned to the wounded attacker (idx 0), adjacent → 12/part.
         assert_eq!(d.heal_assignments.len(), 1);
@@ -2581,10 +2853,10 @@ mod tests {
     fn assign_heals_empty_when_no_healers_or_no_wounded() {
         // No healers.
         let m1 = vec![ranged_member_at(100, 700, 25, 25)];
-        assert!(decide_squad(&SquadView { members: &m1, hostiles: &[], structures: &[], retreat_threshold: 0.3, current_state: SquadOrderState::Moving, enemy_safe_mode: false, engage_objective: EngageObjective::Destroy, enemy_stalled: false }).heal_assignments.is_empty());
+        assert!(decide_squad(&SquadView { members: &m1, hostiles: &[], structures: &[], retreat_threshold: 0.3, current_state: SquadOrderState::Moving, enemy_safe_mode: false, engage_objective: EngageObjective::Destroy, enemy_stalled: false, drain_stance: false }).heal_assignments.is_empty());
         // A healer but everyone full + no damage taken.
         let m2 = vec![ranged_member_at(700, 700, 25, 25), healer_at(600, 600, 5, 26, 25)];
-        assert!(decide_squad(&SquadView { members: &m2, hostiles: &[], structures: &[], retreat_threshold: 0.3, current_state: SquadOrderState::Moving, enemy_safe_mode: false, engage_objective: EngageObjective::Destroy, enemy_stalled: false }).heal_assignments.is_empty());
+        assert!(decide_squad(&SquadView { members: &m2, hostiles: &[], structures: &[], retreat_threshold: 0.3, current_state: SquadOrderState::Moving, enemy_safe_mode: false, engage_objective: EngageObjective::Destroy, enemy_stalled: false, drain_stance: false }).heal_assignments.is_empty());
     }
 
     #[test]
@@ -2599,6 +2871,7 @@ mod tests {
             enemy_safe_mode: false,
             engage_objective: EngageObjective::Destroy,
             enemy_stalled: false,
+            drain_stance: false,
         };
         let mut cb = |_r| Some(LocalCostMatrix::new());
         let d = decide_squad_with_pathing(&view, None, kite::SquadTacticParams::default(), &mut cb, kite::MAX_KITE_OPS);
