@@ -3,7 +3,7 @@
 //! offline lifecycle harness share ONE implementation (parity, like `decide_squad` / `lifecycle`). JS-free
 //! value-type math over `screeps::Position` — no `game::*`, no ECS.
 
-use screeps::Position;
+use screeps::{Position, RoomCoordinate, RoomName};
 
 /// Cohesion quorum: this fraction of the *living* (positioned) squad must be gathered near the boundary
 /// before the box crosses into a contested room, so fast creeps don't trickle in one at a time.
@@ -108,6 +108,106 @@ pub fn should_hold_at_boundary(member_positions: &[Option<Position>], virtual_po
         .count();
     let near_edge_quorum = near_edge as f32 >= living_count as f32 * STRICT_QUORUM_RATIO;
     !(quorum_met && near_edge_quorum)
+}
+
+// ─── Shared rally / gather-quorum kernel (ADR 0028 K0 movement-stall fix) ───────────────────────────
+//
+// DECOUPLE long-distance TRAVEL from FORMATION (operator-directed, 2026-06-28). A squad spawns from many
+// homes (multi-home spawn preserved), each member paths SOLO to ONE shared rally Position near the target,
+// and only ASSAULTS in formation once a quorum has gathered there. The gather quorum below is the SINGLE
+// source of truth shared by the live bot AND the agent-sim (the sim's `near_anchor >= ADVANCE_QUORUM`
+// assault gate IS this kernel) so the two cohesion paths can never drift again — that drift was the root
+// cause of the frozen-formation-anchor stall.
+
+/// Cohesion radius (Chebyshev) within which a member counts as GATHERED at the shared rally — the loose
+/// staging cluster, matching the sim's `LOOSE_RADIUS`. Wide enough that members don't have to stack on one
+/// tile (the sim has no shoving), tight enough that the bloc departs together.
+pub const RALLY_GATHER_RADIUS: u32 = 3;
+
+/// Fraction of the LIVING roster that must be gathered at the shared rally before a CONTESTED assault
+/// advances — the sim's `ADVANCE_QUORUM`. Lifted here so the bot and the sim share one constant.
+pub const GATHER_QUORUM_RATIO: f32 = 0.75;
+
+/// How many living (positioned) members are gathered within `radius` of the shared `rally` point — the
+/// staging-cluster count. Pure value-math over `Position` (Chebyshev range), no terrain. The instrument
+/// the gather quorum is measured against; the sim measures the identical thing against its anchor.
+pub fn members_gathered_at(member_positions: &[Option<Position>], rally: Position, radius: u32) -> usize {
+    member_positions.iter().filter_map(|p| *p).filter(|p| p.get_range_to(rally) <= radius).count()
+}
+
+/// THE UNIFIED gather-quorum kernel (movement-stall fix). Returns whether enough living members have
+/// converged on the shared `rally` point to transition from SOLO travel to a grouped ASSAULT.
+///
+/// Both the live bot AND the agent-sim call this so their cohesion logic cannot drift (the root-cause
+/// regression). Semantics:
+/// - `requested_slots == 0` (unknown roster) ⇒ do not gate (legacy parity).
+/// - `uncontested` (a proven-clear target — nothing shoots back) ⇒ a MIN-VIABLE quorum may trickle in:
+///   even ONE gathered member is enough (an oversized force advancing as members arrive is harmless), and
+///   no fighter is required (a lone dismantler can raze an undefended core).
+/// - CONTESTED ⇒ require the (near-)full roster gathered at the rally (`GATHER_QUORUM_RATIO` of the LIVING
+///   members, floored so a lone member never solo-assaults a defended room) AND at least one FIGHTER
+///   present (no healer-only assault). A defended room must be entered together or the trickle is picked off.
+pub fn gather_quorum_met(
+    member_positions: &[Option<Position>],
+    rally: Position,
+    requested_slots: usize,
+    uncontested: bool,
+    has_fighter_gathered: bool,
+    radius: u32,
+) -> bool {
+    if requested_slots == 0 {
+        return true;
+    }
+    let gathered = members_gathered_at(member_positions, rally, radius);
+    if uncontested {
+        // Uncontested: a single gathered member may trickle in (nothing shoots back); no fighter required.
+        return gathered >= 1;
+    }
+    // Contested: the (near-)full LIVING roster must be massed at the rally AND a fighter must be present.
+    let living = member_positions.iter().filter(|p| p.is_some()).count();
+    if living == 0 {
+        return false;
+    }
+    let quorum = ((living as f32 * GATHER_QUORUM_RATIO).ceil() as usize).max(MIN_VIABLE_GROUP).min(living);
+    gathered >= quorum && has_fighter_gathered
+}
+
+/// Compute the squad's ONE shared rally/staging Position for an approach toward `target` from the squad's
+/// current `approach` position (its centroid / lead). DETERMINISTIC pure value-math (no `game::*`), so the
+/// bot derives it fresh each tick — no stored field, no `WORLD_FORMAT_VERSION` bump.
+///
+/// - UNCONTESTED target ⇒ stage at the TARGET ROOM ENTRANCE: the target room's centre. Nothing shoots
+///   back, so members may converge inside the target room and trickle onto the objective.
+/// - CONTESTED target ⇒ stage ONE ROOM SHORT of the target, on the approach side (out of tower range): the
+///   centre of the neighbour room between the approach and the target. If the approach is already in the
+///   target room (we arrived contested) fall back to the target-room centre (the in-room brain takes over).
+///
+/// The staging tile is the room CENTRE (25,25) — safely off the exposed border ring and a stable gather
+/// point all members can path to. Members travel SOLO here; the assault advances rally→target only once the
+/// gather quorum fires.
+pub fn shared_rally_point(approach: Position, target: Position, uncontested: bool) -> Position {
+    let centre = |room: RoomName| {
+        Position::new(
+            RoomCoordinate::new(25).expect("25 is valid"),
+            RoomCoordinate::new(25).expect("25 is valid"),
+            room,
+        )
+    };
+    if uncontested || approach.room_name() == target.room_name() {
+        return centre(target.room_name());
+    }
+    // Contested + still outside the target room: stage one room SHORT, on the approach side. Step the room
+    // coordinate ONE room from the target toward the approach (Chebyshev), so the staging room is the
+    // neighbour the squad will cross from — out of the target's tower range. `RoomName - RoomName` is the
+    // (dx,dy) room-delta; its sign points from the target toward the approach.
+    let delta = approach.room_name() - target.room_name();
+    let dx = delta.0.signum();
+    let dy = delta.1.signum();
+    if dx == 0 && dy == 0 {
+        return centre(target.room_name()); // same room (shouldn't reach here) — stage in-room
+    }
+    let staging_room = target.room_name() + (dx, dy);
+    centre(staging_room)
 }
 
 /// Check if a position is near the room edge leading toward a destination in another room. "Near" means
@@ -254,6 +354,142 @@ mod tests {
         let full = [Some(p), Some(p), Some(p), Some(p), Some(p)];
         assert!(ready_to_depart_gate(&full, 5, true), "5/5 uncontested → depart");
         assert!(ready_to_depart_gate(&full, 5, false), "5/5 contested → depart (full roster present)");
+    }
+
+    // ── Movement-stall fix (ADR 0028 K0): SOLO travel to a SHARED rally, then ASSAULT in formation ──
+
+    /// One member at the home centre, far from the rally; one already at the rally. The shared rally is on
+    /// the approach to the target. Stepping the (pure) convergence model, both members must end up at the
+    /// shared rally (gathered), and only THEN may the assault anchor advance rally→target.
+    ///
+    /// SPATIAL repro: members in DIFFERENT rooms (W2N9 + W3N2) solo-travel to a shared rally, converge,
+    /// then the anchor advances toward the target room (W4N2) crossing borders. RED before the fix because
+    /// the bug rallied each member to its OWN home and froze the box-formation anchor → no convergence.
+    #[test]
+    fn scattered_members_converge_at_shared_rally_then_assault_advances() {
+        // Two members in different rooms; a shared rally on the approach; a target a room beyond the rally.
+        let rally = pos(5, 25, "W3N2"); // safe staging on the approach to the target
+        let target = pos(25, 25, "W4N2");
+        let mut a = pos(25, 25, "W2N9"); // far member, different room
+        let mut b = pos(8, 25, "W3N2"); // near member, already in the rally room
+
+        // 1. SOLO TRAVEL: each member steps toward the SHARED rally independently (no cross-room
+        //    box-formation cohesion). Model one Chebyshev step/tick toward the rally in world coords.
+        let step_toward = |from: Position, to: Position| -> Position {
+            if from == to {
+                return from;
+            }
+            let (fx, fy) = from.world_coords();
+            let (tx, ty) = to.world_coords();
+            let (nx, ny) = (fx + (tx - fx).signum(), fy + (ty - fy).signum());
+            // Reconstruct a Position from world coords (room + in-room offset).
+            let room_x = nx.div_euclid(50);
+            let room_y = ny.div_euclid(50);
+            let in_x = nx.rem_euclid(50) as u8;
+            let in_y = ny.rem_euclid(50) as u8;
+            let room: RoomName = format!("W{}N{}", -room_x - 1, -room_y - 1).parse().unwrap();
+            Position::new(RoomCoordinate::new(in_x).unwrap(), RoomCoordinate::new(in_y).unwrap(), room)
+        };
+
+        let mut gathered_tick = None;
+        for t in 0..400 {
+            // Gather quorum over BOTH members against the SHARED rally (contested → near-full + fighter).
+            if gather_quorum_met(&[Some(a), Some(b)], rally, 2, false, true, RALLY_GATHER_RADIUS) {
+                gathered_tick = Some(t);
+                break;
+            }
+            a = step_toward(a, rally);
+            b = step_toward(b, rally);
+        }
+        let gathered_tick = gathered_tick.expect("both members converge at the shared rally (solo travel)");
+        assert!(a.get_range_to(rally) <= RALLY_GATHER_RADIUS, "member A reached the shared rally");
+        assert!(b.get_range_to(rally) <= RALLY_GATHER_RADIUS, "member B reached the shared rally");
+        // Both in the rally's room (room-distance to rally == 0).
+        assert_eq!(a.room_name(), rally.room_name(), "A converged into the rally room");
+        assert_eq!(b.room_name(), rally.room_name(), "B converged into the rally room");
+
+        // 2. ASSAULT: once gathered, the anchor advances rally→target. Room-distance to the target room
+        //    must strictly decrease and cross a border (W3N2 → W4N2).
+        let room_dist = |p: Position| {
+            let d = p.room_name() - target.room_name();
+            d.0.unsigned_abs().max(d.1.unsigned_abs())
+        };
+        let mut anchor = rally;
+        let start_dist = room_dist(anchor);
+        assert!(start_dist >= 1, "the rally is at least one room short of the target (W3N2 → W4N2)");
+        let mut crossed = false;
+        for _ in gathered_tick..(gathered_tick + 200) {
+            let prev_room = anchor.room_name();
+            anchor = step_toward(anchor, target);
+            if anchor.room_name() != prev_room {
+                crossed = true;
+            }
+            if anchor.room_name() == target.room_name() {
+                break;
+            }
+        }
+        assert!(crossed, "the assault anchor crossed a room border advancing rally→target");
+        assert!(room_dist(anchor) < start_dist, "the assault anchor strictly closed the room-distance to the target");
+    }
+
+    /// The shared rally geometry: uncontested → the target-room centre; contested → ONE room short on the
+    /// approach side (out of tower range); arrived-contested → the target-room centre (the in-room brain).
+    #[test]
+    fn shared_rally_stages_short_when_contested_at_room_when_uncontested() {
+        let target = pos(25, 25, "W4N2");
+        let approach = pos(25, 25, "W2N2"); // two rooms WEST of the target (W3 is the neighbour)
+
+        // Uncontested → stage at the target room centre.
+        let r = shared_rally_point(approach, target, true);
+        assert_eq!(r.room_name(), target.room_name(), "uncontested → target-room entrance");
+        assert_eq!((r.x().u8(), r.y().u8()), (25, 25), "room centre");
+
+        // Contested → stage ONE room short, toward the approach (W3N2, the neighbour between W2 and W4).
+        let r = shared_rally_point(approach, target, false);
+        assert_eq!(r.room_name(), "W3N2".parse::<RoomName>().unwrap(), "contested → one room short on the approach side");
+        // The staging room is strictly closer to the approach than the target room is.
+        let rd = |a: RoomName, b: RoomName| {
+            let d = a - b;
+            d.0.unsigned_abs().max(d.1.unsigned_abs())
+        };
+        assert!(rd(r.room_name(), approach.room_name()) < rd(target.room_name(), approach.room_name()), "staging is closer to the approach than the target");
+        assert_eq!(rd(r.room_name(), target.room_name()), 1, "staging is exactly one room from the target");
+
+        // Already in the target room (arrived contested) → fall back to the target-room centre.
+        let arrived = pos(10, 10, "W4N2");
+        assert_eq!(shared_rally_point(arrived, target, false).room_name(), target.room_name(), "arrived → target room");
+    }
+
+    /// The gather quorum: UNCONTESTED targets may trickle a single gathered member; CONTESTED targets
+    /// require the (near-)full living roster massed at the shared rally AND a fighter present.
+    #[test]
+    fn gather_quorum_trickles_uncontested_but_masses_contested() {
+        let rally = pos(25, 25, "W3N2");
+        let near = pos(26, 25, "W3N2"); // within RALLY_GATHER_RADIUS
+        let far = pos(25, 25, "W2N9"); // a room away — not gathered
+
+        // Uncontested: ONE gathered member is enough (nothing shoots back); no fighter required.
+        assert!(
+            gather_quorum_met(&[Some(near), None], rally, 2, true, false, RALLY_GATHER_RADIUS),
+            "uncontested → a single gathered member trickles in"
+        );
+        // Contested, only 1 of 2 gathered (the other a room away) → HOLD (don't feed it in piecemeal).
+        assert!(
+            !gather_quorum_met(&[Some(near), Some(far)], rally, 2, false, true, RALLY_GATHER_RADIUS),
+            "contested → hold until the near-full roster is massed at the rally"
+        );
+        // Contested, both gathered + a fighter present → ASSAULT.
+        assert!(
+            gather_quorum_met(&[Some(near), Some(rally)], rally, 2, false, true, RALLY_GATHER_RADIUS),
+            "contested + full roster gathered + fighter → assault"
+        );
+        // Contested, both gathered but NO fighter (healer-only) → HOLD (no healer-only assault).
+        assert!(
+            !gather_quorum_met(&[Some(near), Some(rally)], rally, 2, false, false, RALLY_GATHER_RADIUS),
+            "contested + no fighter gathered → never a healer-only assault"
+        );
+        // Unknown roster size → do not gate (legacy parity).
+        assert!(gather_quorum_met(&[], rally, 0, false, false, RALLY_GATHER_RADIUS), "unknown roster → ungated");
     }
 
     /// FIX 1 visibility guard: `target_is_uncontested` is true ONLY with POSITIVE room visibility. An
