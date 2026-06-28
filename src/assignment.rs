@@ -29,7 +29,7 @@
 //! The result is a stable `row -> col` assignment that the bot then APPLIES (current-objective →
 //! Keep, a new objective → the v1.1 in-place rebind, `Recycle` → retire + zero-orphan recall).
 
-use crate::composition::{pairing_ev, quantize_ev, PairingParams, SquadCapabilities};
+use crate::composition::{pairing_ev, pairing_p_win, quantize_ev, PairingParams, SquadCapabilities, SquadRole};
 use crate::doctrine::EnemyForce;
 use crate::force_sizing::DefenseProfile;
 use crate::objective_value::{value_e, ObjectiveIntel, ObjectiveValueKind};
@@ -66,15 +66,24 @@ pub enum ColumnKind {
     /// Row `row` RECYCLES — `recycle_ev` (`value_e(recycle_refund) − walk`). The floor that prevents a
     /// net-negative commit. Private to `row` so every surplus squad can recycle in the same solve.
     Recycle { row: usize },
+    /// ADR 0032 v2 / ADR 0027 — the MERGE column (the pending-slot Lanchester transfer, lines 256-312
+    /// of ADR 0027 + ADR 0032 §"Merge / attach as a first-class column", lines 101-107). One column per
+    /// FORMING RECEIVER squad `receiver_row` that has an OPEN pending spawn slot. The DONOR row matched
+    /// to this column sheds its role-matched member(s) INTO `receiver_row`'s pending slot; the cell EV is
+    /// the receiver's MARGINAL P(win) lift (NOT a fresh pairing). EXCLUSIVE like an `Objective` column —
+    /// at most one donor merges into a given receiver per solve (one open slot ⇒ one transfer). The
+    /// receiver itself is INFEASIBLE in its own Merge column (no self-merge — ADR 0027 line 274).
+    Merge { receiver_row: usize },
 }
 
 /// A capability-class pre-filter tag (ADR 0032 §Integration: "`capability_class` stays a cheap
 /// pre-filter"). A squad whose class does not match an objective's class yields an `INFEASIBLE_EV`
 /// cell — the column-feasibility filter that REPLACES the v1 `best_reassignment_near` `compatible`
 /// predicate. Mirrors the bot's `CapabilityClass`; the kernel stays bot-enum-free.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum CapClass {
     Defense,
+    #[default]
     Offense,
     Declaim,
 }
@@ -83,7 +92,7 @@ pub enum CapClass {
 /// `optimize_composition` candidate search) + its class + its CURRENT objective (for the `StayPut`
 /// re-score) + the recycle refund. The bot builds one per admitted squad in STABLE id order; the
 /// harness builds synthetic ones.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct SquadRow {
     /// The squad's surviving capability vector (`composition.capabilities(member_energy)`).
     pub caps: SquadCapabilities,
@@ -96,6 +105,52 @@ pub struct SquadRow {
     /// `Recycle` column's EV (ADR 0032 §EV-positive gate). Usually small/zero; the floor below which a
     /// net-negative objective is never taken.
     pub recycle_ev: i64,
+    /// ── ADR 0032 v2 / ADR 0027 MERGE fields (the pending-slot Lanchester transfer) ──────────────────
+    /// As a DONOR: this squad is MERGE-ELIGIBLE (ADR 0027 line 273) — terminal Resolved/ObjectiveGone WITH
+    /// survivors, OR over-rostered, OR a forming squad consolidating. `false` ⇒ never a merge donor (every
+    /// `Merge` cell with this row as donor is `INFEASIBLE_EV`). A mid-fight squad is NOT eligible (it never
+    /// weakens mid-engagement — ADR 0027 line 273 "donor sheds, never weakens mid-fight").
+    pub merge_eligible: bool,
+    /// As a DONOR: the combined capability of the member(s) this squad would SHED into a receiver's pending
+    /// slot (added to the receiver's caps for the marginal-lift P(win)). Zero ⇒ nothing to shed.
+    pub sheddable: SquadCapabilities,
+    /// As a DONOR: the ROLE bitmask of the sheddable member(s) ([`role_bit`]). A `Merge` is feasible only if
+    /// one of these roles matches an OPEN pending slot role of the receiver (`sheddable_roles &
+    /// open_slot_roles != 0`) — the role-compatibility half of the pending-slot guard (ADR 0027 line 258).
+    pub sheddable_roles: u8,
+    /// As a RECEIVER: the ROLE bitmask of this squad's OPEN (unfilled) pending spawn slots ([`role_bit`]).
+    /// Non-zero ⇒ this row gets a `Merge { receiver_row }` column. Zero ⇒ no open slot ⇒ no Merge column
+    /// (a full/non-forming squad is never a receiver — the receiver must be FORMING with a pending slot,
+    /// ADR 0027 line 275).
+    pub open_slot_roles: u8,
+}
+
+/// The single-bit role tag for the merge role-match bitmask ([`SquadRow::sheddable_roles`] /
+/// [`SquadRow::open_slot_roles`]). Deterministic, fixed per [`SquadRole`] variant; the bot ORs these for
+/// its sheddable members / open slots, the kernel ANDs to test role compatibility (ADR 0027 line 258 —
+/// "a creep may transfer ONLY to fill that squad's PENDING SPAWN SLOT (compatible role)"). No `HashMap`.
+pub fn role_bit(role: SquadRole) -> u8 {
+    match role {
+        SquadRole::Tank => 1 << 0,
+        SquadRole::Healer => 1 << 1,
+        SquadRole::RangedDPS => 1 << 2,
+        SquadRole::MeleeDPS => 1 << 3,
+        SquadRole::Dismantler => 1 << 4,
+        SquadRole::Hauler => 1 << 5,
+        SquadRole::Declaimer => 1 << 6,
+    }
+}
+
+/// Sum two capability vectors (the receiver's surviving caps + the donor's sheddable caps) for the
+/// marginal-lift P(win) (ADR 0032 v2 / ADR 0027 — `P(win | B.comp + S.sheddable_members)`). Saturating
+/// (no overflow), field-wise; `tank_effective_hp` takes the MAX (the toughest tank, not a sum — a soak is
+/// the single hardest body, mirroring [`SquadCapabilities`]'s own definition).
+fn merged_caps(receiver: SquadCapabilities, donor_shed: SquadCapabilities) -> SquadCapabilities {
+    SquadCapabilities {
+        heal_per_tick: receiver.heal_per_tick.saturating_add(donor_shed.heal_per_tick),
+        structure_dps: receiver.structure_dps.saturating_add(donor_shed.structure_dps),
+        tank_effective_hp: receiver.tank_effective_hp.max(donor_shed.tank_effective_hp),
+    }
 }
 
 /// One candidate objective COLUMN: the bot's projected facts the cell EV reads (exactly the
@@ -145,11 +200,15 @@ pub struct MatrixParams {
     pub onsite_window: u32,
     /// The v1.1 EV pairing tunables (travel weight + dynamic margin).
     pub pairing: PairingParams,
+    /// ADR 0032 v2 — the linear EV penalty per room the donor's shed member(s) must travel to reach the
+    /// receiver's rally (`transfer_cost` in ADR 0032 line 104). Small (mirrors `pairing.w_travel`) so it
+    /// only breaks near-EV ties between two candidate receivers.
+    pub w_transfer: f32,
 }
 
 impl Default for MatrixParams {
     fn default() -> Self {
-        MatrixParams { onsite_window: 1500, pairing: PairingParams::default() }
+        MatrixParams { onsite_window: 1500, pairing: PairingParams::default(), w_transfer: 1.0 }
     }
 }
 
@@ -200,6 +259,68 @@ fn cell_ev(row: &SquadRow, row_idx: usize, obj: &ObjectiveCell, params: &MatrixP
     quantize_ev(ev)
 }
 
+/// THE MERGE cell EV (ADR 0032 v2 §"Merge / attach", lines 101-107 + ADR 0027 lines 256-312): donor row
+/// `donor_idx` merges its sheddable member(s) into the FORMING receiver `recv_idx`'s open pending slot.
+/// The EV is the receiver's MARGINAL P(win) LIFT (NOT a fresh pairing, NOT the donor's own EV):
+/// `[P(win | B.caps + S.sheddable) − P(win | B.caps)] · value_e(B.objective) − w_transfer · travel`.
+///
+/// Returns [`INFEASIBLE_EV`] unless ALL of the pending-slot Lanchester guard holds (ADR 0027 line 258):
+/// - the donor is `merge_eligible` (terminal-with-survivors / over-rostered / forming-consolidate) AND
+///   actually has sheddable caps + role(s);
+/// - `donor_idx != recv_idx` (no self-merge — ADR 0027 line 274);
+/// - the receiver has an OPEN pending slot whose role MATCHES a sheddable role
+///   (`sheddable_roles & open_slot_roles != 0` — the role-compatibility half of the guard);
+/// - the receiver has a CURRENT objective whose cell is found + class-matches the merged force (B is
+///   forming FOR an objective; the merged force fights B's objective).
+///
+/// A NON-eligible donor, a self-merge, a role mismatch, or a receiver with no open slot is simply NEVER a
+/// feasible cell — which is exactly why a DILUTIVE split (peeling into a new under-strength squad that does
+/// not fill an existing slot) can NEVER be selected: it is not representable as a column at all (ADR 0027
+/// lines 308-312, the whole guard). Pure + deterministic (no `HashMap`; integer-quantized).
+#[allow(clippy::too_many_arguments)]
+fn merge_cell_ev(
+    donor: &SquadRow,
+    donor_idx: usize,
+    recv: &SquadRow,
+    recv_idx: usize,
+    objectives: &[ObjectiveCell],
+    transfer_travel: u32,
+    params: &MatrixParams,
+) -> i64 {
+    // No self-merge (ADR 0027 line 274) + the donor must be merge-eligible with something to shed.
+    if donor_idx == recv_idx || !donor.merge_eligible {
+        return INFEASIBLE_EV;
+    }
+    // Role-compatibility half of the pending-slot guard: a sheddable role must match an OPEN slot role.
+    if donor.sheddable_roles & recv.open_slot_roles == 0 {
+        return INFEASIBLE_EV;
+    }
+    // The receiver must be FORMING for an objective whose cell we can re-score the marginal lift against.
+    let Some(cur) = recv.current_objective else { return INFEASIBLE_EV };
+    let Some(obj_b) = objectives.iter().find(|o| o.id == cur) else { return INFEASIBLE_EV };
+    // The merged force fights B's objective — the class must match (a cross-class merge is incoherent).
+    if recv.class != obj_b.class {
+        return INFEASIBLE_EV;
+    }
+    let val = value_e(obj_b.value_kind, &obj_b.intel);
+    // The marginal LIFT is the pure P(win) DELTA the merged force buys for the RECEIVER's objective. Both
+    // P(win)s use the SAME `onsite_window` (the receiver is the coordination unit and fights B's objective at
+    // B's reach, ADR 0027 line 277 — the reach folds into both identically and cancels in the delta). The
+    // merge changes only the FORCE, not where B fights; the transfer's own reach cost is the separate
+    // `w_transfer · transfer_travel` penalty below (ADR 0032 line 104).
+    let base_p = pairing_p_win(recv.caps, &obj_b.defense, obj_b.enemy, params.onsite_window, &params.pairing);
+    let merged_p = pairing_p_win(
+        merged_caps(recv.caps, donor.sheddable),
+        &obj_b.defense,
+        obj_b.enemy,
+        params.onsite_window,
+        &params.pairing,
+    );
+    let lift = (merged_p - base_p) * val;
+    let ev = lift - params.w_transfer * transfer_travel as f32;
+    quantize_ev(ev)
+}
+
 /// Build the `N×K` EV matrix (ADR 0032 §"The matching"): rows = the assignable squads (caller-ordered
 /// by STABLE id), columns = the top-C objective cells (caller-pre-ranked) + a `StayPut` column +
 /// a `Recycle` column. Every cell is the INTEGER-quantized EV ([`cell_ev`]); an infeasible cell is
@@ -209,11 +330,42 @@ fn cell_ev(row: &SquadRow, row_idx: usize, obj: &ObjectiveCell, params: &MatrixP
 ///   (re-scored with the row's current survivors), else (`current_objective == None` / gone)
 ///   [`INFEASIBLE_EV`]. This is the gate's "beat the fight you're already in" alternative.
 /// - `Recycle[r]` = the row's `recycle_ev` — the net-negative floor.
+///
+/// This is the v1.2 builder (NO merge columns) — preserved BYTE-IDENTICAL for the v1.2 kernel tests +
+/// `run_auction_flow`. The v2 [`build_ev_matrix_with_merge`] adds the [`ColumnKind::Merge`] columns; this
+/// delegates to it with an empty merge-travel matrix (no Merge column is feasible without receiver open
+/// slots, so the result is identical whether or not the merge pass runs — but it short-circuits cleanly).
 pub fn build_ev_matrix(squads: &[SquadRow], objectives: &[ObjectiveCell], params: &MatrixParams) -> EvMatrix {
+    build_ev_matrix_with_merge(squads, objectives, &[], params)
+}
+
+/// ADR 0032 v2 — build the matrix WITH the [`ColumnKind::Merge`] column class (the pending-slot Lanchester
+/// transfer). Identical to [`build_ev_matrix`] PLUS: for every receiver row whose `open_slot_roles != 0` (a
+/// forming squad with an open pending slot), append one `Merge { receiver_row }` column; each donor row's
+/// cell in that column is [`merge_cell_ev`] (the marginal P(win) lift, gated by the pending-slot guard).
+///
+/// `merge_travel_rooms` is an OPTIONAL row-major `rows × rows` matrix of donor→receiver-rally travel
+/// (`merge_travel_rooms[donor * rows + receiver]`); empty ⇒ 0 travel for all (the harness's simple case).
+/// The Merge columns are appended AFTER Objective/StayPut/Recycle, so the v1.2 column indices are unchanged
+/// (StayPut/Recycle bases stay `objectives.len()` / `objectives.len() + rows`).
+pub fn build_ev_matrix_with_merge(
+    squads: &[SquadRow],
+    objectives: &[ObjectiveCell],
+    merge_travel_rooms: &[u32],
+    params: &MatrixParams,
+) -> EvMatrix {
     let rows = squads.len();
+    let merge_travel = |donor: usize, receiver: usize| -> u32 {
+        merge_travel_rooms.get(donor * rows + receiver).copied().unwrap_or(0)
+    };
+    // Receivers that get a Merge column: forming rows with an OPEN pending slot (role bitmask non-zero),
+    // in stable row order (deterministic — no HashMap).
+    let merge_receivers: Vec<usize> = (0..rows).filter(|&r| squads[r].open_slot_roles != 0).collect();
+
     // Columns: the C objective columns (shared/exclusive), then a PRIVATE StayPut + Recycle column per
-    // row (so two squads can both stay/recycle without contending — see [`ColumnKind`]).
-    let mut columns: Vec<ColumnKind> = Vec::with_capacity(objectives.len() + 2 * rows);
+    // row (so two squads can both stay/recycle without contending — see [`ColumnKind`]), then one
+    // exclusive Merge column per forming receiver (ADR 0032 v2).
+    let mut columns: Vec<ColumnKind> = Vec::with_capacity(objectives.len() + 2 * rows + merge_receivers.len());
     for obj in objectives {
         columns.push(ColumnKind::Objective { id: obj.id });
     }
@@ -225,6 +377,10 @@ pub fn build_ev_matrix(squads: &[SquadRow], objectives: &[ObjectiveCell], params
     for r in 0..rows {
         columns.push(ColumnKind::Recycle { row: r });
     }
+    let merge_base = columns.len();
+    for &recv in &merge_receivers {
+        columns.push(ColumnKind::Merge { receiver_row: recv });
+    }
     let cols = columns.len();
 
     let mut ev = vec![INFEASIBLE_EV; rows * cols];
@@ -232,6 +388,12 @@ pub fn build_ev_matrix(squads: &[SquadRow], objectives: &[ObjectiveCell], params
         // Objective columns.
         for (c, obj) in objectives.iter().enumerate() {
             ev[r * cols + c] = cell_ev(row, r, obj, params);
+        }
+        // Merge columns: this row `r` is the DONOR; each Merge column targets a receiver row.
+        for (k, &recv) in merge_receivers.iter().enumerate() {
+            let recv_row = &squads[recv];
+            ev[r * cols + merge_base + k] =
+                merge_cell_ev(row, r, recv_row, recv, objectives, merge_travel(r, recv), params);
         }
         // This row's PRIVATE StayPut column (re-score the CURRENT objective with the row's survivors).
         // Infeasible (a gone objective) ⇒ INFEASIBLE_EV so any positive move beats it.
@@ -473,7 +635,7 @@ mod tests {
     }
 
     fn offense_row(structure_dps: u32, current: Option<u32>) -> SquadRow {
-        SquadRow { caps: caps(structure_dps, 50), class: CapClass::Offense, current_objective: current, recycle_ev: 0 }
+        SquadRow { caps: caps(structure_dps, 50), class: CapClass::Offense, current_objective: current, recycle_ev: 0, ..Default::default() }
     }
 
     /// A faithful model of the OLD per-squad GREEDY behaviour (ADR 0032 §Problem #2): iterate rows in
@@ -583,7 +745,7 @@ mod tests {
         // wins. We assert it is not the low objective id.
         match m.columns[c] {
             ColumnKind::Objective { id } => assert_ne!(id, 1, "must not take the sub-threshold low objective"),
-            ColumnKind::StayPut { .. } | ColumnKind::Recycle { .. } => {}
+            ColumnKind::StayPut { .. } | ColumnKind::Recycle { .. } | ColumnKind::Merge { .. } => {}
         }
         // And the total EV must equal the high/StayPut EV (the squad keeps its valuable fight). The high
         // objective is col 0; row 0's private StayPut is col (objectives.len() + 0).
@@ -600,7 +762,7 @@ mod tests {
         let mut obj = undefended_obj(0, 1.0, 1);
         obj.defense = DefenseProfile { safe_mode: true, ..Default::default() }; // safe mode → P(win)=0 → EV = −travel
         obj.travel_rooms_per_row = vec![5];
-        let row = SquadRow { caps: caps(120, 50), class: CapClass::Offense, current_objective: None, recycle_ev: 0 };
+        let row = SquadRow { caps: caps(120, 50), class: CapClass::Offense, current_objective: None, recycle_ev: 0, ..Default::default() };
         let squads = [row];
         let objs = [obj];
         let m = build_ev_matrix(&squads, &objs, &MatrixParams::default());
@@ -616,7 +778,7 @@ mod tests {
     #[test]
     fn capability_class_is_a_hard_prefilter() {
         let offense_obj = undefended_obj(0, 100_000.0, 1); // class Offense
-        let defender = SquadRow { caps: caps(1000, 50), class: CapClass::Defense, current_objective: None, recycle_ev: 0 };
+        let defender = SquadRow { caps: caps(1000, 50), class: CapClass::Defense, current_objective: None, recycle_ev: 0, ..Default::default() };
         let squads = [defender];
         let objs = [offense_obj];
         let m = build_ev_matrix(&squads, &objs, &MatrixParams::default());
@@ -877,5 +1039,206 @@ mod tests {
         let want = exhaustive_optimum(&raw, rows, cols);
         assert_eq!(want, 0, "the may-skip optimum is to take NOTHING (0) — strictly better than −50");
         assert!(sol.total_ev < want, "WITHOUT a per-row escape the solver is worse than optimal-with-skip ({} < {})", sol.total_ev, want);
+    }
+
+    // ══ ADR 0032 v2 / ADR 0027 — the MERGE column class (the pending-slot Lanchester transfer) ══════════
+
+    /// A DEFENDED objective worth `value` energy-equiv with `tower_dps` incoming + `required` hits to kill,
+    /// no travel for `n_rows`. Defended ⇒ P(win) is a smooth function of caps (NOT the undefended binary), so
+    /// adding a donor's sheddable caps produces a real MARGINAL LIFT.
+    fn defended_obj(id: u32, value: f32, tower_range: u32, required: u32, n_rows: usize) -> ObjectiveCell {
+        use crate::force_sizing::TowerThreat;
+        ObjectiveCell {
+            id,
+            class: CapClass::Offense,
+            value_kind: ObjectiveValueKind::Denial,
+            intel: ObjectiveIntel { denial_value: value * 2.0, ..Default::default() },
+            defense: DefenseProfile {
+                objective_hits: required,
+                // A fully-energized tower at `tower_range` (energy well above TOWER_ENERGY_COST so it fires).
+                towers: vec![TowerThreat { range_to_assault: tower_range, energy: 1000 }],
+                ..Default::default()
+            },
+            enemy: None,
+            travel_rooms_per_row: vec![0; n_rows],
+            feasible_per_row: vec![true; n_rows],
+        }
+    }
+
+    /// THE HEADLINE MERGE PROOF (ADR 0032 v2 §Sim, ADR 0027 lines 256-312): the matrix picks `Merge→Bk`
+    /// for a donor over a marginal SOLO reassign because the receiver's marginal P(win) LIFT outvalues the
+    /// donor's own best solo objective — AND the DILUTIVE-split column is ABSENT (cannot be selected), which
+    /// is the whole pending-slot guard.
+    #[test]
+    fn merge_is_picked_over_a_marginal_solo_reassign_and_the_dilutive_split_is_absent() {
+        // Receiver B (row 0): FORMING for a high-value DEFENDED objective (id 0), under-DPS'd ALONE so its
+        // P(win) is well below 1 — there is real lift to be had. It has an OPEN Dismantler pending slot.
+        let mut receiver = offense_row(200, Some(0));
+        receiver.open_slot_roles = role_bit(SquadRole::Dismantler); // an open dismantler pending slot
+        // Donor S (row 1): a terminal-with-survivors squad whose sheddable member is a heavy Dismantler. Its
+        // OWN best solo objective is a small-value one (id 1). Merge-eligible; sheds a Dismantler.
+        let mut donor = offense_row(50, None);
+        donor.merge_eligible = true;
+        donor.sheddable = caps(800, 0); // a big structure-DPS dismantler — fills B's missing kill power
+        donor.sheddable_roles = role_bit(SquadRole::Dismantler);
+
+        // B's objective: HIGH value, defended (so caps matter). Donor's own objective: LOW value.
+        let obj_b = defended_obj(0, 200_000.0, 20, 400_000, 2);
+        let obj_low = undefended_obj(1, 50.0, 2); // donor's marginal solo option
+
+        let squads = [receiver, donor];
+        let objs = [obj_b, obj_low];
+        let m = build_ev_matrix_with_merge(&squads, &objs, &[], &MatrixParams::default());
+
+        // The Merge column for receiver_row 0 exists; NO Merge column for the donor (no open slot) — and
+        // crucially there is NO column anywhere that represents a DILUTIVE split (peeling into a new under-
+        // strength squad). The ONLY merge column is `Merge { receiver_row: 0 }`.
+        let merge_cols: Vec<usize> = m
+            .columns
+            .iter()
+            .enumerate()
+            .filter_map(|(c, col)| matches!(col, ColumnKind::Merge { .. }).then_some(c))
+            .collect();
+        assert_eq!(merge_cols.len(), 1, "exactly ONE merge column (the one forming receiver with an open slot)");
+        assert_eq!(m.columns[merge_cols[0]], ColumnKind::Merge { receiver_row: 0 }, "the merge column targets B");
+        // The DILUTIVE split is never representable: the donor (row 1) is never a RECEIVER (open_slot_roles=0),
+        // so no `Merge { receiver_row: 1 }` exists. (ADR 0027 lines 308-312 — the guard IS the absence.)
+        assert!(
+            !m.columns.iter().any(|c| matches!(c, ColumnKind::Merge { receiver_row: 1 })),
+            "a dilutive split (donor as its own new under-strength receiver) is NOT a column"
+        );
+
+        // The donor's merge cell EV must be POSITIVE (a real lift) and beat its own best solo objective cell.
+        let merge_ev = m.at(1, merge_cols[0]);
+        let donor_solo_low = m.at(1, 1); // donor on the low objective
+        assert!(merge_ev > 0, "the marginal-lift merge EV is positive, got {merge_ev}");
+        assert!(merge_ev > donor_solo_low, "merge ({merge_ev}) must beat the donor's marginal solo reassign ({donor_solo_low})");
+
+        // The SELF-merge cell (donor merging into itself) is INFEASIBLE — guarded explicitly.
+        // (receiver row 0 in its own merge column.)
+        assert_eq!(m.at(0, merge_cols[0]), INFEASIBLE_EV, "the receiver cannot self-merge (no self-merge guard)");
+
+        // The global solve assigns the donor (row 1) to the merge column (its best feasible move).
+        let sol = solve_assignment(&m);
+        assert_eq!(sol.row_to_col[1], Some(merge_cols[0]), "the donor is matched to Merge→B, not the marginal solo objective");
+    }
+
+    /// FORMING-CONSOLIDATION (ADR 0027 lines 270-271 — "two squads stuck at 1/4 each can MERGE into one at
+    /// 2/4"): two forming squads each at partial strength; the optimum consolidates the donor's member into
+    /// the receiver's open slot (a merge) rather than both churning. Asserts the merge column is feasible +
+    /// positive and chosen.
+    #[test]
+    fn two_forming_squads_consolidate_via_a_merge() {
+        // Receiver (row 0): forming for a DEFENDED objective, has an open RangedDPS slot, under-DPS alone.
+        let mut receiver = offense_row(150, Some(0));
+        receiver.open_slot_roles = role_bit(SquadRole::RangedDPS);
+        // Donor (row 1): ALSO forming (consolidating), merge-eligible, sheds a RangedDPS that lifts B.
+        let mut donor = offense_row(150, Some(1));
+        donor.merge_eligible = true;
+        donor.sheddable = caps(500, 30);
+        donor.sheddable_roles = role_bit(SquadRole::RangedDPS);
+
+        let obj_b = defended_obj(0, 150_000.0, 20, 300_000, 2);
+        // The donor's own objective is the SAME class but lower value + also defended (it is ALSO struggling).
+        let obj_d = defended_obj(1, 40_000.0, 20, 300_000, 2);
+
+        let squads = [receiver, donor];
+        let objs = [obj_b, obj_d];
+        let m = build_ev_matrix_with_merge(&squads, &objs, &[], &MatrixParams::default());
+
+        let merge_col = m.columns.iter().position(|c| *c == ColumnKind::Merge { receiver_row: 0 }).expect("B has a merge column");
+        let merge_ev = m.at(1, merge_col);
+        let donor_stay = m.at(1, /*stay_base=*/ objs.len() + /*row*/ 1); // donor staying on its own struggling fight
+        assert!(merge_ev > 0, "consolidation lift is positive, got {merge_ev}");
+        let sol = solve_assignment(&m);
+        assert_eq!(
+            sol.row_to_col[1],
+            Some(merge_col),
+            "the donor consolidates into B (merge {merge_ev}) instead of churning on its own fight (stay {donor_stay})"
+        );
+    }
+
+    /// THE PENDING-SLOT GUARD — a ROLE MISMATCH makes the merge INFEASIBLE (ADR 0027 line 258: a creep may
+    /// transfer ONLY to fill a PENDING SPAWN SLOT of a COMPATIBLE ROLE). The donor sheds a Healer but B's
+    /// only open slot is a Dismantler ⇒ the merge cell is INFEASIBLE_EV (never chosen).
+    #[test]
+    fn merge_is_infeasible_on_a_role_mismatch() {
+        let mut receiver = offense_row(200, Some(0));
+        receiver.open_slot_roles = role_bit(SquadRole::Dismantler); // open Dismantler slot
+        let mut donor = offense_row(50, None);
+        donor.merge_eligible = true;
+        donor.sheddable = caps(0, 600);
+        donor.sheddable_roles = role_bit(SquadRole::Healer); // sheds a HEALER — wrong role
+
+        let obj_b = defended_obj(0, 200_000.0, 20, 400_000, 2);
+        let squads = [receiver, donor];
+        let objs = [obj_b];
+        let m = build_ev_matrix_with_merge(&squads, &objs, &[], &MatrixParams::default());
+        let merge_col = m.columns.iter().position(|c| *c == ColumnKind::Merge { receiver_row: 0 }).expect("merge col exists");
+        assert_eq!(m.at(1, merge_col), INFEASIBLE_EV, "a role-mismatched merge is INFEASIBLE (the pending-slot role guard)");
+    }
+
+    /// A NON-merge-eligible donor (mid-fight — not terminal, not over-rostered, not forming-consolidate) is
+    /// NEVER a merge donor: every merge cell with it as donor is INFEASIBLE (ADR 0027 line 273 — "donor sheds,
+    /// never weakens mid-fight").
+    #[test]
+    fn ineligible_donor_never_merges() {
+        let mut receiver = offense_row(200, Some(0));
+        receiver.open_slot_roles = role_bit(SquadRole::Dismantler);
+        let mut donor = offense_row(800, Some(1)); // a strong squad on its OWN fight — merge_eligible=false (default)
+        donor.sheddable = caps(800, 0);
+        donor.sheddable_roles = role_bit(SquadRole::Dismantler);
+        // merge_eligible left false (Default) — the guard.
+
+        let obj_b = defended_obj(0, 200_000.0, 20, 400_000, 2);
+        let obj_d = undefended_obj(1, 90_000.0, 2);
+        let squads = [receiver, donor];
+        let objs = [obj_b, obj_d];
+        let m = build_ev_matrix_with_merge(&squads, &objs, &[], &MatrixParams::default());
+        let merge_col = m.columns.iter().position(|c| *c == ColumnKind::Merge { receiver_row: 0 }).expect("merge col exists");
+        assert_eq!(m.at(1, merge_col), INFEASIBLE_EV, "an ineligible (mid-fight) donor never merges");
+    }
+
+    /// DETERMINISM (ADR 0032 §Determinism): the merge matrix + solve is byte-identical run twice, and
+    /// PERMUTING the donor/receiver row order yields the SAME donor→receiver match (the role-matched,
+    /// stable-order donor→slot match of ADR 0027 line 282).
+    #[test]
+    fn merge_is_deterministic_and_permutation_invariant() {
+        let mut receiver = offense_row(200, Some(0));
+        receiver.open_slot_roles = role_bit(SquadRole::Dismantler);
+        let mut donor = offense_row(50, Some(1));
+        donor.merge_eligible = true;
+        donor.sheddable = caps(800, 0);
+        donor.sheddable_roles = role_bit(SquadRole::Dismantler);
+        let obj_b = defended_obj(0, 200_000.0, 20, 400_000, 2);
+        let obj_d = undefended_obj(1, 30.0, 2);
+
+        // Run twice — byte-identical.
+        let m1 = build_ev_matrix_with_merge(&[receiver, donor], &[obj_b.clone(), obj_d.clone()], &[], &MatrixParams::default());
+        let a = solve_assignment(&m1);
+        let b = solve_assignment(&m1);
+        assert_eq!(a, b, "the merge solve is deterministic run twice");
+
+        // Permute the rows: donor first, receiver second. The donor must STILL merge into the receiver (now
+        // row 1's merge column targets the receiver's NEW row index). We assert the donor (whichever row) is
+        // matched to the receiver's merge column — order-independent.
+        let m2 = build_ev_matrix_with_merge(&[donor, receiver], &[obj_b, obj_d], &[], &MatrixParams::default());
+        let sol2 = solve_assignment(&m2);
+        // In m2, the receiver is row 1 ⇒ its merge column is `Merge { receiver_row: 1 }`; the donor is row 0.
+        let recv_merge_col = m2.columns.iter().position(|c| *c == ColumnKind::Merge { receiver_row: 1 }).expect("merge col");
+        assert_eq!(sol2.row_to_col[0], Some(recv_merge_col), "permuting rows keeps the donor→receiver merge match");
+    }
+
+    /// The v2 builder PRESERVES the v1.2 matrix when no receiver has an open slot (no Merge column appended) —
+    /// the empty-merge path is byte-identical to `build_ev_matrix` (the delegation invariant).
+    #[test]
+    fn no_open_slot_means_no_merge_column_v1_2_preserved() {
+        let squads = [offense_row(1000, None), offense_row(500, None)];
+        let objs = [undefended_obj(0, 90_000.0, 2), undefended_obj(1, 60_000.0, 2)];
+        let v1_2 = build_ev_matrix(&squads, &objs, &MatrixParams::default());
+        let v2 = build_ev_matrix_with_merge(&squads, &objs, &[], &MatrixParams::default());
+        assert_eq!(v1_2.columns, v2.columns, "no open slots ⇒ no merge columns ⇒ identical column layout");
+        assert!(!v2.columns.iter().any(|c| matches!(c, ColumnKind::Merge { .. })), "no merge column without an open slot");
+        assert_eq!(solve_assignment(&v1_2), solve_assignment(&v2), "identical solve");
     }
 }
