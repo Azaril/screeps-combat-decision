@@ -380,6 +380,9 @@ pub fn assemble_force(req: &RequiredForce, member_energy: u32) -> Option<SquadCo
 
     // The capability vector → weapon-role demands, in the ADR's frozen dimension order (= the slot order +
     // the determinism tie-break). RANGED = immune_struct + anti_creep (anti-structure AND anti-creep).
+    // NOTE: this is the COMPOSITION order (the engaged formation expects the healer-anchored layout); the
+    // FIGHTER-FIRST SPAWN ordering (deep-reach fix Break #1) is applied at the bot's Phase-B spawn loop
+    // (`spawn_order_fighter_first`), NOT here — so the engaged force's positioning/formation is unchanged.
     let demands: [(SquadRole, u32); 4] = [
         (SquadRole::Healer, req.heal_parts),
         (SquadRole::Dismantler, req.dismantle_parts),
@@ -957,6 +960,32 @@ mod tests {
             comp.slots.iter().any(|s| s.role == SquadRole::RangedDPS),
             "undefended immune core still fields a RANGED kill: {}",
             comp.label
+        );
+    }
+
+    /// STABLE undefended sizing (deep-reach fix — Break #1 / the roster-stall avoidance): an undefended core
+    /// sizes to a STABLE single slot across the per-tick `onsite_window` jitter (CREEP_LIFE_TIME − spawn −
+    /// travel, which shrinks as the squad travels). If the member count OSCILLATED with the window (1↔2),
+    /// the requested-slot count would flap each reconcile → the rally gate + Phase-B spawn churn → the
+    /// roster never completes (the live W9N8-style oscillation that re-introduces the stall). A small core
+    /// that one RANGED member razes well within even the SHORTEST realistic window must stay a single slot.
+    #[test]
+    fn undefended_core_sizes_to_a_stable_single_slot_across_windows() {
+        // A small undefended core a single capped RANGED member clears within ~hundreds of ticks — so it is
+        // winnable across the whole realistic on-site window range (no window forces a 2nd member).
+        let core = DefenseProfile { towers: vec![], breach_hits: 0, objective_hits: 8_000, enemy_dps: 0.0, repair_per_tick: 0.0, safe_mode: false };
+        let p = CompositionParams { member_energy: 5600, ..Default::default() };
+        let counts: Vec<usize> = [400u32, 600, 900, 1200, 1400]
+            .iter()
+            .map(|&window| {
+                optimize_composition(DoctrineObjective::KillImmuneStructure, &core, None, 100_000.0, window, EnemyCoordination::Individual, 0.0, true, &p)
+                    .expect("a small undefended core is winnable at every realistic window")
+                    .member_count()
+            })
+            .collect();
+        assert!(
+            counts.iter().all(|&n| n == 1),
+            "an undefended small core must size to a STABLE single slot across the on-site-window range (no 1↔2 oscillation), got {counts:?}"
         );
     }
 

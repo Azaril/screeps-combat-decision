@@ -33,6 +33,27 @@ pub struct ReconcileSnapshot {
     /// last looked). True only on the exact tick a new member appears, so it is self-bounding: a roster
     /// can increase at most `requested_slots` times, after which progress stays false and the lease lapses.
     pub forming_progress: bool,
+    /// A forming squad has a slot with a QUEUED or IN-FLIGHT spawn this tick (a member is banking/spawning).
+    /// The deep-reach fix (Break #1): the inter-member banking gap can exceed the lease window, so refreshing
+    /// ONLY on the exact `forming_progress` tick lets the lease lapse BETWEEN members → re-field churn that
+    /// orphans the early roster. Refreshing while a member is in flight keeps a SLOW-but-fielding roster
+    /// alive. BOUNDED by `forming_budget_remaining` so a genuinely-unfieldable squad still gives up.
+    pub forming_in_flight: bool,
+    /// The forming exemption budget has not yet been exhausted (a squad-age bound on how long the
+    /// forming-in-flight refresh may extend the lease). False ⇒ the forming refresh stops and the squad
+    /// gives up even if a member is still nominally in flight — so the immortal-squad failure can't recur.
+    pub forming_budget_remaining: bool,
+    /// The squad has its FULL roster (rally released) and is TRAVELING to the target — not yet engaged, not
+    /// yet in the target room. The travel-phase has no focus + is not forming, so the base lease lapses
+    /// mid-hop (Break #2 travel half — the live W7N7 1-slot lapse). Refresh while traveling + progressing.
+    pub traveling: bool,
+    /// The traveling squad made POSITIONAL progress toward the target this reconcile (closed distance). True
+    /// only while the squad is actually advancing — a stuck/blocked traveler stops progressing and the lease
+    /// lapses (the travel refresh is bounded by progress, like `forming_progress` bounds the forming one).
+    pub travel_progress: bool,
+    /// The travel exemption budget has not yet been exhausted (an absolute travel-time bound). False ⇒ the
+    /// travel refresh stops and a squad that can never arrive gives up.
+    pub travel_budget_remaining: bool,
 }
 
 /// Why a squad is being retired (drives logging + backoff).
@@ -85,12 +106,31 @@ pub enum ReconcileAction {
 /// only on the tick a new member appears, and a roster grows at most `requested_slots` times — once the
 /// count stops increasing (a genuinely-unfieldable squad that can never bank enough energy for the next
 /// member) `forming_progress` stays false, the lease lapses, and the squad gives up + frees the slot.
+///
+/// DEEP-REACH FIX (the "fielded squad never reaches/engages" bug, two added lease refreshes):
+/// (1) FORMING IN-FLIGHT — the inter-member BANKING GAP under spawn contention can exceed the lease window,
+/// so `forming_progress` (the exact present++ tick) is too sparse: the lease lapses BETWEEN members → re-
+/// field churn that orphans the early roster (the live W7N4 healer pile-up). While `forming` AND a member is
+/// `forming_in_flight` (a slot has a queued/in-flight spawn) the lease is refreshed through the gap, BOUNDED
+/// by `forming_budget_remaining` (a per-generation forming clock) so a truly-unfieldable squad still gives up.
+/// (2) TRAVEL — a FULL-ROSTER squad that has departed home but not yet arrived/engaged is `traveling`: it has
+/// no focus and is not forming, so the base lease lapses MID-HOP (the live W7N7 1-slot lapse). While it is
+/// `traveling` AND making positional `travel_progress` (closing distance) the lease is refreshed, BOUNDED by
+/// `travel_budget_remaining` (an absolute travel clock) so a squad that can never arrive still gives up.
 pub fn reconcile(s: ReconcileSnapshot) -> ReconcileAction {
     let resolved = s.engaged_once && s.in_target_room && !s.has_focus && s.has_members;
-    // A forming squad that is still gaining members keeps its lease alive past the deadline (bounded — see
-    // the doc comment). It must NOT count as a give-up even though it has no focus and the lease lapsed.
-    let forming_progressing = s.forming && s.forming_progress && s.has_members;
-    let gave_up = s.deadline_lapsed && !s.has_focus && !resolved && !forming_progressing;
+    // A forming squad keeps its lease alive past the deadline (bounded — see the doc comment) while it is
+    // making spawn PROGRESS (a member just appeared) OR a member is IN FLIGHT (banking/spawning the next
+    // member, even on a tick the present count is flat). The in-flight refresh is bounded by
+    // `forming_budget_remaining` so a genuinely-unfieldable squad still gives up (no immortal squad). It must
+    // NOT count as a give-up even though it has no focus and the lease lapsed.
+    let forming_progressing =
+        s.forming && s.has_members && (s.forming_progress || (s.forming_in_flight && s.forming_budget_remaining));
+    // A FULL-ROSTER squad TRAVELING to the target keeps its lease alive while it is making positional
+    // progress (closing distance), bounded by `travel_budget_remaining` — so the lease does not lapse
+    // mid-hop (the W7N7 travel-phase lapse) but a squad that can never arrive still gives up.
+    let traveling_progressing = s.traveling && s.travel_progress && s.travel_budget_remaining && !s.engaged_once;
+    let gave_up = s.deadline_lapsed && !s.has_focus && !resolved && !forming_progressing && !traveling_progressing;
 
     if s.objective_gone || s.duplicate || s.wiped || resolved || gave_up {
         // Precedence: a clean clear (Resolved) is the most informative + drives withdraw; then the
@@ -116,9 +156,10 @@ pub fn reconcile(s: ReconcileSnapshot) -> ReconcileAction {
         };
     }
 
-    // Refresh the lease while actively engaging (a long fight / vision gap) OR while a forming squad is
-    // still making spawn progress (the rally-stall fix — the assembly is not torn down mid-form).
-    if s.has_focus || forming_progressing {
+    // Refresh the lease while actively engaging (a long fight / vision gap), while a forming squad is still
+    // making spawn progress / has a member in flight (the rally-stall fix — the assembly is not torn down
+    // mid-form), OR while a full-roster squad is traveling + closing on the target (the mid-hop lapse fix).
+    if s.has_focus || forming_progressing || traveling_progressing {
         ReconcileAction::KeepRefreshLease
     } else {
         ReconcileAction::Keep
@@ -143,6 +184,11 @@ mod tests {
             has_members: true,
             forming: false,
             forming_progress: false,
+            forming_in_flight: false,
+            forming_budget_remaining: true,
+            traveling: false,
+            travel_progress: false,
+            travel_budget_remaining: true,
         }
     }
 
@@ -242,6 +288,75 @@ mod tests {
         let s = ReconcileSnapshot { deadline_lapsed: true, forming: true, forming_progress: false, ..forming() };
         assert_eq!(
             reconcile(s),
+            ReconcileAction::Retire { reason: RetireReason::GaveUp, withdraw: false, mark_unwinnable: true }
+        );
+    }
+
+    /// DEEP-REACH FIX (Break #1): a forming squad PAST its lease with present count FLAT (no `forming_progress`
+    /// this tick) but a member still IN FLIGHT (banking/spawning the next member) must be KEPT — the lease is
+    /// refreshed during the inter-member banking gap so the slow-but-fielding roster is not torn down + re-
+    /// fielded. The pre-fix lease (refresh only on the exact present++ tick) lapsed in this gap → churn.
+    #[test]
+    fn forming_in_flight_past_lease_is_kept_not_retired() {
+        let s = ReconcileSnapshot {
+            deadline_lapsed: true,
+            forming: true,
+            forming_progress: false, // present is flat this tick (between members)
+            forming_in_flight: true, // but a member is banking/spawning
+            forming_budget_remaining: true,
+            ..forming()
+        };
+        assert_eq!(reconcile(s), ReconcileAction::KeepRefreshLease);
+    }
+
+    /// DEEP-REACH FIX bound: the forming in-flight refresh is BOUNDED — once `forming_budget_remaining` is
+    /// false (the squad has been forming too long) the lease lapses even with a member nominally in flight,
+    /// so a genuinely-unfieldable squad still gives up (no immortal squad).
+    #[test]
+    fn forming_in_flight_past_budget_still_gives_up() {
+        let s = ReconcileSnapshot {
+            deadline_lapsed: true,
+            forming: true,
+            forming_progress: false,
+            forming_in_flight: true,
+            forming_budget_remaining: false, // budget exhausted
+            ..forming()
+        };
+        assert_eq!(
+            reconcile(s),
+            ReconcileAction::Retire { reason: RetireReason::GaveUp, withdraw: false, mark_unwinnable: true }
+        );
+    }
+
+    /// DEEP-REACH FIX (Break #2 travel half): a FULL-ROSTER squad TRAVELING to the target past its lease,
+    /// still closing distance (positional progress), must be KEPT — the travel lease is refreshed so the
+    /// squad does not lapse MID-HOP (the live W7N7 1-slot lapse). It has no focus + is not forming, so the
+    /// base lease would otherwise give up before it ever arrives.
+    #[test]
+    fn traveling_full_roster_past_lease_is_kept_not_retired() {
+        let s = ReconcileSnapshot {
+            deadline_lapsed: true,
+            forming: false, // full roster — past forming
+            traveling: true,
+            travel_progress: true,
+            travel_budget_remaining: true,
+            ..forming()
+        };
+        assert_eq!(reconcile(s), ReconcileAction::KeepRefreshLease);
+    }
+
+    /// DEEP-REACH FIX travel bound: the travel refresh is BOUNDED — a squad that can never arrive (no
+    /// positional progress, or the absolute travel budget exhausted) still gives up.
+    #[test]
+    fn traveling_without_progress_or_budget_gives_up() {
+        let stuck = ReconcileSnapshot { deadline_lapsed: true, traveling: true, travel_progress: false, travel_budget_remaining: true, ..forming() };
+        assert_eq!(
+            reconcile(stuck),
+            ReconcileAction::Retire { reason: RetireReason::GaveUp, withdraw: false, mark_unwinnable: true }
+        );
+        let over_budget = ReconcileSnapshot { deadline_lapsed: true, traveling: true, travel_progress: true, travel_budget_remaining: false, ..forming() };
+        assert_eq!(
+            reconcile(over_budget),
             ReconcileAction::Retire { reason: RetireReason::GaveUp, withdraw: false, mark_unwinnable: true }
         );
     }
