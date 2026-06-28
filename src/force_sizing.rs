@@ -26,6 +26,13 @@ use screeps_combat_engine::constants::{DISMANTLE_POWER, RANGED_ATTACK_POWER, TOW
 /// scenarios.
 pub const HOLD_MARGIN: f32 = 1.3;
 
+/// FIX 3 headroom for the MINIMAL undefended-target kill rate (zero attrition, zero repair). The force is
+/// sized to raze the structure within the on-site budget with this small surplus, so the optimizer's
+/// integer part-rounding (whole RANGED parts) still clears comfortably inside the window without climbing
+/// to the gross ceiling. Only applies to undefended, no-repair targets (the scoped FIX 3 path); the
+/// defended/repairing path is unchanged.
+const UNDEFENDED_KILL_HEADROOM: f32 = 1.15;
+
 /// Coordinated square-law over-match seed (ADR 0026 §9.4/§9.8): a player's creeps fight TOGETHER
 /// (focus-fire + mutual heal), so to win the attrition race with survivors we must OUT-power them, not
 /// merely match — field this multiple of the break-even creep-clear force. An `Individual` fight (NPCs
@@ -159,17 +166,38 @@ pub fn assess(profile: &DefenseProfile, budget: &ForceBudget) -> ForceAssessment
     if required_heal <= budget.max_heal_per_tick {
         let total = breach_ticks.saturating_add(kill_ticks);
         if total <= budget.onsite_budget_ticks {
-            return ForceAssessment {
-                winnable: true,
-                mode: AssaultMode::Breach,
-                required_heal_per_tick: required_heal,
+            // FIX 3 — UNDEFENDED, zero-attrition, no-repair target (e.g. a level-0 invader core: towers=[],
+            // enemy dps=0, repair=0). The GROSS-dismantle sizing below exists to out-pace defensive REPAIR
+            // (so repair can't cancel the breach twice at runtime). With NO repair and NO attrition there is
+            // nothing to out-pace and no risk of stalling — the only requirement is to raze
+            // `objective_hits + breach_hits` within the on-site budget. Sizing to the gross ceiling here
+            // over-sizes a trivial core to the full 4-5-fighter ceiling DPS; the EV optimizer then can't
+            // size below it. So size to the MINIMAL rate that clears within the window (a tiny headroom
+            // margin absorbs the ceil rounding), letting the optimizer field the fewest-creeps force the
+            // operator wants. SCOPED to `incoming == 0.0 && repair_per_tick == 0.0`; a DEFENDED or
+            // repairing target keeps the gross-dismantle sizing UNCHANGED (the calibration gates test
+            // defended sizing and must not shift).
+            let undefended_no_repair = incoming == 0.0 && profile.repair_per_tick == 0.0;
+            let required_dismantle_dps = if undefended_no_repair {
+                let window = budget.onsite_budget_ticks.max(1) as f32;
+                let minimal_rate = (profile.objective_hits + profile.breach_hits) as f32 / window;
+                // A small headroom factor so the optimizer's integer part-rounding still clears within the
+                // window; clamped to the gross ceiling so we never size ABOVE the defended path.
+                (minimal_rate * UNDEFENDED_KILL_HEADROOM).clamp(1.0, budget.max_dismantle_dps.max(1.0))
+            } else {
                 // GROSS dismantle the squad must FIELD — not the net-of-repair RATE. `breach_ticks` and
                 // `kill_ticks` above were computed assuming the squad brings the full
                 // `budget.max_dismantle_dps`; sizing to the net (`max − repair`) would have repair
                 // subtract a SECOND time at runtime, so the fielded squad delivers `net − repair` and
                 // stalls at the rampart. The squad must out-pace repair AND clear the core, so it fields
                 // the gross (`net + repair == max_dismantle_dps`).
-                required_dismantle_dps: budget.max_dismantle_dps.max(1.0),
+                budget.max_dismantle_dps.max(1.0)
+            };
+            return ForceAssessment {
+                winnable: true,
+                mode: AssaultMode::Breach,
+                required_heal_per_tick: required_heal,
+                required_dismantle_dps,
                 est_ticks: total,
                 reason: "breach: out-heal the towers and dismantle through",
             };

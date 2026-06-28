@@ -543,9 +543,29 @@ pub fn optimize_composition(
 
     // The (dynamic-margin-inflated) threat the candidate must survive + kill.
     let enemy = enemy.unwrap_or_default();
-    let incoming = (tower_dps_at_assault(&defense.towers) + enemy.dps) * params.dynamic_margin;
+    let tower_dps = tower_dps_at_assault(&defense.towers);
+    let incoming = (tower_dps + enemy.dps) * params.dynamic_margin;
     let required_kill =
         defense.objective_hits as f32 + defense.breach_hits as f32 + enemy.hits as f32 * params.dynamic_margin;
+
+    // FIX 3 — UNDEFENDED, zero-attrition structure target (e.g. a level-0 invader core: towers=[], enemy
+    // dps=0, no defenders). With NOTHING shooting back there is NO attrition risk: we ALWAYS win, for ANY
+    // force that razes the structure before its real available deadline (the long `onsite_window`, which the
+    // caller derives from the core's deploy/expiry window). The logistic `win_probability(deliverable,
+    // required_kill)` below conflates kill-SPEED with win-PROBABILITY — it stays < 1.0 at the minimal force
+    // even though the win is certain, so the optimizer climbs the over-power ladder and over-sizes a trivial
+    // core to 4-5 RangedDPS. For a no-attrition target `p_kill` is BINARY: 1.0 iff the candidate clears
+    // within the window (`deliverable >= required_kill`), else 0.0 (can't kill in time — not winnable in the
+    // window). That removes the over-power climb (every in-time force is equally certain to win), so the
+    // EV-max collapses to the MINIMAL clearing force via the cost term + the lowest-k / fewest-members
+    // tie-break — the operator's "fewest creeps / most efficient" goal.
+    //
+    // SCOPE: strictly `tower_dps == 0` (no energized towers) AND `incoming == 0` (no defender DPS / no enemy
+    // force). A DEFENDED target (energized towers OR enemy dps > 0) has real attrition, keeps `incoming > 0`,
+    // and falls to the existing logistic `p_kill` + over-power headroom UNCHANGED — so the DEFENDED
+    // calibration gates (OracleCalibration / SizingWins / CreepClearWins / the defended-core acceptance
+    // tests) are untouched.
+    let undefended = tower_dps == 0.0 && incoming == 0.0;
 
     let mut best: Option<(f32, f32, f32, usize, SquadComposition)> = None; // (ev, k, t, members, comp)
     for &k in OVER_POWER_LADDER.iter() {
@@ -563,7 +583,17 @@ pub fn optimize_composition(
             let caps = comp.capabilities(member_energy);
             let p_survive = win_probability(caps.heal_per_tick as f32, incoming);
             let deliverable = caps.structure_dps as f32 * onsite_window as f32;
-            let p_kill = win_probability(deliverable, required_kill);
+            // No-attrition target: certain win for any force that clears within the window; otherwise the
+            // logistic kill-speed → win-probability curve (DEFENDED, real attrition — unchanged).
+            let p_kill = if undefended {
+                if required_kill <= 0.0 || (deliverable >= required_kill && caps.structure_dps > 0) {
+                    1.0
+                } else {
+                    0.0
+                }
+            } else {
+                win_probability(deliverable, required_kill)
+            };
             let p_win = p_survive * p_kill;
             let cost = params.w_energy * comp.estimated_cost(member_energy) as f32 + params.w_creep * comp.member_count() as f32;
             let ev = p_win * target_value - cost;
@@ -885,5 +915,99 @@ mod tests {
         .expect("a winnable immune core commits at Default");
         // An immune core is killed by RANGED, not WORK.
         assert!(comp.slots.iter().any(|s| s.role == SquadRole::RangedDPS), "immune core fields RANGED: {}", comp.label);
+    }
+
+    /// FIX 3 — an UNDEFENDED, zero-attrition level-0 invader core (towers=[], enemy dps=0, hits~100k) MUST
+    /// size to the MINIMAL clearing force (the operator's "fewest creeps / most efficient" goal), NOT climb
+    /// the over-power ladder to the 4-5 RangedDPS over-size the EV optimizer used to pick. With nothing
+    /// shooting back the win is certain for any force that razes the core within the on-site window, so
+    /// `p_kill` is binary and the EV-max collapses to the cheapest in-time force.
+    #[test]
+    fn optimize_composition_sizes_an_undefended_core_to_a_minimal_force() {
+        let undefended = DefenseProfile {
+            towers: vec![], // no towers
+            breach_hits: 0,
+            objective_hits: 100_000,
+            enemy_dps: 0.0, // no defenders
+            repair_per_tick: 0.0,
+            safe_mode: false,
+        };
+        let comp = optimize_composition(
+            DoctrineObjective::KillImmuneStructure,
+            &undefended,
+            None, // no enemy force
+            100_000.0,
+            1400,
+            EnemyCoordination::Individual,
+            0.0,
+            true,
+            &CompositionParams { member_energy: 5600, ..Default::default() },
+        )
+        .expect("an undefended core is trivially winnable");
+        // MINIMAL: strictly fewer than the old 4-5-member over-size.
+        assert!(
+            comp.member_count() <= 3,
+            "undefended core must size to a minimal force (≤3), got {} ({})",
+            comp.member_count(),
+            comp.label
+        );
+        // Still actually fields a RANGED kill (an immune core needs ranged) — i.e. it's a real clearing force,
+        // not an empty one.
+        assert!(
+            comp.slots.iter().any(|s| s.role == SquadRole::RangedDPS),
+            "undefended immune core still fields a RANGED kill: {}",
+            comp.label
+        );
+    }
+
+    /// FIX 3 scoping guard — a DEFENDED high-value core MUST still OVER-INVEST via the over-power path
+    /// (real attrition ⇒ p_kill headroom is correct), while the SAME bed UNDEFENDED sizes minimal. This is
+    /// the DEFENDED-vs-UNDEFENDED distinction the FIX 3 scope hinges on: the over-power climb is preserved
+    /// for defended targets (the calibration gates test this) and removed only for zero-attrition ones.
+    #[test]
+    fn over_invest_distinguishes_defended_from_undefended() {
+        let p = CompositionParams { member_energy: 5600, w_energy: 0.01, ..Default::default() };
+        let undefended = DefenseProfile {
+            towers: vec![],
+            breach_hits: 0,
+            objective_hits: 100_000,
+            enemy_dps: 0.0,
+            repair_per_tick: 0.0,
+            safe_mode: false,
+        };
+        let defended = DefenseProfile {
+            towers: vec![TowerThreat { range_to_assault: 14, energy: 1000 }], // energized tower → real attrition
+            objective_hits: 100_000,
+            ..undefended.clone()
+        };
+        let opt = |d: &DefenseProfile| {
+            optimize_composition(
+                DoctrineObjective::KillImmuneStructure,
+                d,
+                None,
+                50_000_000.0, // a huge value — the over-power knob bites hard IF there is attrition headroom
+                1400,
+                EnemyCoordination::Individual,
+                0.0,
+                true,
+                &p,
+            )
+            .expect("winnable")
+        };
+        let undef = opt(&undefended);
+        let def = opt(&defended);
+        // Even at a huge value the UNDEFENDED core stays minimal (no attrition ⇒ no P(win) to buy), while the
+        // DEFENDED core over-invests (real attrition ⇒ over-power pays). The defended force is strictly larger.
+        assert!(
+            def.estimated_cost(5600) > undef.estimated_cost(5600),
+            "defended high-value over-invests vs undefended minimal: defended {} vs undefended {}",
+            def.estimated_cost(5600),
+            undef.estimated_cost(5600)
+        );
+        assert!(
+            undef.member_count() <= 3,
+            "undefended stays minimal even at huge value: {} members",
+            undef.member_count()
+        );
     }
 }
