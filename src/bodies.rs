@@ -23,13 +23,19 @@ pub struct CombatBodySpec {
     pub work: u32,
     pub carry: u32,
     pub heal: u32,
+    /// CLAIM parts — ADR 0027 v1.1 P2: a [`SquadRole::Declaimer`](crate::composition::SquadRole) member
+    /// `attackController`s a derelict controller to neutral. The force-sizing oracle never sizes CLAIM (it
+    /// has no combat dimension); only the `DeclaimAttack` doctrine sets it. Defaults to 0 so every existing
+    /// combat-body construction is byte-unchanged.
+    #[serde(default)]
+    pub claim: u32,
 }
 
 impl CombatBodySpec {
     /// Fatigue-generating parts (everything except MOVE; CARRY counted conservatively as it may be
     /// laden in transit) — the input to the MOVE-ratio calc.
     pub fn non_move_parts(&self) -> u32 {
-        self.tough + self.attack + self.ranged_attack + self.work + self.carry + self.heal
+        self.tough + self.attack + self.ranged_attack + self.work + self.carry + self.heal + self.claim
     }
 }
 
@@ -77,6 +83,7 @@ pub fn build_combat_body(spec: &CombatBodySpec, move_profile: MoveProfile, max_e
         + spec.work * Part::Work.cost()
         + spec.carry * Part::Carry.cost()
         + spec.heal * Part::Heal.cost()
+        + spec.claim * Part::Claim.cost()
         + moves * Part::Move.cost();
     if cost > max_energy {
         return None;
@@ -85,13 +92,14 @@ pub fn build_combat_body(spec: &CombatBodySpec, move_profile: MoveProfile, max_e
     let mut body = Vec::with_capacity(total as usize);
     body.extend(std::iter::repeat_n(Part::Tough, spec.tough as usize));
     // Round-robin the remaining buckets (incl. MOVE) so capabilities degrade evenly behind the TOUGH.
-    let mut buckets: [(Part, u32); 6] = [
+    let mut buckets: [(Part, u32); 7] = [
         (Part::Move, moves),
         (Part::RangedAttack, spec.ranged_attack),
         (Part::Attack, spec.attack),
         (Part::Work, spec.work),
         (Part::Carry, spec.carry),
         (Part::Heal, spec.heal),
+        (Part::Claim, spec.claim),
     ];
     let mut remaining: u32 = buckets.iter().map(|(_, n)| *n).sum();
     while remaining > 0 {
@@ -298,6 +306,19 @@ mod tests {
         assert_eq!(count(&body, Part::Move), 12, "1:1 move for 12 non-move parts");
         assert_eq!(body.len(), 24);
         assert!(body[0] == Part::Tough && body[1] == Part::Tough, "TOUGH is the front meat-shield");
+    }
+
+    /// ADR 0027 v1.1 P2: a CLAIM declaimer body (CLAIM + MOVE, plains 1:1). CLAIM costs 600e, so 1 CLAIM +
+    /// 1 MOVE = 650e, affordable at RCL4+; the MOVE keeps it mobile (CLAIM is fatigue-generating).
+    #[test]
+    fn build_combat_body_builds_a_claim_declaimer() {
+        let spec = CombatBodySpec { claim: 1, ..Default::default() };
+        let body = build_combat_body(&spec, MoveProfile::Plains, 700).expect("1 CLAIM + 1 MOVE = 650e fits");
+        assert_eq!(count(&body, Part::Claim), 1, "the CLAIM weapon");
+        assert_eq!(count(&body, Part::Move), 1, "1:1 plains MOVE keeps it mobile");
+        assert_eq!(body.len(), 2);
+        // Too poor to afford even one CLAIM ⇒ the can't-afford defer signal.
+        assert_eq!(build_combat_body(&spec, MoveProfile::Plains, 600), None, "650e body > 600e budget → None");
     }
 
     #[test]

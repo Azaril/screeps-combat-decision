@@ -338,6 +338,11 @@ pub struct RequiredForce {
     /// Σ TOUGH parts — the effective-HP buffer. v1 = 0 (role bodies carry their own HP); the
     /// margin-driven EHP buffer is R5/D2.
     pub tough_parts: u32,
+    /// Σ CLAIM parts — ADR 0027 v1.1 P2: the `attackController` weapon for a DECLAIM objective (neutralize a
+    /// derelict controller). Sized ONLY by the `DeclaimAttack` doctrine (a derelict controller is undefended
+    /// by construction, so the force-sizing oracle never sets this); `assemble_force` fields the
+    /// [`Declaimer`](crate::composition::SquadRole::Declaimer) role from it. Zero on every combat objective.
+    pub claim_parts: u32,
 }
 
 impl RequiredForce {
@@ -357,6 +362,7 @@ impl RequiredForce {
             // (P2) adds anti-creep via clear_force over enemy_force; here it stays 0.
             anti_creep_parts: 0,
             tough_parts: 0,
+            claim_parts: 0,
         }
     }
 
@@ -384,6 +390,7 @@ impl RequiredForce {
             immune_struct_parts: s(self.immune_struct_parts),
             anti_creep_parts: s(self.anti_creep_parts),
             tough_parts: s(self.tough_parts),
+            claim_parts: s(self.claim_parts),
         }
     }
 }
@@ -654,7 +661,7 @@ mod tests {
     #[test]
     fn importance_scales_the_invested_force() {
         assert_eq!(importance_margin(0.0), 1.0);
-        let base = RequiredForce { heal_parts: 10, dismantle_parts: 6, immune_struct_parts: 0, anti_creep_parts: 0, tough_parts: 0 };
+        let base = RequiredForce { heal_parts: 10, dismantle_parts: 6, immune_struct_parts: 0, anti_creep_parts: 0, tough_parts: 0, claim_parts: 0 };
         assert_eq!(base.scaled(importance_margin(0.0)), base, "importance 0 → no over-invest");
         assert_eq!(importance_margin(1.0), 1.5);
         let crit = base.scaled(importance_margin(1.0));

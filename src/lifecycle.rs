@@ -63,6 +63,18 @@ pub struct ReconcileSnapshot {
     /// the OBJECTIVE lifecycle, not an infinite lease: when the threat clears, war.rs stops asserting the
     /// Defend objective → `objective_gone` fires → the garrison retires cleanly (no infinite garrison).
     pub holding_station: bool,
+    /// ADR 0027 v1.1 P2 (DECLAIM persistence across the 1000-tick cadence): a `Declaim` squad's CLAIM
+    /// declaimer has reached the controller room (`in_target_room`) and is striking it on the 1000-tick
+    /// upgrade-block cadence. A declaimer carries NO combat parts, so it has no `focus` and never latches
+    /// `engaged_once` — without this flag the base lease lapses at +400 (mid-cadence, between strikes) and the
+    /// squad would `GaveUp`+mark_unwinnable WHILE STILL NEUTRALIZING the controller. Set by the manager as
+    /// `is_declaim && in_target_room && has_members`; the kernel treats it EXACTLY like `holding_station` —
+    /// it refreshes the lease (engaged/holding) AND blocks the `resolved` clear (a declaimer in a quiet room
+    /// has no focus, which would otherwise read as "cleared"). BOUNDED by the OBJECTIVE lifecycle, not an
+    /// infinite lease: once the controller goes neutral the producer (`SalvageMission`) stops emitting the
+    /// `Declaim` objective → `objective_gone` retires the squad cleanly; a re-armed room is withdrawn the same
+    /// way (the salvage standdown). So the declaimer persists across the cadence but never immortally.
+    pub declaiming: bool,
     /// ADR 0027 v1 (whole-squad REASSIGN): a sibling objective is available for THIS squad to take over
     /// (a manager-computed snapshot, fed in EXACTLY like `holding_station` so the kernel stays pure —
     /// `best_unclaimed_near_excluding(exclude=[current])` filtered through the capability gate, true ⇒ a
@@ -144,7 +156,14 @@ pub enum ReconcileAction {
 /// `traveling` AND making positional `travel_progress` (closing distance) the lease is refreshed, BOUNDED by
 /// `travel_budget_remaining` (an absolute travel clock) so a squad that can never arrive still gives up.
 pub fn reconcile(s: ReconcileSnapshot) -> ReconcileAction {
-    let resolved = s.engaged_once && s.in_target_room && !s.has_focus && s.has_members;
+    // ADR 0027 v1.1 P2: a DECLAIMING squad (in the controller room, striking on the 1000-tick cadence) is
+    // HOLDING, not done — a CLAIM declaimer has no focus, so without this guard `resolved` (engaged_once &&
+    // in_room && !focus) or `gave_up` (lease lapsed && !focus) would mislabel mid-neutralization as a clean
+    // clear / a give-up. Treated exactly like `holding_station`: it refreshes the lease and blocks both
+    // terminals; the producer withdraws the objective when the controller goes neutral (objective_gone retires).
+    let declaiming = s.declaiming && s.in_target_room && s.has_members;
+    // A declaimer in its room with no focus must NOT read as a clean clear (it is still striking, not done).
+    let resolved = s.engaged_once && s.in_target_room && !s.has_focus && s.has_members && !declaiming;
     // A forming squad keeps its lease alive past the deadline (bounded — see the doc comment) while it is
     // making spawn PROGRESS (a member just appeared) OR a member is IN FLIGHT (banking/spawning the next
     // member, even on a tick the present count is flat). The in-flight refresh is bounded by
@@ -160,8 +179,13 @@ pub fn reconcile(s: ReconcileSnapshot) -> ReconcileAction {
     // it must not GaveUp+refield while the Defend objective persists. Bounded by the objective lifecycle:
     // when the threat clears, war.rs drops the Defend objective → `objective_gone` retires the garrison.
     let holding_station = s.holding_station && s.is_defend && s.in_target_room && !s.has_focus && s.has_members;
-    let gave_up =
-        s.deadline_lapsed && !s.has_focus && !resolved && !forming_progressing && !traveling_progressing && !holding_station;
+    let gave_up = s.deadline_lapsed
+        && !s.has_focus
+        && !resolved
+        && !forming_progressing
+        && !traveling_progressing
+        && !holding_station
+        && !declaiming;
 
     if s.objective_gone || s.duplicate || s.wiped || resolved || gave_up {
         // Precedence: a clean clear (Resolved) is the most informative + drives withdraw; then the
@@ -204,7 +228,7 @@ pub fn reconcile(s: ReconcileSnapshot) -> ReconcileAction {
     // Refresh the lease while actively engaging (a long fight / vision gap), while a forming squad is still
     // making spawn progress / has a member in flight (the rally-stall fix — the assembly is not torn down
     // mid-form), OR while a full-roster squad is traveling + closing on the target (the mid-hop lapse fix).
-    if s.has_focus || forming_progressing || traveling_progressing || holding_station {
+    if s.has_focus || forming_progressing || traveling_progressing || holding_station || declaiming {
         ReconcileAction::KeepRefreshLease
     } else {
         ReconcileAction::Keep
@@ -235,6 +259,7 @@ mod tests {
             travel_progress: false,
             travel_budget_remaining: true,
             holding_station: false,
+            declaiming: false,
             reassign_available: false,
         }
     }
@@ -448,6 +473,67 @@ mod tests {
             reconcile(s),
             ReconcileAction::Retire { reason: RetireReason::ObjectiveGone, withdraw: false, mark_unwinnable: false },
             "the garrison retires cleanly once its Defend objective is dropped (bounded by the objective, not the lease)"
+        );
+    }
+
+    /// ADR 0027 v1.1 P2: a DECLAIMING squad (a CLAIM declaimer in the controller room, striking on the
+    /// 1000-tick cadence) PERSISTS across the cadence — its lapsed lease is REFRESHED, never given up, while
+    /// it neutralizes the controller. A declaimer has no focus + never engages, so without `declaiming` the
+    /// lapsed lease would `GaveUp`+mark_unwinnable mid-neutralization (the exact failure P2 warns about).
+    #[test]
+    fn declaimer_persists_across_the_cadence_does_not_give_up() {
+        let s = ReconcileSnapshot {
+            in_target_room: true,
+            has_focus: false,      // a quiet derelict room — nothing to fight
+            engaged_once: false,   // a declaimer never enters combat
+            deadline_lapsed: true, // the lease lapsed BETWEEN strikes (mid-1000-tick cadence)
+            declaiming: true,      // the manager's is_declaim && in_target_room && has_members signal
+            ..forming()
+        };
+        assert_eq!(
+            reconcile(s),
+            ReconcileAction::KeepRefreshLease,
+            "an in-room declaimer holds its lease across the cadence, not GaveUp mid-neutralization"
+        );
+    }
+
+    /// ADR 0027 v1.1 P2: a declaimer in its room must NOT read as a clean clear. A focus-less in-room squad
+    /// that ALSO `engaged_once` would normally Resolve+withdraw — but a declaimer (declaiming=true) is still
+    /// striking, so `resolved` is blocked and the squad keeps holding (the controller-neutral terminal is the
+    /// producer's `objective_gone`, not a manager-side Resolve).
+    #[test]
+    fn declaimer_in_room_is_not_a_false_resolve() {
+        let s = ReconcileSnapshot {
+            in_target_room: true,
+            has_focus: false,
+            engaged_once: true, // even if it somehow latched, declaiming blocks the false Resolve
+            declaiming: true,
+            ..forming()
+        };
+        assert_eq!(
+            reconcile(s),
+            ReconcileAction::KeepRefreshLease,
+            "a declaiming squad is not a Resolved clean clear — it holds until the producer withdraws"
+        );
+    }
+
+    /// ADR 0027 v1.1 P2 bound: the declaim hold is bounded by the OBJECTIVE lifecycle, not an infinite lease.
+    /// Once the controller goes neutral (or the room re-arms), `SalvageMission` stops emitting the `Declaim`
+    /// objective → `objective_gone` retires the declaimer cleanly (no backoff — a clean de-claim is not a loss).
+    #[test]
+    fn declaimer_retires_when_controller_neutralized() {
+        let s = ReconcileSnapshot {
+            in_target_room: true,
+            has_focus: false,
+            declaiming: true,
+            objective_gone: true, // controller neutral → the producer dropped the Declaim objective
+            deadline_lapsed: true,
+            ..forming()
+        };
+        assert_eq!(
+            reconcile(s),
+            ReconcileAction::Retire { reason: RetireReason::ObjectiveGone, withdraw: false, mark_unwinnable: false },
+            "the declaimer retires cleanly once its Declaim objective is dropped (bounded by the objective)"
         );
     }
 

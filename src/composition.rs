@@ -58,6 +58,9 @@ pub enum SquadRole {
     Dismantler,
     /// Resource hauler with CARRY.
     Hauler,
+    /// Controller de-claimer with CLAIM — ADR 0027 v1.1 P2: `attackController`s a derelict controller to
+    /// neutral (the `DeclaimAttack` doctrine). Undefended by construction, so it carries CLAIM + MOVE only.
+    Declaimer,
 }
 
 /// Enum of body definition selectors. With the static catalog deleted (ADR 0031 Phase 4b), the only
@@ -298,6 +301,7 @@ fn single_role_spec(role: SquadRole, n: u32) -> bodies::CombatBodySpec {
         SquadRole::MeleeDPS => bodies::CombatBodySpec { attack: n, ..Default::default() },
         SquadRole::Tank => bodies::CombatBodySpec { tough: n, ..Default::default() },
         SquadRole::Hauler => bodies::CombatBodySpec { carry: n, ..Default::default() },
+        SquadRole::Declaimer => bodies::CombatBodySpec { claim: n, ..Default::default() },
     }
 }
 
@@ -383,11 +387,14 @@ pub fn assemble_force(req: &RequiredForce, member_energy: u32) -> Option<SquadCo
     // NOTE: this is the COMPOSITION order (the engaged formation expects the healer-anchored layout); the
     // FIGHTER-FIRST SPAWN ordering (deep-reach fix Break #1) is applied at the bot's Phase-B spawn loop
     // (`spawn_order_fighter_first`), NOT here — so the engaged force's positioning/formation is unchanged.
-    let demands: [(SquadRole, u32); 4] = [
+    let demands: [(SquadRole, u32); 5] = [
         (SquadRole::Healer, req.heal_parts),
         (SquadRole::Dismantler, req.dismantle_parts),
         (SquadRole::RangedDPS, req.immune_struct_parts + req.anti_creep_parts),
         (SquadRole::Tank, req.tough_parts),
+        // ADR 0027 v1.1 P2: a DECLAIM objective fields CLAIM declaimers (set only by the `DeclaimAttack`
+        // doctrine; 0 on every combat objective, so the demand list is inert for all existing objectives).
+        (SquadRole::Declaimer, req.claim_parts),
     ];
 
     let mut slots: Vec<SquadSlot> = Vec::new();

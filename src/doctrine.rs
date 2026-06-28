@@ -63,6 +63,9 @@ pub enum DoctrineObjective {
     Harass,
     /// Suppress a farmable hazard creep (a Source Keeper) — kite + out-heal + kill, hold the source.
     Suppress,
+    /// Neutralize a derelict controller (`attackController`) — ADR 0027 v1.1 P2. Fields a CLAIM declaimer
+    /// (undefended by construction; ALWAYS-FIELD — the EV/admit decision stays in `SalvageOperation`).
+    Declaim,
 }
 
 /// The resolved enemy creep force a creep-clear / defense sizes against (ADR 0026 §9.3/§9.4), derived from
@@ -217,8 +220,32 @@ pub fn emit_requirement(
             let f = enemy_force.unwrap_or_default();
             clear_force(defense.towers.clone(), f.dps, 0, f.heal, budget, over_power_margin, defense.safe_mode)
         }
+        // DECLAIM (ADR 0027 v1.1 P2): field a CLAIM declaimer. A derelict controller is undefended by
+        // construction (the salvage mission aborts on re-arm), so there is no winnability search — the
+        // requirement is a fixed CLAIM force the assembler fields directly (like `Suppress`, which is also
+        // winnable-by-construction). One declaimer is fielded ([`DECLAIM_CLAIM_PARTS`] CLAIM parts); only one
+        // `attackController` strike lands per 1000-tick upgrade-block cadence anyway, so a second would idle.
+        DoctrineObjective::Declaim => {
+            let required = RequiredForce { claim_parts: DECLAIM_CLAIM_PARTS, ..Default::default() };
+            let assessment = ForceAssessment {
+                winnable: true,
+                mode: AssaultMode::Breach,
+                required_heal_per_tick: 0.0,
+                required_dismantle_dps: 0.0,
+                est_ticks: 0,
+                reason: "declaim: neutralize the controller (attackController)",
+            };
+            (assessment, required)
+        }
     }
 }
+
+/// ADR 0027 v1.1 P2 — CLAIM parts on the single declaimer the `DeclaimAttack` doctrine sizes. A CLAIM body
+/// lives ~600 ticks and lands ~one strike before the 1000-tick upgrade-block clears, so a few CLAIM parts buy
+/// a meaningful single strike (−300 ttd per CLAIM, engine-mechanics §2.12) without runaway cost. The
+/// assembler caps the per-member count to what the home can afford, so this is the DESIRED, not guaranteed,
+/// size. (The doctrine sizes a CLAIM squad; the EV/admit gate stays in `SalvageOperation::salvage_worthwhile`.)
+pub const DECLAIM_CLAIM_PARTS: u32 = 4;
 
 /// Anti-creep OVERLAY for a STRUCTURE objective (ADR 0031 Layer C): when defenders are OBSERVED, size
 /// `anti_creep_parts` (via `clear_force` over `enemy_force`) to KILL them — `assess` only OUT-HEALS them
@@ -293,6 +320,19 @@ pub fn plan_engagement(doctrine: &dyn ForceDoctrine, ctx: &EngagementContext, bu
     // Suppress is winnable-by-construction + kited (no EV search needed — the keeper kill is the requirement);
     // assemble it directly so its bursty retreat tuning + always-field floor flow through unchanged.
     if matches!(ctx.objective, DoctrineObjective::Suppress) {
+        let retreat = doctrine.retreat_threshold();
+        let composition = assemble_force(&required, params.member_energy).map(|mut c| {
+            c.retreat_threshold = retreat;
+            c
+        });
+        return ForcePlan { composition, assessment, required };
+    }
+
+    // DECLAIM (ADR 0027 v1.1 P2) is winnable-by-construction (an undefended derelict controller) + always-
+    // field — assemble the fixed CLAIM force directly (NO EV/optimize search, which only sizes combat parts
+    // and would never field a CLAIM body, and NO default combat floor — a declaimer carries CLAIM + MOVE
+    // only). Mirrors the `Suppress` direct-assembly path. `None` only when no home affords even one declaimer.
+    if matches!(ctx.objective, DoctrineObjective::Declaim) {
         let retreat = doctrine.retreat_threshold();
         let composition = assemble_force(&required, params.member_energy).map(|mut c| {
             c.retreat_threshold = retreat;
@@ -466,6 +506,30 @@ impl ForceDoctrine for HarassRemote {
     }
 }
 
+/// De-claim a derelict controller (ADR 0027 v1.1 P2) → field a CLAIM declaimer that `attackController`s the
+/// controller to neutral for the waiting mining outpost. ALWAYS-FIELD (`honor_verdict() == false`) — a
+/// derelict controller is undefended by construction (the salvage mission aborts the moment the room re-arms),
+/// so there is no oracle gate here; the EV/admit decision (is this room worth taking over?) stays in
+/// `SalvageOperation::salvage_worthwhile`, and the producer only emits the `Declaim` objective once the
+/// corridor is open (`ControllerAccess::ReachableNow`, opened by the P1 breach `Dismantle` squad). The driver
+/// assembles the CLAIM force DIRECTLY (the `Declaim` arm in `plan_engagement` — the optimizer only sizes
+/// combat parts and would never field a CLAIM body). `Individual` (one controller).
+pub struct DeclaimAttack;
+impl ForceDoctrine for DeclaimAttack {
+    fn name(&self) -> &'static str {
+        "declaim-attack"
+    }
+    fn applies(&self, ctx: &EngagementContext) -> bool {
+        matches!(ctx.objective, DoctrineObjective::Declaim)
+    }
+    fn fighter_role(&self) -> SquadRole {
+        SquadRole::Declaimer // CLAIM neutralizes the controller (not a combat weapon)
+    }
+    fn honor_verdict(&self) -> bool {
+        false // always-field — the EV/admit decision is upstream in SalvageOperation, not the oracle
+    }
+}
+
 /// Garrison defense (ADR 0026 §9.10 L3, generalized ADR 0029) — hold an owned room against a present threat.
 /// Sizes a ranged+heal force CONTINUOUSLY through the force-sizing oracle (`clear_force` → `assemble_force`):
 /// the member count emerges from the threat, NOT from fixed buckets. The buckets (the former
@@ -508,6 +572,7 @@ pub fn default_doctrines() -> Vec<Box<dyn ForceDoctrine>> {
         Box::new(PlayerRaid),
         Box::new(GatedPlayerRaid),
         Box::new(HarassRemote),
+        Box::new(DeclaimAttack),
     ]
 }
 
@@ -598,6 +663,32 @@ mod tests {
         assert!(plan.required.heal_parts > 0, "out-heals the keeper melee");
         let comp = plan.composition.expect("always fields the suppression force");
         assert!((comp.retreat_threshold - 0.5).abs() < 1e-6, "SK retreat tuning is layered (bursty → 0.5)");
+    }
+
+    /// ADR 0027 v1.1 P2: the `DeclaimAttack` doctrine routes a `Declaim` objective + sizes a CLAIM declaimer
+    /// squad — ALWAYS-FIELD (the EV/admit gate is upstream in SalvageOperation), undefended-by-construction
+    /// (fields even with no scouted threat), and the assembled body is CLAIM + MOVE only (no combat floor).
+    #[test]
+    fn declaim_attack_sizes_a_claim_declaimer_and_always_fields() {
+        use crate::composition::SquadRole;
+        let docs = default_doctrines();
+        let c = ctx(DoctrineObjective::Declaim, DefenseProfile::default());
+        let doc = decide_doctrine(&c, &docs).expect("Declaim → declaim-attack");
+        assert_eq!(doc.name(), "declaim-attack");
+        assert!(!doc.honor_verdict(), "declaim always-fields (the gate is upstream in SalvageOperation)");
+        let plan = plan_engagement(doc, &c, None);
+        assert_eq!(plan.required.claim_parts, super::DECLAIM_CLAIM_PARTS, "the doctrine sizes the CLAIM weapon");
+        let comp = plan.composition.expect("a home affords the declaimer (always-field, undefended)");
+        // Exactly one declaimer (one strike per 1000-tick cadence), built CLAIM + MOVE — no combat parts.
+        assert_eq!(comp.slots.len(), 1, "one declaimer (a second would idle behind the upgrade-block cadence)");
+        assert!(comp.slots.iter().all(|s| s.role == SquadRole::Declaimer), "the sole role is Declaimer");
+        let body = comp.slots[0].body_type.build_body(c.member_energy, crate::bodies::MoveProfile::Plains).expect("builds");
+        assert!(body.iter().any(|&p| p == screeps::Part::Claim), "the declaimer carries CLAIM");
+        assert!(body.iter().any(|&p| p == screeps::Part::Move), "and MOVE");
+        assert!(
+            body.iter().all(|&p| matches!(p, screeps::Part::Claim | screeps::Part::Move)),
+            "CLAIM + MOVE only — no combat floor on a declaimer"
+        );
     }
 
     #[test]
@@ -695,6 +786,7 @@ mod tests {
             (DoctrineObjective::ClearCreeps, "player-raid"),
             (DoctrineObjective::RaidCreeps, "gated-player-raid"),
             (DoctrineObjective::Harass, "harass-remote"),
+            (DoctrineObjective::Declaim, "declaim-attack"),
         ];
         for (obj, name) in cases {
             let c = ctx(obj, DefenseProfile::default());
@@ -731,7 +823,7 @@ mod tests {
     fn always_field_doctrines_field_even_unscouted() {
         let docs = default_doctrines();
         // honor_verdict == false (operator intent / deny) → field a force even with NO scouted threat.
-        for obj in [DoctrineObjective::ClearCreeps, DoctrineObjective::Harass] {
+        for obj in [DoctrineObjective::ClearCreeps, DoctrineObjective::Harass, DoctrineObjective::Declaim] {
             let c = ctx(obj, DefenseProfile::default());
             let doc = decide_doctrine(&c, &docs).expect("routes");
             assert!(!doc.honor_verdict(), "{obj:?} is always-field");
@@ -762,6 +854,7 @@ mod tests {
             DoctrineObjective::RaidCreeps,
             DoctrineObjective::Suppress,
             DoctrineObjective::Harass,
+            DoctrineObjective::Declaim,
         ] {
             let run = || emit_requirement(obj, &defense, enemy, Some(&budget), EnemyCoordination::Coordinated, 0.5, HOLD_MARGIN, COORDINATED_DPS_MARGIN);
             assert_eq!(run(), run(), "{obj:?}: the emitter is deterministic");
