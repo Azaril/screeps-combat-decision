@@ -48,16 +48,37 @@ pub fn squad_ready_to_depart_at_quorum(member_positions: &[Option<Position>], re
     present >= quorum
 }
 
+/// Whether the combat DTOs for a target room come from a TRUSTWORTHY source — i.e. empty hostiles/towers
+/// genuinely mean "clear", not merely "unseen". An offense target is reliable when EITHER it is `mapped`
+/// (a scouted `RoomData` ECS entity whose cached last-scouted intel persists even without current live
+/// vision) OR it is `live_visible` (a member stands in it this tick). Only a GENUINELY-UNKNOWN room
+/// (unmapped AND not live-visible) is unreliable.
+///
+/// This is the stability property the rally-oscillation fix turns on: a MAPPED target stays reliable
+/// REGARDLESS of live vision, so `target_is_uncontested` no longer flaps as a solo member crosses the
+/// W6N5↔W7N5 boundary (toggling raw `game::rooms().get().is_some()` live vision). Cached intel is the
+/// single source of truth; the cache outlives the transient loss of vision.
+pub fn rally_intel_reliable(mapped: bool, live_visible: bool) -> bool {
+    mapped || live_visible
+}
+
 /// Whether a target room is PROVEN UNCONTESTED — safe to deploy a sub-roster quorum into rather than
 /// holding the full all-or-nothing rally bloc. The classification (rally-stall fix): an undefended,
-/// towerless, not-safe-moded room that we can currently SEE. The visibility flag is LOAD-BEARING — an
-/// `unseen` target room reports empty hostiles/structures DTOs simply because we have no vision, NOT
-/// because it is clear; gating on `no_hostiles` alone would mis-classify a defended-but-unseen room as
-/// uncontested and trickle a sub-roster into it to be picked off. So we require POSITIVE room visibility
-/// (computed live via `game::rooms().get(room).is_some()` at the call site) AND no hostiles AND no hostile
+/// towerless, not-safe-moded room for which we have TRUSTWORTHY intel.
+///
+/// `intel_reliable` is LOAD-BEARING — when the target DTOs come from a GENUINELY-UNKNOWN room (unmapped
+/// AND no live vision) the empty hostiles/structures DTOs simply mean we have no information, NOT that the
+/// room is clear; gating on `no_hostiles` alone would mis-classify a defended-but-unseen room as
+/// uncontested and trickle a sub-roster into it to be picked off. So we require TRUSTWORTHY intel (cached
+/// scouted `RoomData` OR current live vision — see [`rally_intel_reliable`]) AND no hostiles AND no hostile
 /// towers AND no enemy safe mode. Any of those false ⇒ keep the hard full-roster rally.
-pub fn target_is_uncontested(room_visible: bool, no_hostiles: bool, no_hostile_towers: bool, no_enemy_safe_mode: bool) -> bool {
-    room_visible && no_hostiles && no_hostile_towers && no_enemy_safe_mode
+///
+/// NOTE (rally-oscillation fix): the first param was `room_visible` (raw current live vision) which FLAPPED
+/// as a solo member crossed a room boundary, flipping `uncontested` and oscillating the shared rally room.
+/// It is now `intel_reliable`, which is stably true for a mapped (scouted) target — breaking the feedback
+/// loop at its source. The boolean logic is UNCHANGED; only what the caller PASSES changed.
+pub fn target_is_uncontested(intel_reliable: bool, no_hostiles: bool, no_hostile_towers: bool, no_enemy_safe_mode: bool) -> bool {
+    intel_reliable && no_hostiles && no_hostile_towers && no_enemy_safe_mode
 }
 
 /// Select the rally/deploy gate (rally-stall fix). For a PROVEN-uncontested target the squad need not wait
@@ -506,5 +527,84 @@ mod tests {
         assert!(!target_is_uncontested(true, false, true, true), "hostiles present → not uncontested");
         assert!(!target_is_uncontested(true, true, false, true), "hostile tower present → not uncontested");
         assert!(!target_is_uncontested(true, true, true, false), "enemy safe mode → not uncontested");
+    }
+
+    // ── RALLY-OSCILLATION FIX (intel-reliability, not raw live vision) ──────────────────────────────
+
+    /// The stability property: a MAPPED (scouted) target is reliable REGARDLESS of current live vision,
+    /// so its `intel_reliable` does not flap as a member crosses a room boundary. An UNMAPPED room is
+    /// reliable only while we actually see it; a genuinely-unknown room (neither) stays guarded.
+    #[test]
+    fn intel_reliable_mapped_is_stable_regardless_of_live_vision() {
+        // Mapped → reliable whether or not we currently see it (the stability that kills the oscillation).
+        assert!(rally_intel_reliable(true, false), "mapped + no live vision → reliable (cached intel)");
+        assert!(rally_intel_reliable(true, true), "mapped + live vision → reliable");
+        // Unmapped → reliable only with current live vision.
+        assert!(rally_intel_reliable(false, true), "unmapped + live-visible → reliable (we see it now)");
+        // Genuinely unknown → never reliable (never trust no-vision emptiness).
+        assert!(!rally_intel_reliable(false, false), "unmapped + unseen → NOT reliable (guarded)");
+    }
+
+    /// REPRODUCE the oscillation (RED before the fix): the OLD raw-live-vision input flaps
+    /// `[false,true,false,true]` as a solo member crosses the room boundary, while cached hostiles are
+    /// stably empty. Feeding that flapping flag straight into `target_is_uncontested` (the pre-fix
+    /// behaviour) flips `uncontested` every tick → `shared_rally_point` flips the rally ROOM between the
+    /// target (uncontested) and one room short (contested). Asserts the rally room OSCILLATES — the bug.
+    #[test]
+    fn shared_rally_oscillates_when_fed_raw_live_vision() {
+        let approach = pos(25, 25, "W6N5"); // one room short of the target, on the approach side
+        let target = pos(25, 25, "W7N5");
+        // A solo member crossing the boundary makes raw live vision of the target room flap each tick.
+        let raw_live_vision = [false, true, false, true];
+        let no_hostiles = true; // cached intel is stably clear
+
+        let rally_rooms: Vec<RoomName> = raw_live_vision
+            .iter()
+            .map(|&room_visible| {
+                // PRE-FIX: the bot passed raw live vision as the first arg.
+                let uncontested = target_is_uncontested(room_visible, no_hostiles, true, true);
+                shared_rally_point(approach, target, uncontested).room_name()
+            })
+            .collect();
+
+        let target_room = target.room_name();
+        let short_room = "W6N5".parse::<RoomName>().unwrap();
+        // The rally room flips target ⇄ one-room-short across the tick sequence — the stall feedback loop.
+        assert_eq!(rally_rooms[0], short_room, "vision lost → contested → stage one room short");
+        assert_eq!(rally_rooms[1], target_room, "vision gained → uncontested → stage at the target");
+        assert_ne!(rally_rooms[0], rally_rooms[1], "the rally room OSCILLATES (the reproduced bug)");
+        assert_eq!(rally_rooms[2], short_room);
+        assert_eq!(rally_rooms[3], target_room);
+    }
+
+    /// PROVE the fix (GREEN): a MAPPED target → `intel_reliable` is stably TRUE (computed via
+    /// `rally_intel_reliable(mapped=true, live)`) under the SAME flapping live vision and stable empty
+    /// cached hostiles. The rally room is now CONSTANT across the whole tick sequence — the feedback loop
+    /// is broken at its source.
+    #[test]
+    fn shared_rally_is_constant_for_a_mapped_target_under_flapping_vision() {
+        let approach = pos(25, 25, "W6N5");
+        let target = pos(25, 25, "W7N5");
+        let flapping_live_vision = [false, true, false, true];
+        let no_hostiles = true;
+        let mapped = true; // an assault objective is always a mapped (scouted) room
+
+        let rally_rooms: Vec<RoomName> = flapping_live_vision
+            .iter()
+            .map(|&live_visible| {
+                // POST-FIX: the bot passes reliable intel, not raw live vision.
+                let intel_reliable = rally_intel_reliable(mapped, live_visible);
+                let uncontested = target_is_uncontested(intel_reliable, no_hostiles, true, true);
+                shared_rally_point(approach, target, uncontested).room_name()
+            })
+            .collect();
+
+        let first = rally_rooms[0];
+        assert_eq!(first, target.room_name(), "mapped + clear → uncontested → stage at the target");
+        assert!(
+            rally_rooms.iter().all(|&r| r == first),
+            "the rally room is CONSTANT across the flapping-vision sequence (oscillation fixed): {:?}",
+            rally_rooms
+        );
     }
 }
