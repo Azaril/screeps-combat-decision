@@ -1143,6 +1143,156 @@ fn tower_nest_centroid(towers: &[&CombatStructureDto]) -> Position {
     )
 }
 
+/// ADR 0031 §2(g) — the DRAIN healer set-back from the standoff (tiles farther from the nest than the
+/// tank, along the approach ray). `1` = the healer sits one tile BEHIND the tank (farther from the towers,
+/// so the tank — not a healer — stays the towers' single nearest focus), at melee-heal range 1 of it. The
+/// oracle's drain-sustain math sizes the heal at the range-1 rate (`heal_power × HEAL_POWER` = 12×/part),
+/// so the soak only holds if the healers actually heal at range 1 — a larger set-back drops them to the
+/// 4×/part ranged-heal band and the soak under-heals. Behind-by-one keeps the tank forward AND the heal at
+/// the full rate.
+const DRAIN_HEALER_SETBACK: u32 = 1;
+
+/// ADR 0031 §2(g) — pick the DRAIN tank: the soak member with the most EHP (max `hits_max` — the TOUGH
+/// member presents the armor). Deterministic tie-break = the LOWEST member index (the Vec is the stable
+/// roster order; no float, no HashMap). Returns `None` if no member has spawned (no `hits_max > 0`).
+fn drain_tank_index(members: &[SquadMemberView]) -> Option<usize> {
+    members
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.hits_max > 0 && m.pos.is_some())
+        // Max hits_max wins; on a tie the EARLIER index wins (`max_by_key` keeps the LAST max on equal
+        // keys, so fold the negated index into the key to make the lowest index the maximum).
+        .max_by_key(|(i, m)| (m.hits_max, std::cmp::Reverse(*i)))
+        .map(|(i, _)| i)
+}
+
+/// ADR 0031 §2(g) — project a tile `dist` tiles from `nest` along the `nest → toward` direction (the
+/// squad's approach ray), clamped to the room. Chebyshev step: each axis moves toward `toward` by the
+/// signed unit, scaled to `dist`, so a tank at `dist == standoff_range` sits at the falloff standoff and
+/// a healer at `dist == standoff_range + setback` sits behind it. Integer (bit-deterministic, no float).
+fn project_from_nest(nest: Position, toward: Position, dist: u32) -> Position {
+    let (nx, ny) = (nest.x().u8() as i32, nest.y().u8() as i32);
+    let (tx, ty) = (toward.x().u8() as i32, toward.y().u8() as i32);
+    let (dx, dy) = (tx - nx, ty - ny);
+    // Scale the ACTUAL approach vector to Chebyshev length `dist`, PRESERVING its direction (the longer
+    // axis hits `dist`, the shorter is scaled proportionally). A pure per-axis signum would force a 45°
+    // diagonal and drive a near-horizontal approach into the room corner; proportional scaling keeps the
+    // standoff on the real approach line. Degenerate (squad on the nest) ⇒ push straight west so a goal
+    // still exists.
+    let cheb = dx.abs().max(dy.abs());
+    let (ox, oy) = if cheb == 0 {
+        (-(dist as i32), 0)
+    } else {
+        // round(d * dist / cheb) per axis (integer, symmetric rounding) — bit-deterministic.
+        let scale = |d: i32| -> i32 {
+            let num = d * dist as i32;
+            let q = num / cheb;
+            let rem = num % cheb;
+            // round half away from zero
+            if 2 * rem.abs() >= cheb {
+                q + d.signum()
+            } else {
+                q
+            }
+        };
+        (scale(dx), scale(dy))
+    };
+    let px = (nx + ox).clamp(0, ROOM_EDGE_MAX as i32) as u8;
+    let py = (ny + oy).clamp(0, ROOM_EDGE_MAX as i32) as u8;
+    Position::new(
+        RoomCoordinate::new(px).expect("clamped 0..=49"),
+        RoomCoordinate::new(py).expect("clamped 0..=49"),
+        nest.room_name(),
+    )
+}
+
+/// ADR 0031 §2(g) DRAIN tank-forward + healers-behind per-member goals. The TANK (`tank_idx`) holds the
+/// falloff STANDOFF (forward, soaking the falloff fire); every OTHER living, positioned member (the
+/// healers/support) is set BEHIND the tank — [`DRAIN_HEALER_SETBACK`] tiles deeper into the falloff along
+/// the squad's approach ray (`nest → centroid`), so it stays within ranged-heal range (≤3) of the tank
+/// but OUT of / at the edge of the soak band the tank eats. Returned parallel to `members`: `Some(tile)`
+/// overrides the shared `Drain` directive for that member (the adapter stamps it as `Advance{range:0}`);
+/// `None` ⇒ follow the block. Pure geometry → bit-deterministic.
+fn drain_member_goals(members: &[SquadMemberView], nest: Position, centroid: Position, standoff_range: u8) -> Vec<Option<Position>> {
+    let tank_idx = match drain_tank_index(members) {
+        Some(i) => i,
+        None => return vec![None; members.len()],
+    };
+    // The approach ray points from the nest toward the squad centroid (the side it came in from). The
+    // tank holds at the standoff on that ray; healers sit `setback` farther out on the SAME ray.
+    let tank_goal = project_from_nest(nest, centroid, standoff_range as u32);
+    let healer_goal = project_from_nest(nest, centroid, standoff_range as u32 + DRAIN_HEALER_SETBACK);
+    (0..members.len())
+        .map(|i| {
+            let m = &members[i];
+            if m.hits == 0 || m.pos.is_none() {
+                return None; // unspawned / dead — no goal to honour
+            }
+            if i == tank_idx {
+                Some(tank_goal) // the TOUGH front holds the standoff and soaks the falloff fire
+            } else {
+                Some(healer_goal) // healers/support stay behind the tank, in heal range, out of the soak band
+            }
+        })
+        .collect()
+}
+
+/// ADR 0031 §2(g) DRAIN heal-the-tank assignment: in the drain stance the TANK is the sole soaker, so
+/// every available in-range healer is force-assigned to it FIRST (sustain the front), and only the spill
+/// (idle healers) falls through to the generic [`assign_heals`] triage. Reuses the same greedy machinery
+/// — the tank is just pinned as the priority target — so the heal math (range bands, over-heal cap) is
+/// identical. Returns assignments over member indices, parallel-compatible with the generic path.
+fn assign_heals_drain(
+    members: &[SquadMemberView],
+    threats: &[kite::KiteThreat],
+    towers: &[kite::KiteTower],
+    tank_idx: usize,
+) -> Vec<HealAssignment> {
+    let tank = &members[tank_idx];
+    let tank_pos = match tank.pos {
+        Some(p) => p,
+        None => return assign_heals(members, threats, towers), // no positioned tank → generic triage
+    };
+    let healers: Vec<usize> = (0..members.len())
+        .filter(|&i| members[i].heal_power > 0 && members[i].pos.is_some())
+        .collect();
+    let mut out = Vec::new();
+    let mut idle: Vec<usize> = Vec::new();
+    // (1) Force every IN-RANGE healer onto the tank first — the soaker must outlast the drain.
+    for &hi in &healers {
+        let hp = members[hi].pos.expect("healer filtered to have a position");
+        let range = hp.get_range_to(tank_pos);
+        let heal = if range <= 1 {
+            members[hi].heal_power * 12
+        } else if range <= 3 {
+            members[hi].heal_power * 4
+        } else {
+            idle.push(hi); // out of heal range of the tank this tick → spill to generic triage
+            continue;
+        };
+        // Over-heal cap: don't assign more than the tank's deficit + its anticipated incoming this tick.
+        let risk = tank.damage_taken_last_tick.max(incoming_damage_at(tank_pos, threats, towers));
+        let need = (tank.hits_max - tank.hits) + risk;
+        if need == 0 {
+            idle.push(hi); // tank is topped + safe → this healer is free for the spill
+            continue;
+        }
+        out.push(HealAssignment { healer_idx: hi, target_idx: tank_idx, expected_heal: heal.min(need) });
+    }
+    // (2) Spill: idle healers (out of tank range, or tank already safe) run the generic triage so they
+    //     still cover a wounded support member. Filter the generic result to the idle healers only — the
+    //     tank-pinned ones above keep their assignment.
+    if !idle.is_empty() {
+        let idle_set: std::collections::BTreeSet<usize> = idle.into_iter().collect();
+        for a in assign_heals(members, threats, towers) {
+            if idle_set.contains(&a.healer_idx) {
+                out.push(a);
+            }
+        }
+    }
+    out
+}
+
 /// Assess engage-vs-retreat by Lanchester fighting strength over the **killable** enemy force, plus the
 /// hard vetoes the kill calc surfaces (ADR 0020 §8.2): out-healed/shielded enemies can't be cleared, and
 /// energized hostile towers + unkillable creeps are irremovable damage — if that exceeds our heal
@@ -1379,7 +1529,16 @@ pub fn decide_squad(view: &SquadView) -> SquadDecision {
         // DRY→ADVANCE transition): the squad closes on the dead base and breaches it.
     }
 
-    let heal_assignments = assign_heals(view.members, &kite_threats(view.hostiles), &kite_towers(view.structures));
+    // ADR 0031 §2(g) heal-the-tank: in an ACTIVE drain (the `Drain` standoff directive is set above), the
+    // TANK is the sole soaker — force the available in-range healers onto it FIRST, spill the rest to the
+    // generic triage. Outside the drain (normal/breach, or the dry→advance phase where `movement` is no
+    // longer `Drain`) the generic mortal-first triage is byte-unchanged.
+    let threats = kite_threats(view.hostiles);
+    let towers = kite_towers(view.structures);
+    let heal_assignments = match (matches!(movement, SquadMovement::Drain { .. })).then(|| drain_tank_index(view.members)).flatten() {
+        Some(tank_idx) => assign_heals_drain(view.members, &threats, &towers, tank_idx),
+        None => assign_heals(view.members, &threats, &towers),
+    };
     // Damage spill (ADR 0020 §4.2): per-member focus so combined fire doesn't over-damage one creep.
     let focus_assignments = assign_focus_fire(view.members, view.hostiles, view.structures);
 
@@ -1717,13 +1876,18 @@ pub fn decide_squad_with_pathing(
     };
     let room = centroid.room_name();
 
-    // ADR 0031 #39 DRAIN phase — when `decide_squad` set a `Drain` standoff (drain stance + live finite
-    // towers that the heal sustains against), the squad HOLDS the falloff standoff and the per-creep
-    // `decide_movement`/`decide_combat` handle the standoff step + self-heal. Bypass the kite/engage
-    // positioning + the EV kernel (which would otherwise re-aim the tank into the towers or emit goals):
-    // the drain directive governs. Once the towers run dry `decide_squad` no longer emits `Drain` and the
-    // normal Advance/breach path resumes (this guard is skipped).
-    if matches!(decision.movement, SquadMovement::Drain { .. }) {
+    // ADR 0031 #39/§2(g) DRAIN phase — when `decide_squad` set a `Drain` standoff (drain stance + live
+    // finite towers that the heal sustains against), the squad HOLDS the falloff standoff. Rather than move
+    // ALL members UNIFORMLY to the standoff band (which sits the healers in the falloff fire and kills them
+    // — the multi-member-soak gap), emit PER-MEMBER goals: the TANK (max-EHP TOUGH member) FORWARD to the
+    // standoff (it soaks the falloff fire) and the HEALERS BEHIND it (within ranged-heal range ≤3 of the
+    // tank but deeper into the falloff, OUT of the soak band). The adapter stamps each member_goal as that
+    // member's `Advance{range:0}`. The EV kernel + kite/engage positioning stay bypassed (the drain
+    // directive governs). Once the towers run dry `decide_squad` drops `Drain` and the normal Advance/breach
+    // path resumes (this guard is skipped). `decision.heal_assignments` is already tank-prioritized (set in
+    // `decide_squad`'s drain branch — heal-the-tank).
+    if let SquadMovement::Drain { goal: nest, standoff_range } = decision.movement {
+        decision.member_goals = drain_member_goals(view.members, nest, centroid, standoff_range);
         return decision;
     }
 
@@ -2827,6 +2991,88 @@ mod tests {
                 assert!((5..=20).contains(&standoff_range), "standoff is in the tower-falloff band, got {standoff_range}");
             }
             other => panic!("drain squad should emit a Drain standoff directive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drain_tank_index_picks_max_ehp_with_stable_tiebreak() {
+        // ADR 0031 §2(g) — the tank = the max-`hits_max` (TOUGH) member; on an EHP TIE the LOWEST index
+        // wins (deterministic, no HashMap). Unspawned / position-less members are ineligible.
+        let mk = |hits_max: u32, has_pos: bool| SquadMemberView {
+            hits: hits_max,
+            hits_max,
+            pos: has_pos.then(|| pos(5, 25)),
+            ..Default::default()
+        };
+        // Distinct EHP → the biggest wins (idx 2).
+        let distinct = vec![mk(2000, true), mk(4000, true), mk(8000, true)];
+        assert_eq!(drain_tank_index(&distinct), Some(2), "max hits_max is the tank");
+        // Tie on max EHP → the LOWEST index wins (idx 0, not 2).
+        let tied = vec![mk(8000, true), mk(2000, true), mk(8000, true)];
+        assert_eq!(drain_tank_index(&tied), Some(0), "tie-break is the lowest index (deterministic)");
+        // The biggest is unspawned (no pos) → it's skipped, the next eligible wins.
+        let unspawned = vec![mk(8000, false), mk(4000, true)];
+        assert_eq!(drain_tank_index(&unspawned), Some(1), "a position-less member is ineligible for tank");
+        // No eligible members → None.
+        assert_eq!(drain_tank_index(&[mk(0, true)]), None, "no spawned member → no tank");
+    }
+
+    #[test]
+    fn drain_member_goals_put_the_tank_forward_and_healers_behind_in_heal_range() {
+        // ADR 0031 §2(g) — per-member goals: the TANK closer to the nest (forward, at the standoff) so it
+        // is the towers' single nearest focus; the HEALERS one tile BEHIND it (farther from the nest, out
+        // of the soak band) but within heal range ≤3 of the tank. Approach from the WEST (centroid west of
+        // the nest), so "forward" = larger x (toward the nest), "behind" = smaller x.
+        let nest = pos(25, 25);
+        let centroid = pos(5, 25); // squad approaches from the west
+        let members = vec![
+            SquadMemberView { hits: 8000, hits_max: 8000, pos: Some(pos(6, 25)), ..Default::default() }, // tank (max EHP)
+            SquadMemberView { hits: 2000, hits_max: 2000, heal_power: 25, pos: Some(pos(5, 25)), ..Default::default() },
+            SquadMemberView { hits: 2000, hits_max: 2000, heal_power: 25, pos: Some(pos(5, 26)), ..Default::default() },
+        ];
+        let standoff = 18u8;
+        let goals = drain_member_goals(&members, nest, centroid, standoff);
+        assert_eq!(goals.len(), members.len());
+        let tank_goal = goals[0].expect("the tank has a goal");
+        let h1 = goals[1].expect("healer 1 has a goal");
+        let h2 = goals[2].expect("healer 2 has a goal");
+        // The tank holds the standoff (range == standoff from the nest).
+        assert_eq!(tank_goal.get_range_to(nest), standoff as u32, "tank goal is at the standoff range");
+        // The healers are BEHIND (farther from the nest) than the tank.
+        assert!(h1.get_range_to(nest) > tank_goal.get_range_to(nest), "healer 1 stands behind the tank (deeper falloff)");
+        assert!(h2.get_range_to(nest) > tank_goal.get_range_to(nest), "healer 2 stands behind the tank (deeper falloff)");
+        // …and within heal range (≤3) of the tank's standoff tile, so the heal still reaches.
+        assert!(tank_goal.get_range_to(h1) <= 3, "healer 1 is in heal range of the tank goal");
+        assert!(tank_goal.get_range_to(h2) <= 3, "healer 2 is in heal range of the tank goal");
+        // DETERMINISM: identical input → identical goals (pure geometry, no HashMap / RNG).
+        assert_eq!(goals, drain_member_goals(&members, nest, centroid, standoff), "per-member goals are deterministic");
+    }
+
+    #[test]
+    fn drain_heal_assignments_prioritize_the_tank() {
+        // ADR 0031 §2(g) — heal-the-tank: in an ACTIVE drain the available in-range healers are force-
+        // assigned to the TANK first (it is the soaker). Bed: a 4-finite-tower nest (the drain holds) +
+        // a max-EHP tank at the standoff + two healers in range 1 of it. The tank is WOUNDED so the heal
+        // has somewhere to land. All heal assignments must target the tank index.
+        let towers = vec![tower_e(24, 24, 1500), tower_e(26, 24, 1500), tower_e(24, 26, 1500), tower_e(26, 26, 1500)];
+        let structures: Vec<CombatStructureDto> = towers.into_iter().chain(std::iter::once(structure(25, 25, StructureType::Spawn, Ownership::Hostile))).collect();
+        let members = vec![
+            SquadMemberView { hits: 4000, hits_max: 8000, pos: Some(pos(5, 25)), ..Default::default() }, // wounded tank (max EHP)
+            SquadMemberView { hits: 2000, hits_max: 2000, heal_power: 40, pos: Some(pos(5, 24)), ..Default::default() }, // healer, range 1
+            SquadMemberView { hits: 2000, hits_max: 2000, heal_power: 40, pos: Some(pos(5, 26)), ..Default::default() }, // healer, range 1
+        ];
+        let d = decide_squad(&SquadView {
+            members: &members, hostiles: &[], structures: &structures, retreat_threshold: 0.3,
+            current_state: SquadOrderState::Engaged, enemy_safe_mode: false,
+            engage_objective: EngageObjective::Destroy, enemy_stalled: false, drain_stance: true,
+        });
+        // The drain directive is active (so the heal-the-tank path is taken).
+        assert!(matches!(d.movement, SquadMovement::Drain { .. }), "the drain standoff is active, got {:?}", d.movement);
+        assert!(!d.heal_assignments.is_empty(), "the wounded tank draws heals");
+        for a in &d.heal_assignments {
+            assert_eq!(a.target_idx, 0, "every drain heal targets the TANK (idx 0), got {a:?}");
+            // The tank's deficit is 4000; a range-1 healer's 40×12 = 480 is below that, so it's uncapped.
+            assert_eq!(a.expected_heal, 40 * 12, "an adjacent (range 1) healer heals 12/part");
         }
     }
 
