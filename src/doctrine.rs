@@ -76,10 +76,12 @@ pub enum DoctrineObjective {
 /// ADR 0031 #41 — `EnemyForce` is the SINGLE SOURCE OF TRUTH for enemy creep combat power, read by BOTH the
 /// structure-breach SIZING path ([`force_sizing::assess`], via [`emit_requirement`]) AND the EV path
 /// ([`crate::composition::optimize_composition`] / `pairing_p_win`). The former dual channel
-/// (`DefenseProfile.enemy_dps`) is removed. NOTE the `estimated_dps` overload: `dps` is the
-/// Attack/RangedAttack damage/tick only — it is NOT the harmlessness signal. A creep with `dps == 0` (a CLAIM
-/// declaimer, a WORK dismantler, a lone HEAL creep) can still be dangerous; harmlessness is a SEPARATE signal
-/// (`hostile_warrants_defender`, computed from parts at the producer — `threatmap.rs`), so `dps == 0`
+/// (`DefenseProfile.enemy_dps`) is removed. NOTE the combat-power vs harmlessness split (the former
+/// `estimated_dps` overload, now `RoomThreatData::estimated_attack_dps`): `dps` is the Attack/RangedAttack
+/// damage/tick only — it is NOT the harmlessness signal. A creep with `dps == 0` (a CLAIM declaimer, a WORK
+/// dismantler, a lone HEAL creep) can still be dangerous; harmlessness is a SEPARATE signal
+/// (`hostile_warrants_defender`, computed from parts at the producer — `threatmap.rs`; the cached canonical
+/// is `RoomThreatData::threat_level` / `warrants_attention`), so `dps == 0`
 /// ≠ harmless. Cross-ref ADR 0027 (owned-floor closure) + ADR 0031 §"Single enemy-force source of truth".
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct EnemyForce {
