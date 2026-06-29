@@ -72,6 +72,15 @@ pub enum DoctrineObjective {
 /// OBSERVED bodies — NOT type constants. For an `Individual` fight it is the WORST SINGLE enemy; for a
 /// `Coordinated` one, the AGGREGATE. `dps`/`hits`/`heal` drive `force_sizing::clear_force`; `count`/
 /// `boosted` drive a defender's SHAPE selection (`GarrisonDefense`).
+///
+/// ADR 0031 #41 — `EnemyForce` is the SINGLE SOURCE OF TRUTH for enemy creep combat power, read by BOTH the
+/// structure-breach SIZING path ([`force_sizing::assess`], via [`emit_requirement`]) AND the EV path
+/// ([`crate::composition::optimize_composition`] / `pairing_p_win`). The former dual channel
+/// (`DefenseProfile.enemy_dps`) is removed. NOTE the `estimated_dps` overload: `dps` is the
+/// Attack/RangedAttack damage/tick only — it is NOT the harmlessness signal. A creep with `dps == 0` (a CLAIM
+/// declaimer, a WORK dismantler, a lone HEAL creep) can still be dangerous; harmlessness is a SEPARATE signal
+/// (`hostile_warrants_defender`, computed from parts at the producer — `threatmap.rs`), so `dps == 0`
+/// ≠ harmless. Cross-ref ADR 0027 (owned-floor closure) + ADR 0031 §"Single enemy-force source of truth".
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct EnemyForce {
     pub dps: f32,
@@ -113,7 +122,7 @@ pub struct EngagementContext {
     /// (ADR 0031 §2(d))? The caller sets this from the SAME intel-reliability source the rally fix uses
     /// (`CombatIntelSource::is_reliable` — `Cached` mapped `RoomData` OR `LiveVisible`; `None` = no vision).
     /// It is the ONLY new bit threaded for the CONFIRMED-undefended distinction: an empty `defense`
-    /// (towers=[], enemy_dps=0) means *genuinely clear* only when this is `true`; when `false` it means
+    /// (towers=[]) with no `enemy_force` means *genuinely clear* only when this is `true`; when `false` it means
     /// merely *unseen*, so the always-field heal/anti-creep floor is RETAINED (don't field a naked force
     /// into the unknown). Per-tick / computed — NOT serialized (no `WORLD_FORMAT_VERSION` bump). DEFAULT
     /// `false` (the SAFE "not confirmed") for any caller that does not set it.
@@ -127,18 +136,17 @@ impl EngagementContext {
     /// ([`defense_intel_reliable`](Self::defense_intel_reliable)) AND the reliable target shows ZERO threat:
     /// no ENERGIZED towers AND no defender DPS — mirroring the no-attrition detector
     /// [`crate::composition::optimize_composition`] uses for its FIX-3 gate (`tower_dps == 0 &&
-    /// incoming == 0`). "No defender DPS" reads BOTH channels a caller can carry it in: `defense.enemy_dps`
-    /// (the structure arms' folded defender dps) AND the `enemy_force` (the creep-clear arms' observed creep
-    /// force) — so a player room with guard creeps but no towers (`defense.enemy_dps == 0` yet
-    /// `enemy_force.dps > 0`) is correctly NOT confirmed-undefended (the floor is retained — no regression).
-    /// Reliable-but-empty intel is required: an UNSEEN room (`defense_intel_reliable == false`) is never
-    /// "confirmed undefended" even with an all-zero target, so the floor's hedge against fielding a naked
-    /// force into the unknown is preserved (a strict regression-guard over the prior `incoming == 0` alone).
+    /// incoming == 0`). "No defender DPS" reads the SINGLE enemy-creep channel `enemy_force` (ADR 0031 #41 —
+    /// the footgun is gone: there is no longer a second `defense.enemy_dps` term to AND). A player room with
+    /// guard creeps but no towers (`enemy_force.dps > 0`) is correctly NOT confirmed-undefended (the floor is
+    /// retained — no regression). Reliable-but-empty intel is required: an UNSEEN room
+    /// (`defense_intel_reliable == false`) is never "confirmed undefended" even with an all-zero target, so the
+    /// floor's hedge against fielding a naked force into the unknown is preserved (a strict regression-guard
+    /// over the prior `incoming == 0` alone).
     pub fn defense_confirmed_undefended(&self) -> bool {
         let enemy_dps = self.enemy_force.map(|e| e.dps).unwrap_or(0.0);
         self.defense_intel_reliable
             && crate::force_sizing::tower_dps_at_assault(&self.defense.towers) == 0.0
-            && self.defense.enemy_dps == 0.0
             && enemy_dps == 0.0
     }
 }
@@ -195,7 +203,12 @@ pub fn emit_requirement(
     match objective {
         DoctrineObjective::KillImmuneStructure | DoctrineObjective::DismantleStructure => {
             let budget = budget.expect("a structure objective must be given a ForceBudget");
-            let a = assess(defense, budget);
+            // SINGLE SOURCE OF TRUTH (ADR 0031 #41): the hostile creep dps the breach must out-heal comes from
+            // `enemy_force` (the one enemy-creep channel), NOT a `DefenseProfile.enemy_dps` field (removed). The
+            // same `EnemyForce` the EV path / anti-creep overlay read — priced ONCE, consumed by both (assess
+            // sizes survivability heal, the EV path sizes P(win)). `None`/absent ⇒ 0 (an undefended structure).
+            let enemy_dps = enemy_force.map(|e| e.dps).unwrap_or(0.0);
+            let a = assess(defense, enemy_dps, budget);
             if !a.winnable {
                 return (a, RequiredForce::default());
             }
@@ -817,7 +830,6 @@ mod tests {
             towers: vec![TowerThreat { range_to_assault: 15, energy: 200 }],
             breach_hits: 0,
             objective_hits: 100_000,
-            enemy_dps: 0.0,
             repair_per_tick: 0.0,
             safe_mode: false,
         }
@@ -956,10 +968,11 @@ mod tests {
             towers: vec![TowerThreat { range_to_assault: 10, energy: 1000 }],
             breach_hits: 20_000,
             objective_hits: 100_000,
-            enemy_dps: 120.0,
             repair_per_tick: 50.0,
             safe_mode: false,
         };
+        // ADR 0031 #41: the enemy creep dps the structure breach out-heals comes from THIS `EnemyForce` (the
+        // single channel), no longer a co-resident `defense.enemy_dps`.
         let enemy = Some(EnemyForce { dps: 120.0, heal: 20.0, hits: 4000, count: 3, boosted: false });
         let budget = crate::composition::optimizer_ceiling_budget(DoctrineObjective::KillImmuneStructure, 5600, 1400);
         for obj in [
@@ -986,7 +999,7 @@ mod tests {
     fn emit_requirement_reproduces_per_objective_semantics() {
         // A guard but NO towers, so the anti-creep overlay's `clear_force` is out-heal-feasible against the
         // siege budget (towers + a guard exceed the siege ceiling's heal — that's a correct defer, tested elsewhere).
-        let guarded = DefenseProfile { towers: vec![], breach_hits: 10_000, objective_hits: 100_000, enemy_dps: 90.0, repair_per_tick: 0.0, safe_mode: false };
+        let guarded = DefenseProfile { towers: vec![], breach_hits: 10_000, objective_hits: 100_000, repair_per_tick: 0.0, safe_mode: false };
         let undefended = DefenseProfile { breach_hits: 10_000, objective_hits: 100_000, ..Default::default() };
         let guard = Some(EnemyForce { dps: 90.0, heal: 0.0, hits: 3000, count: 2, boosted: false });
         let budget = crate::composition::optimizer_ceiling_budget(DoctrineObjective::DismantleStructure, 5600, 1400);

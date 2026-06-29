@@ -49,7 +49,14 @@ pub struct TowerThreat {
     pub energy: u32,
 }
 
-/// The target's defense as the oracle sees it — built bot-side from `RoomThreatData` + the objective.
+/// The target's STRUCTURE/tower defense as the oracle sees it — built bot-side from `RoomThreatData` + the
+/// objective. ADR 0031 #41: this is purely the STRUCTURE channel (towers / breach / objective / repair /
+/// safe-mode). The hostile CREEP combat power is NOT here — it is the SINGLE SOURCE OF TRUTH
+/// [`crate::doctrine::EnemyForce`], threaded into [`assess`] (and read by the EV path
+/// [`crate::composition::optimize_composition`] / `pairing_p_win`) as the one enemy-creep-dps channel. The
+/// formerly-co-resident `enemy_dps` field is REMOVED: it was dead in the modern EV/optimize path (which
+/// already read `EnemyForce.dps`) and live only in `assess`, so keeping both forced every floor/predicate
+/// to remember two channels (the double-count footgun). See ADR 0031 §"Single enemy-force source of truth".
 #[derive(Clone, Debug, Default)]
 pub struct DefenseProfile {
     pub towers: Vec<TowerThreat>,
@@ -57,8 +64,6 @@ pub struct DefenseProfile {
     pub breach_hits: u32,
     /// Objective structure hits to destroy once reached (e.g. the invader core itself).
     pub objective_hits: u32,
-    /// Hostile creep damage/tick at the objective.
-    pub enemy_dps: f32,
     /// Defensive repair/tick of the breach target (tower/creep repair of ramparts); 0 for cores.
     pub repair_per_tick: f32,
     /// Owner safe-mode active → zero damage possible → a hard veto.
@@ -173,7 +178,15 @@ fn drain_ticks(towers: &[TowerThreat]) -> u32 {
 
 /// The force-sizing oracle (ADR 0020 §12.2): can `budget` (a single squad) beat `profile`, and via
 /// which mode? See the module docs for the conservatism contract.
-pub fn assess(profile: &DefenseProfile, budget: &ForceBudget) -> ForceAssessment {
+///
+/// `enemy_dps` is the hostile CREEP Attack/RangedAttack damage/tick at the objective — the SINGLE SOURCE OF
+/// TRUTH ([`crate::doctrine::EnemyForce::dps`], threaded here by [`crate::doctrine::emit_requirement`]),
+/// folded into `incoming` for the breach out-heal and into the post-drain out-heal exactly as the removed
+/// `DefenseProfile.enemy_dps` field was (ADR 0031 #41 — the unification is read-equivalent: the EXACT same
+/// value, just sourced from `EnemyForce` instead of a second co-resident field). It is a SURVIVABILITY input
+/// here (size heal to out-heal it); the EV path consumes the SAME value for P(win) — different consumers of
+/// one value, NOT a double price.
+pub fn assess(profile: &DefenseProfile, enemy_dps: f32, budget: &ForceBudget) -> ForceAssessment {
     let unwinnable = |reason| ForceAssessment {
         winnable: false,
         mode: AssaultMode::Breach,
@@ -196,7 +209,7 @@ pub fn assess(profile: &DefenseProfile, budget: &ForceBudget) -> ForceAssessment
     let kill_ticks = ticks_for(profile.objective_hits as f32, budget.max_dismantle_dps.max(1.0));
 
     let tower_dps = tower_dps_at_assault(&profile.towers);
-    let incoming = tower_dps + profile.enemy_dps;
+    let incoming = tower_dps + enemy_dps;
 
     // Direct breach: out-heal towers + creeps the whole time (with the HOLD margin so HP recovers
     // through damage and the squad doesn't early-retreat), dismantle through.
@@ -271,7 +284,7 @@ pub fn assess(profile: &DefenseProfile, budget: &ForceBudget) -> ForceAssessment
         // heal. The soak heal carries no hold margin (the EHP buffer provides the headroom a breach's 1.3×
         // heal gives) so a tank that drains feasibly via a big EHP reserve (heal < falloff) is NOT spuriously
         // deferred for lacking heal it does not need — `tank_sustain ≥ drain_damage` above is the real veto.
-        let post_drain_heal = profile.enemy_dps.max(1.0) * HOLD_MARGIN;
+        let post_drain_heal = enemy_dps.max(1.0) * HOLD_MARGIN;
         let soak_heal = standoff_dps.min(budget.max_heal_per_tick);
         let required_heal = soak_heal.max(post_drain_heal);
         if required_heal <= budget.max_heal_per_tick {
@@ -615,7 +628,7 @@ mod tests {
     #[test]
     fn safe_mode_is_a_hard_veto() {
         let profile = DefenseProfile { safe_mode: true, ..Default::default() };
-        assert!(!assess(&profile, &strong_budget()).winnable);
+        assert!(!assess(&profile, 0.0, &strong_budget()).winnable);
     }
 
     #[test]
@@ -626,7 +639,7 @@ mod tests {
             objective_hits: 100_000,
             ..Default::default()
         };
-        let a = assess(&profile, &strong_budget());
+        let a = assess(&profile, 0.0, &strong_budget());
         assert!(a.winnable);
         assert_eq!(a.mode, AssaultMode::Breach);
     }
@@ -640,7 +653,7 @@ mod tests {
             ..Default::default()
         };
         let weak_heal = ForceBudget { max_heal_per_tick: 50.0, ..strong_budget() };
-        let a = assess(&profile, &weak_heal);
+        let a = assess(&profile, 0.0, &weak_heal);
         assert!(a.winnable, "drained towers deal no damage, so this is winnable: {}", a.reason);
         assert_eq!(a.mode, AssaultMode::Breach);
     }
@@ -653,7 +666,7 @@ mod tests {
             objective_hits: 80_000,
             ..Default::default()
         };
-        let a = assess(&profile, &strong_budget());
+        let a = assess(&profile, 0.0, &strong_budget());
         assert!(a.winnable, "should be drainable: {}", a.reason);
         assert_eq!(a.mode, AssaultMode::Drain);
     }
@@ -676,7 +689,7 @@ mod tests {
         // A budget whose heal beats the falloff soak (600) but NOT the point-blank breach fire — so a breach
         // is NOT winnable and the drain is the only path (the favorable case).
         let budget = ForceBudget { max_heal_per_tick: 600.0, max_dismantle_dps: 600.0, tank_effective_hp: 20_000.0, onsite_budget_ticks: 1500 };
-        let a = assess(&profile, &budget);
+        let a = assess(&profile, 0.0, &budget);
         assert!(a.winnable, "a finite-tower base IS winnable via drain: {}", a.reason);
         assert_eq!(a.mode, AssaultMode::Drain, "and the chosen mode is DRAIN (breach can't out-heal point-blank): {}", a.reason);
         // The sized comp: HEAL out-paces the falloff soak, and the TOUGH buffer is present (drain mode sizes it).
@@ -696,7 +709,7 @@ mod tests {
             objective_hits: 80_000,
             ..Default::default()
         };
-        let a = assess(&profile, &strong_budget());
+        let a = assess(&profile, 0.0, &strong_budget());
         assert!(!a.winnable, "an infinite-tower base is NOT drainable by one squad");
         assert_ne!(a.mode, AssaultMode::Drain, "and it is NOT mis-classified as a drain");
         assert!(a.reason.contains("heavy assault"), "it defers to the heavy-assault arm: {}", a.reason);
@@ -716,7 +729,7 @@ mod tests {
         // A FRAGILE budget: low heal + low EHP can't soak 6×150 = 900/tick over the ~4000-tick drain, and the
         // drain is far too slow for one creep lifetime regardless → NOT winnable, NOT a fielded drain.
         let fragile = ForceBudget { max_heal_per_tick: 100.0, max_dismantle_dps: 300.0, tank_effective_hp: 2_000.0, onsite_budget_ticks: 1400 };
-        let a = assess(&profile, &fragile);
+        let a = assess(&profile, 0.0, &fragile);
         assert!(!a.winnable, "an unsustainable / too-slow finite drain is unwinnable for one squad: {}", a.reason);
     }
 
@@ -727,7 +740,7 @@ mod tests {
         // One weak finite tower a strong budget out-heals easily → a breach wins; even though the tower is a
         // finite-energy drain CANDIDATE, the breach branch returns first (no downgrade).
         let profile = DefenseProfile { towers: vec![tower(5, 500)], breach_hits: 20_000, objective_hits: 80_000, ..Default::default() };
-        let a = assess(&profile, &strong_budget());
+        let a = assess(&profile, 0.0, &strong_budget());
         assert!(a.winnable);
         assert_eq!(a.mode, AssaultMode::Breach, "a winning breach is NOT downgraded to a drain: {}", a.reason);
         assert_eq!(RequiredForce::from_assessment(&a).tough_parts, 0, "a breach carries no drain EHP buffer");
@@ -740,7 +753,7 @@ mod tests {
         let profile = DefenseProfile { towers: vec![tower(1, 1500); 4], breach_hits: 20_000, objective_hits: 30_000, ..Default::default() };
         let budget = ForceBudget { max_heal_per_tick: 600.0, max_dismantle_dps: 600.0, tank_effective_hp: 20_000.0, onsite_budget_ticks: 1500 };
         let run = || {
-            let a = assess(&profile, &budget);
+            let a = assess(&profile, 0.0, &budget);
             (a.mode, a.winnable, a.required_heal_per_tick, a.required_tank_hp, RequiredForce::from_assessment(&a))
         };
         assert_eq!(run().0, AssaultMode::Drain, "the drain bed picks Drain");
@@ -773,7 +786,7 @@ mod tests {
             objective_hits: 80_000,
             ..Default::default()
         };
-        let a = assess(&profile, &strong_budget());
+        let a = assess(&profile, 0.0, &strong_budget());
         assert!(!a.winnable);
         assert!(a.reason.contains("heavy assault"), "reason: {}", a.reason);
     }
@@ -786,7 +799,7 @@ mod tests {
             objective_hits: 100_000,
             ..Default::default()
         };
-        let a = assess(&profile, &strong_budget());
+        let a = assess(&profile, 0.0, &strong_budget());
         assert!(!a.winnable);
         assert!(a.reason.contains("too slow"), "reason: {}", a.reason);
     }
@@ -798,7 +811,7 @@ mod tests {
         // rate — else `assemble_force` under-sizes WORK by `repair` and the squad stalls at the wall (the
         // oracle bug the offline oracle-calibration tournament caught).
         let profile = DefenseProfile { breach_hits: 50_000, objective_hits: 100_000, repair_per_tick: 200.0, ..Default::default() };
-        let a = assess(&profile, &strong_budget());
+        let a = assess(&profile, 0.0, &strong_budget());
         assert!(a.winnable, "600 gross out-paces 200 repair: {}", a.reason);
         assert_eq!(a.required_dismantle_dps, 600.0, "field the GROSS dismantle, not the net-of-repair rate (200 less)");
         let rf = RequiredForce::from_assessment(&a);
@@ -817,17 +830,17 @@ mod tests {
             repair_per_tick: 700.0, // ≥ strong_budget's 600 max_dismantle_dps
             ..Default::default()
         };
-        let a = assess(&repair_locked, &strong_budget());
+        let a = assess(&repair_locked, 0.0, &strong_budget());
         assert!(!a.winnable);
         assert!(a.reason.contains("repair out-paces"), "reason: {}", a.reason);
         let out_paced = DefenseProfile { repair_per_tick: 200.0, ..repair_locked.clone() };
-        assert!(assess(&out_paced, &strong_budget()).winnable, "600 dismantle out-paces 200 repair");
+        assert!(assess(&out_paced, 0.0, &strong_budget()).winnable, "600 dismantle out-paces 200 repair");
     }
 
     #[test]
     fn undefended_room_is_a_no_breach_win() {
         let profile = DefenseProfile { objective_hits: 50_000, ..Default::default() };
-        let a = assess(&profile, &strong_budget());
+        let a = assess(&profile, 0.0, &strong_budget());
         assert!(a.winnable);
         assert_eq!(a.mode, AssaultMode::Breach);
         assert_eq!(a.required_heal_per_tick, 0.0, "nothing is shooting us");
