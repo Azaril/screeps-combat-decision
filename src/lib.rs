@@ -1245,6 +1245,29 @@ pub fn predict_engage(view: &SquadView, centroid: Option<Position>) -> EnginePre
     }
 }
 
+/// Reach bug #2 (ADR 0028 §"P(win)-driven proceed gate") — would the CURRENT PRESENT force WIN-OR-STALL
+/// against the target's defense, REUSING the exact `assess_engage` Lanchester model the retreat gate uses?
+///
+/// "Win or stall" = NOT losing — the present roster either WINS (favorable balance) or STALLS (holds; won't
+/// lose). It is defined as the precise INVERSE of the present-force RETREAT (lose) condition in
+/// [`decide_squad`] (`balance_retreat = our_strength > 0 && balance <= -ENGAGE_BALANCE_BAND`, plus the
+/// `unwinnable` bleed-out veto): a force loses iff it would be sent retreating by the strength balance OR
+/// the irremovable-damage veto. So the squad will win-or-stall iff:
+///   `our_strength > 0` (a PRESENT fighting force — never trickle a zero-strength roster into a defended
+///   room; that genuine roster-incompleteness is the rally/lifecycle layer's job, cf. reach bug #1) AND
+///   `!unwinnable` (no irremovable incoming we can't out-heal / no safe-mode) AND
+///   `balance > -ENGAGE_BALANCE_BAND` (the balance is not in the retreat/lose band — it's favorable OR a
+///   sustainable stall around parity).
+///
+/// This is the PROCEED gate the rally/forming lifecycle consults: if the as-is force will win-or-stall,
+/// holding for more roster is pointless — deploy. If it would LOSE, HOLD (wait for more roster). Composition
+/// still SIZES the spawn (the oracle's `RequiredForce`); P(win) only GATES the proceed. Pure + deterministic
+/// (the same integer Lanchester math, no float-into-a-branch).
+pub fn present_force_wins_or_stalls(view: &SquadView, centroid: Option<Position>) -> bool {
+    let a = assess_engage(view, centroid);
+    a.our_strength > 0 && !a.unwinnable && a.balance > -ENGAGE_BALANCE_BAND
+}
+
 /// **The squad-level tactical decision** (ADR 0008 §4, P2.G3). Picks the squad's shared
 /// focus ([`select_focus_target`] from the whole roster's perspective) and resolves
 /// engage-vs-retreat with **coupled hysteresis** (no yo-yo): once `Retreating`, the squad
@@ -2664,6 +2687,96 @@ mod tests {
         let heavy: Vec<_> = (0..3).map(|i| creep(20 + i, 26, 25 + i as u8, 1000, &[(Part::Attack, 10), (Part::Move, 5)])).collect();
         let d2 = decide_squad(&squad_view(&bleeding, &heavy, SquadOrderState::Engaged));
         assert_eq!(d2.state, SquadOrderState::Retreating, "a present force bleeding out (unwinnable veto) still retreats even at our_strength 0");
+    }
+
+    // ── Reach bug #2: the rally/forming PROCEED gate is Lanchester P(win)-driven (win-or-stall) ─────────
+    //
+    // The proceed gate ([`present_force_wins_or_stalls`]) fires when the CURRENT PRESENT force will WIN or
+    // STALL (won't lose) — REGARDLESS of whether the expected archetypes are all present. Composition still
+    // SIZES the spawn; P(win) GATES the proceed. The predicate is the exact INVERSE of the present-force
+    // retreat (lose) condition `decide_squad` uses, so the proceed gate and the retreat gate can never
+    // disagree about what "losing" means. The four cases the directive demands: (a) a winning incomplete
+    // force proceeds, (b) a stalling force proceeds, (c) a losing force HOLDS, (d) sizing is untouched.
+
+    /// (a) WIN with incomplete archetypes: a single present ranged fighter (NO healer archetype yet) that
+    /// out-matches a weak target WINS → the proceed gate fires even though the roster is incomplete. Holding
+    /// for the missing healer is pointless when the as-is force already wins.
+    #[test]
+    fn proceed_gate_fires_for_a_winning_incomplete_force() {
+        let weak_enemy = vec![creep(1, 25, 25, 100, &[(Part::Attack, 1)])]; // a winnable target
+        let lone_fighter = vec![ranged_member_at(2000, 2000, 25, 26)]; // fighter only — no healer present
+        let view = squad_view(&lone_fighter, &weak_enemy, SquadOrderState::Moving);
+        let centroid = cohesion::centroid(&member_positions(view.members));
+        assert!(
+            present_force_wins_or_stalls(&view, centroid),
+            "an incomplete force that already WINS proceeds (composition sizes, P(win) gates)"
+        );
+        // CONSISTENCY with the retreat gate: a winning force is NOT sent retreating.
+        assert_ne!(decide_squad(&view).state, SquadOrderState::Retreating, "the same force the gate proceeds does not retreat");
+    }
+
+    /// (b) STALL (won't lose): a present force at near-parity — its Lanchester balance lands inside the
+    /// GENUINE stall band `(-ENGAGE_BALANCE_BAND, +ENGAGE_BALANCE_BAND]` (neither a clear win nor a loss) —
+    /// PROCEEDS. It will hold the line (stall), not lose, so waiting for more roster is pointless. This is
+    /// the NOVEL middle region the win-or-stall predicate introduces, so the test pins balance INSIDE the
+    /// band on BOTH sides — not just "> -band" (which a clear win also satisfies) but also "<= +band" so it
+    /// is provably NOT a clear win.
+    #[test]
+    fn proceed_gate_fires_for_a_stalling_force() {
+        // Two ranged fighters (70 dps × 4000 ehp = 560k strength) vs a pair tuned to MATCH that strength:
+        // 7 RANGED_ATTACK (70 dps) + 6 TOUGH ⇒ 20 parts ⇒ 2000 hits each, so killable_ehp = 4000 and
+        // enemy_strength = 140 × 4000 = 560k. With our_strength == enemy_strength the Lanchester balance
+        // is ~0 — dead in the stall band, NOT the clear win (≫ +band) the old roster produced (~428).
+        let members = vec![ranged_member_at(2000, 2000, 24, 25), ranged_member_at(2000, 2000, 26, 25)];
+        let enemy = vec![
+            creep(1, 25, 24, 2000, &[(Part::RangedAttack, 7), (Part::Move, 7), (Part::Tough, 6)]),
+            creep(2, 25, 26, 2000, &[(Part::RangedAttack, 7), (Part::Move, 7), (Part::Tough, 6)]),
+        ];
+        let view = squad_view(&members, &enemy, SquadOrderState::Moving);
+        let centroid = cohesion::centroid(&member_positions(view.members));
+        let a = predict_engage(&view, centroid);
+        // It is genuinely a STALL: balance INSIDE (-band, +band] on both sides → not a loss AND not a clear
+        // win, and no bleed-out. This is the middle region the win-or-stall predicate uniquely covers.
+        assert!(!a.unwinnable, "the stall is not a bleed-out");
+        assert!(
+            a.balance > -ENGAGE_BALANCE_BAND && a.balance <= ENGAGE_BALANCE_BAND,
+            "balance lands in the GENUINE stall band (-{band}, +{band}], not a clear win or a loss: {bal}",
+            band = ENGAGE_BALANCE_BAND,
+            bal = a.balance,
+        );
+        assert!(
+            present_force_wins_or_stalls(&view, centroid),
+            "a force that STALLS (won't lose) proceeds — holding for more is pointless"
+        );
+    }
+
+    /// (c) LOSE → HOLD: a present force genuinely outmatched (balance trails by the band) does NOT proceed —
+    /// the rally/forming layer keeps HOLDING for more roster. This is the exact case the retreat gate sends
+    /// retreating, so the proceed gate must agree it would lose. No trickle-to-death: a LOSING present force
+    /// HOLDS.
+    #[test]
+    fn proceed_gate_holds_for_a_losing_force() {
+        // One present ranged fighter vs four heavy bruisers → balance hugely negative (the genuine-loss case
+        // the retreat-preservation test also uses).
+        let members = vec![ranged_member_at(2000, 2000, 25, 25)];
+        let enemy: Vec<_> = (0..4u8).map(|i| creep(10 + i, 30, 25 + i, 1000, &[(Part::Attack, 5), (Part::Move, 5)])).collect();
+        let view = squad_view(&members, &enemy, SquadOrderState::Moving);
+        let centroid = cohesion::centroid(&member_positions(view.members));
+        assert!(
+            !present_force_wins_or_stalls(&view, centroid),
+            "a LOSING present force HOLDS (waits for more roster — no trickle-to-death)"
+        );
+        // CONSISTENCY: the SAME force the gate holds is exactly the one the retreat gate sends retreating.
+        assert_eq!(decide_squad(&view).state, SquadOrderState::Retreating, "the gate's 'lose' agrees with the retreat gate");
+
+        // A ZERO-present-fighting-strength roster (only a healer present — the lone fighter still spawning)
+        // against a defended target does NOT proceed either: that is roster-incompleteness the rally layer
+        // owns, NOT a winnable force. (our_strength == 0 → never proceed into a contested room.)
+        let healers_only = vec![healer_at(2000, 2000, 10, 25, 25)];
+        let defended = vec![creep(30, 26, 25, 1000, &[(Part::Attack, 10), (Part::Move, 5)])];
+        let view2 = squad_view(&healers_only, &defended, SquadOrderState::Moving);
+        let c2 = cohesion::centroid(&member_positions(view2.members));
+        assert!(!present_force_wins_or_stalls(&view2, c2), "a zero-fighting-strength roster never proceeds into a defended room");
     }
 
     /// A hostile tower at `(x,y)` with explicit `energy` (the `structure` helper hardcodes 1000).

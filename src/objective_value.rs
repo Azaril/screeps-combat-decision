@@ -154,6 +154,30 @@ mod tests {
         assert_eq!(v, 1000.0 * DENIAL_DISCOUNT);
     }
 
+    /// (d) Reach-bug #3 / ADR 0032 §economic-value-unlocked — DEFENSE STAYS DOMINANT: a high-value Defend
+    /// (a real RCL8-magnitude asset under a genuine assault) out-values a healthy remote economic target
+    /// (a reservable lvl0-core remote, priced via the FarmCore economic arm at its net-ROI). The economic-
+    /// value-unlocked fix lifts a winnable core from ~0 to its real net-ROI, but must NOT let a remote
+    /// out-bid defending the base.
+    #[test]
+    fn high_value_defend_out_ranks_a_remote_economic_target() {
+        // A genuine assault on a substantial base (RCL8-ish asset, a real attacking force).
+        let defend = value_e(
+            ObjectiveValueKind::Defend,
+            &ObjectiveIntel { asset_value: 1_000_000.0, threat_danger: 300.0, ..Default::default() },
+        );
+        // A healthy reservable remote core, priced economically: ~7 net e/t × a 1500-tick horizon ≈ 10.5k.
+        let remote_economy = value_e(
+            ObjectiveValueKind::FarmCore,
+            &ObjectiveIntel { income_per_tick: 7.0, horizon: 1500.0, ..Default::default() },
+        );
+        assert!(remote_economy > 5_000.0, "the economic value is healthy (the fix), got {remote_economy}");
+        assert!(
+            defend > remote_economy,
+            "defense stays dominant: defend ({defend}) > remote economy ({remote_economy})"
+        );
+    }
+
     /// value_e is always finite + non-negative + deterministic.
     #[test]
     fn value_e_is_nonnegative_and_deterministic() {
