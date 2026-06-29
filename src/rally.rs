@@ -231,6 +231,123 @@ pub fn shared_rally_point(approach: Position, target: Position, uncontested: boo
     centre(staging_room)
 }
 
+/// Chebyshev ROOM-distance between two rooms (max of the room-coord deltas). Pure integer math.
+fn room_distance(a: RoomName, b: RoomName) -> u32 {
+    let d = a - b;
+    d.0.unsigned_abs().max(d.1.unsigned_abs())
+}
+
+/// The member furthest (room-distance) from the target — the laggard that actually GATES convergence.
+/// Ties break on the larger `world_coords` (deterministic, no HashMap, stable). `None` for an empty
+/// slice. ADR 0034 D2 helper.
+fn furthest_member_from(member_positions: &[Position], target: RoomName) -> Option<Position> {
+    member_positions
+        .iter()
+        .copied()
+        .max_by_key(|p| (room_distance(p.room_name(), target), p.world_coords()))
+}
+
+/// Step ONE room from `from_room` toward `target_room` along the Chebyshev room grid (a single
+/// diagonal/orthogonal room hop). Returns `Some(from_room)` if already at the target, `None` if the hop
+/// would leave the world (a world-edge guard via `checked_add` — never panics). Pure integer room-coord
+/// math. ADR 0034 D2/D3 helper.
+fn one_room_toward(from_room: RoomName, target_room: RoomName) -> Option<RoomName> {
+    let delta = target_room - from_room; // (dx,dy) from `from` toward `target`
+    let (dx, dy) = (delta.0.signum(), delta.1.signum());
+    if dx == 0 && dy == 0 {
+        return Some(from_room);
+    }
+    from_room.checked_add((dx, dy))
+}
+
+/// SCATTER-ROBUST shared rally selection (ADR 0034 D2 + D3 — RC-2 fix). The production manager calls
+/// THIS (not the raw [`shared_rally_point`]) with the squad's member positions + the assault target, so
+/// the rally is biased onto the LAGGARD's approach corridor and VALIDATED to be on the approach line,
+/// strictly closer to the target than the furthest member, and a real in-bounds room.
+///
+/// Why not the raw centroid as the approach: for a far/cross-quadrant scatter (homes W3N2 + W4N7,
+/// target W9N8) the spatial centroid room can be *equidistant* with (or no closer than) the furthest
+/// member, so a centroid-derived staging room lands off the laggard's path and the laggard never
+/// converges (RC-1/RC-2 — the headline far-home stall).
+///
+/// Algorithm:
+/// - **Same-room / tight squad** (the centroid room == the furthest member's room): defer to the legacy
+///   [`shared_rally_point`] with the centroid as the approach — byte-identical behaviour for the
+///   in-room/adjacent cases the existing tests pin.
+/// - **Scattered squad** (members span multiple rooms): derive the approach from the FURTHEST member's
+///   room (D2), compute the legacy staging room from there, then VALIDATE it (D3-geometry): the staging
+///   room must be (a) a real, in-bounds room, (b) strictly closer (room-distance) to the target than the
+///   furthest member, and (c) on the approach line (between the laggard and the target, not behind). If
+///   any check fails, fall back to a conservative on-corridor room: ONE room from the furthest member
+///   toward the target.
+///
+/// DETERMINISTIC pure value-math (no `game::*`, no float branch, no HashMap), re-derived fresh each tick
+/// — no stored field, no `WORLD_FORMAT_VERSION` bump. The spawn-aware "renewable staging" half of D3 is
+/// DEFERRED to ADR 0034 Phase 2 (renew); this kernel is the GEOMETRY fix and stays spawn-blind.
+pub fn shared_rally_point_for_members(member_positions: &[Option<Position>], target: Position, uncontested: bool) -> Position {
+    let centre = |room: RoomName| {
+        Position::new(
+            RoomCoordinate::new(25).expect("25 is valid"),
+            RoomCoordinate::new(25).expect("25 is valid"),
+            room,
+        )
+    };
+    let positioned: Vec<Position> = member_positions.iter().filter_map(|p| *p).collect();
+    // Centroid via the SAME production world-coord kernel the rest of the squad code uses.
+    let centroid = match crate::cohesion::centroid(&positioned) {
+        Some(c) => c,
+        None => return centre(target.room_name()), // no positioned members → target-room centre
+    };
+
+    let target_room = target.room_name();
+    let furthest = furthest_member_from(&positioned, target_room).unwrap_or(centroid);
+    let furthest_room = furthest.room_name();
+
+    // TIGHT / same-room: the centroid room is the laggard's room (1-room cluster or all co-located).
+    // Defer to the legacy kernel with the centroid as the approach — preserves the in-room/adjacent
+    // behaviour the existing `shared_rally_point` tests pin.
+    if centroid.room_name() == furthest_room {
+        return shared_rally_point(centroid, target, uncontested);
+    }
+
+    // SCATTERED (D2): bias the approach onto the furthest member's room.
+    let furthest_dist = room_distance(furthest_room, target_room);
+
+    // UNCONTESTED target ⇒ stage IN the target room (nothing shoots back) — distance 0 < furthest_dist,
+    // valid by construction, panic-free (no room-coord step).
+    if uncontested {
+        return centre(target_room);
+    }
+
+    // CONTESTED: stage ONE room SHORT of the target, on the LAGGARD's approach side — `target` stepped one
+    // room toward the furthest member (checked, so a world-edge target can't panic). This is the D2 bias:
+    // the staging room sits on the corridor the laggard must traverse.
+    let candidate_room = one_room_toward(target_room, furthest_room);
+
+    // D3-geometry validation: (a) a real in-bounds room (the `checked_add` `Some`), (b) STRICTLY closer
+    // (room-distance) to the target than the furthest member, (c) on the approach line (between the
+    // laggard and the target — room-distance to the target is monotone-decreasing along the corridor, so
+    // "closer than the laggard" + "one hop from the target toward the laggard" places it BETWEEN them,
+    // never behind). One hop from the target sits at distance 1 (or `furthest_dist` if they're adjacent),
+    // so the closer-than-laggard check also rejects the degenerate adjacent case.
+    if let Some(room) = candidate_room {
+        if room_distance(room, target_room) < furthest_dist {
+            return centre(room);
+        }
+    }
+
+    // CONSERVATIVE FALLBACK (D3): one room from the LAGGARD toward the target — guaranteed on-corridor and
+    // strictly closer (distance furthest_dist-1 < furthest_dist) whenever furthest_dist >= 1 and the hop
+    // stays in-bounds.
+    if let Some(fallback_room) = one_room_toward(furthest_room, target_room) {
+        if room_distance(fallback_room, target_room) < furthest_dist {
+            return centre(fallback_room);
+        }
+    }
+    // Degenerate (laggard already in the target room, or both hops out-of-bounds): stage at the target.
+    centre(target_room)
+}
+
 /// Check if a position is near the room edge leading toward a destination in another room. "Near" means
 /// within 8 tiles of the relevant border.
 fn is_near_room_edge_toward(pos: Position, destination: Position) -> bool {
@@ -527,6 +644,244 @@ mod tests {
         assert!(!target_is_uncontested(true, false, true, true), "hostiles present → not uncontested");
         assert!(!target_is_uncontested(true, true, false, true), "hostile tower present → not uncontested");
         assert!(!target_is_uncontested(true, true, true, false), "enemy safe mode → not uncontested");
+    }
+
+    // ── ADR 0034 Phase 0: FAR-HOME / CROSS-QUADRANT real-geometry rally repro (RC-1 + RC-2) ─────────
+
+    /// Chebyshev room-distance helper for the rally tests.
+    fn room_dist(a: RoomName, b: RoomName) -> u32 {
+        let d = a - b;
+        d.0.unsigned_abs().max(d.1.unsigned_abs())
+    }
+
+    /// THE headline far-home CENTROID repro — RC-1 ONLY (ADR 0034 §2.3.1 / Phase 0 / D1). Members at
+    /// W3N2(25,25) + W4N7(25,25) against a FAR target W9N8 — the operator-flagged cross-quadrant scatter
+    /// that never converged. Drives the PRODUCTION `cohesion::centroid` over real cross-quadrant
+    /// `Position`s and asserts the world-coord midpoint.
+    ///
+    /// SPLIT from the rally assertions (FINDING-1): the OLD combined test asserted the centroid FIRST and
+    /// the rally AFTER, so in the RED state the centroid `assert` PANICKED and the rally assertions were
+    /// unreached dead code. RC-1 (centroid) and the rally (RC-2) are now proven in INDEPENDENT functions
+    /// so neither masks the other.
+    ///
+    /// RED-able against: the pre-D1 in-room centroid (averaging only the 0–49 in-room offsets and
+    /// stamping the result into `positions[0].room_name()` = W3N2). Revert `cohesion::centroid` to that
+    /// and the `assert_ne`/corridor/band asserts below go RED. GREEN with the world-coord centroid (W3N4).
+    #[test]
+    fn far_home_cross_quadrant_centroid_is_the_world_midpoint() {
+        let a = pos(25, 25, "W3N2");
+        let b = pos(25, 25, "W4N7");
+
+        // CENTROID (RC-1) — a true spatial midpoint room (~W3/W4, N4–N5), NOT W3N2 and NOT ~5 rooms off
+        // the true midpoint. World midpoint of W3N2 & W4N7 is W3N4.
+        let centroid = crate::cohesion::centroid(&[a, b]).expect("two members");
+        assert_ne!(centroid.room_name(), a.room_name(), "RC-1: centroid is NOT stamped into positions[0] (W3N2)");
+        let cx = centroid.room_name().to_string();
+        assert!(cx.starts_with("W3") || cx.starts_with("W4"), "centroid in the W3/W4 corridor, got {}", cx);
+        assert!(cx.ends_with("N4") || cx.ends_with("N5"), "centroid in the N4–N5 band, got {}", cx);
+        // Pin the exact world midpoint room (the byte-precise RC-1 outcome).
+        assert_eq!(centroid.room_name(), "W3N4".parse::<RoomName>().unwrap(), "RC-1: world-coord midpoint room of W3N2 & W4N7");
+    }
+
+    /// THE headline far-home RALLY repro — RC-2 ONLY, proven INDEPENDENTLY of the RC-1 centroid assertion
+    /// (FINDING-1 split). Members at W3N2(25,25) + W4N7(25,25) against W9N8: the shared rally must be on
+    /// the approach line toward the target, STRICTLY closer (room-distance) to the target than the
+    /// furthest member, and a real reachable room (not behind the squad).
+    ///
+    /// NOTE (FINDING-1 / why a SECOND discriminating test exists): for THIS geometry the new D2/D3
+    /// `shared_rally_point_for_members` and the legacy `shared_rally_point(centroid)` return the SAME room
+    /// (W8N7) — legacy only steps ONE room out from the target along the SIGN of the approach delta, so it
+    /// is insensitive to how far the approach is. So this test proves RC-2's VALIDITY (the rally is a
+    /// correct staging room) but NOT that D2/D3 is live; that is `d2_d3_scatter_robust_rally_*` below.
+    ///
+    /// RED-able against: the pre-D1 in-room centroid would feed `shared_rally_point` the W3N2 approach
+    /// (same sign as the true centroid here, so the room is unchanged) — RC-2's value is actually robust;
+    /// this test's teeth are the "strictly closer than the furthest member" + "not behind" invariants
+    /// that any correct staging room must satisfy.
+    #[test]
+    fn far_home_cross_quadrant_rally_is_valid_toward_target() {
+        let a = pos(25, 25, "W3N2");
+        let b = pos(25, 25, "W4N7");
+        let target = pos(25, 25, "W9N8");
+        let members = [Some(a), Some(b)];
+        let positioned: Vec<Position> = members.iter().filter_map(|p| *p).collect();
+
+        // The furthest member from the target gates convergence.
+        let furthest_dist = positioned.iter().map(|p| room_dist(p.room_name(), target.room_name())).max().unwrap();
+
+        // RALLY (RC-2) — strictly closer to the target than the FURTHEST member, and a real room.
+        let rally = shared_rally_point_for_members(&members, target, /*uncontested=*/ false);
+        let rally_dist = room_dist(rally.room_name(), target.room_name());
+        assert!(
+            rally_dist < furthest_dist,
+            "rally room {} (dist {}) is STRICTLY closer to {} than the furthest member (dist {})",
+            rally.room_name(), rally_dist, target.room_name(), furthest_dist
+        );
+        // On the approach line: the rally sits between the laggard and the target — its room-distance to
+        // the target is no greater than each member's own distance to the target (it's toward target).
+        for m in &positioned {
+            let m_to_target = room_dist(m.room_name(), target.room_name());
+            assert!(
+                rally_dist <= m_to_target,
+                "rally is toward the target relative to member {} (not behind the squad)",
+                m.room_name()
+            );
+        }
+        // A real, in-bounds room (constructible / parseable).
+        assert!(RoomName::new(&rally.room_name().to_string()).is_ok(), "rally is a real room");
+    }
+
+    /// D2/D3 LIVENESS + CORRECTNESS — the discriminating-geometry proof (FINDING-1, the gap the headline
+    /// far-home test does NOT exercise). The headline W3N2+W4N7→W9N8 geometry is INSENSITIVE to D2/D3
+    /// (legacy and new both return W8N7) because the centroid's bearing to the target matches the furthest
+    /// member's bearing. This test picks a geometry where the CENTROID bearing DIFFERS from the
+    /// FURTHEST-member bearing, so the new scatter-robust `shared_rally_point_for_members` produces a
+    /// DIFFERENT (and better) rally than `shared_rally_point(centroid)` — proving D2/D3 is NOT inert.
+    ///
+    /// GEOMETRY (asymmetric — one member STRICTLY furthest, no tie-break dependency): a near member at
+    /// W8N7 (dist 1 to target) + a far laggard at W17N8 (dist 8 to target) against target W9N8.
+    /// - centroid = W12N7 (pulled OFF the laggard's N8 row by the near member on N7).
+    /// - legacy `shared_rally_point(centroid)` = W10N7 (on the centroid's N7 row).
+    /// - new D2/D3 `shared_rally_point_for_members` = W10N8 (on the LAGGARD's N8 row — biased onto the
+    ///   corridor the laggard W17N8 must traverse to reach W9N8).
+    ///
+    /// (a) proves D2/D3 CHANGES the outcome (legacy W10N7 != new W10N8 → not inert);
+    /// (b) proves the new rally is VALID (strictly closer to the target than the furthest member; on the
+    ///     approach line; a real room);
+    /// (c) proves the bias is onto the LAGGARD's corridor: the new rally lies on the straight
+    ///     room-corridor between the laggard and the target (collinear) AND on the laggard's exact N-row,
+    ///     while the legacy rally is one row OFF it (on the centroid's row) — the laggard, not the
+    ///     centroid, sets the bearing.
+    ///
+    /// RED-able against: revert D2/D3 so `shared_rally_point_for_members` always defers to
+    /// `shared_rally_point(centroid, ..)` (the pre-ADR-0034-Phase-0 behaviour) → it returns W10N7 and
+    /// assertion (a)'s `assert_ne` goes RED (legacy == new), and (c)'s laggard-row assert also goes RED.
+    #[test]
+    fn d2_d3_scatter_robust_rally_is_live_and_biased_onto_the_laggard() {
+        let near = pos(25, 25, "W8N7"); // dist 1 to the target — clearly NOT the laggard
+        let laggard = pos(25, 25, "W17N8"); // dist 8 to the target — the STRICTLY furthest member
+        let target = pos(25, 25, "W9N8");
+        let members = [Some(near), Some(laggard)];
+        let positioned: Vec<Position> = members.iter().filter_map(|p| *p).collect();
+
+        let centroid = crate::cohesion::centroid(&positioned).expect("two members");
+        let furthest_dist = positioned.iter().map(|p| room_dist(p.room_name(), target.room_name())).max().unwrap();
+        assert_eq!(room_dist(laggard.room_name(), target.room_name()), furthest_dist, "W17N8 is the strictly furthest member");
+        assert!(room_dist(near.room_name(), target.room_name()) < furthest_dist, "W8N7 is NOT the laggard");
+
+        let legacy = shared_rally_point(centroid, target, /*uncontested=*/ false);
+        let new_rally = shared_rally_point_for_members(&members, target, /*uncontested=*/ false);
+
+        // (a) D2/D3 is NOT INERT: the scatter-robust selection differs from the raw-centroid selection.
+        assert_ne!(
+            new_rally.room_name(), legacy.room_name(),
+            "D2/D3 must CHANGE the rally vs legacy(centroid) for this discriminating geometry (legacy={}, new={})",
+            legacy.room_name(), new_rally.room_name()
+        );
+        // Pin the exact rooms (documents the discriminating values: legacy W10N7 vs new W10N8).
+        assert_eq!(legacy.room_name(), "W10N7".parse::<RoomName>().unwrap(), "legacy(centroid) rally = W10N7 (centroid's row)");
+        assert_eq!(new_rally.room_name(), "W10N8".parse::<RoomName>().unwrap(), "new D2/D3 rally = W10N8 (laggard's row)");
+
+        // (b) The new rally is VALID — strictly closer to the target than the furthest member, on the
+        //     approach line (toward target, not behind any member), and a real room.
+        let new_dist = room_dist(new_rally.room_name(), target.room_name());
+        assert!(new_dist < furthest_dist, "new rally (dist {}) strictly closer to the target than the laggard (dist {})", new_dist, furthest_dist);
+        for m in &positioned {
+            assert!(new_dist <= room_dist(m.room_name(), target.room_name()), "new rally is toward the target relative to {} (not behind)", m.room_name());
+        }
+        assert!(RoomName::new(&new_rally.room_name().to_string()).is_ok(), "new rally is a real room");
+
+        // (c) BIASED ONTO THE LAGGARD'S CORRIDOR. The new rally is collinear on the straight room-corridor
+        //     between the laggard and the target (dist-to-laggard + dist-to-target == laggard-to-target),
+        //     AND it sits on the laggard's EXACT N-row (W17N8 → N8), the corridor the laggard must
+        //     traverse — whereas the legacy rally sits one row off it (on the centroid's N7 row).
+        let on_laggard_corridor = |r: RoomName| {
+            room_dist(r, laggard.room_name()) + room_dist(r, target.room_name()) == furthest_dist
+        };
+        assert!(on_laggard_corridor(new_rally.room_name()), "new rally is on the laggard→target room-corridor");
+        // The laggard's N-row is N8 (== the target's row here); the new rally shares it, the legacy does not.
+        let n_of = |r: RoomName| r.to_string().split('N').nth(1).unwrap().to_string();
+        assert_eq!(n_of(new_rally.room_name()), n_of(laggard.room_name()), "new rally is on the laggard's N-row (biased onto its corridor)");
+        assert_ne!(n_of(legacy.room_name()), n_of(laggard.room_name()), "legacy rally is OFF the laggard's row (biased by the centroid)");
+    }
+
+    /// D2/D3 liveness — the VERIFIER's NAMED example (W1N1 + W17N8 → W9N8), proving the distance-bias
+    /// onto the laggard in the cleanest form. Here BOTH members are equidistant (dist 8) from the target,
+    /// so the laggard is the deterministic tie-break (larger world-coords → W1N1). The new D2/D3 rally is
+    /// STRICTLY CLOSER (room-distance) to that laggard than the legacy(centroid) rally is — the clean
+    /// distance form of the "biased onto the laggard's corridor" property.
+    ///
+    /// - centroid = W9N4; legacy(centroid) rally = W9N7 (dist 8 to the laggard W1N1);
+    /// - new D2/D3 rally = W8N7 (dist 7 to the laggard W1N1, and dist 9 to the OTHER member W17N8 —
+    ///   so the bias is unambiguously toward W1N1, the laggard).
+    ///
+    /// RED-able against: reverting D2/D3 (always defer to `shared_rally_point(centroid)`) → new == legacy
+    /// == W9N7, so the `assert_ne` and the strictly-closer-to-laggard assert both go RED.
+    #[test]
+    fn d2_d3_rally_is_strictly_closer_to_the_laggard_than_legacy() {
+        let m0 = pos(25, 25, "W1N1");
+        let m1 = pos(25, 25, "W17N8");
+        let target = pos(25, 25, "W9N8");
+        let members = [Some(m0), Some(m1)];
+        let positioned: Vec<Position> = members.iter().filter_map(|p| *p).collect();
+
+        // Deterministic laggard (both dist 8; tie-break on larger world-coords picks W1N1) — what D2 uses.
+        let laggard = furthest_member_from(&positioned, target.room_name()).unwrap();
+        assert_eq!(laggard.room_name(), "W1N1".parse::<RoomName>().unwrap(), "deterministic laggard via D2's tie-break");
+
+        let centroid = crate::cohesion::centroid(&positioned).expect("two members");
+        let legacy = shared_rally_point(centroid, target, /*uncontested=*/ false);
+        let new_rally = shared_rally_point_for_members(&members, target, /*uncontested=*/ false);
+
+        assert_ne!(new_rally.room_name(), legacy.room_name(), "D2/D3 changes the rally (legacy={}, new={})", legacy.room_name(), new_rally.room_name());
+        assert_eq!(legacy.room_name(), "W9N7".parse::<RoomName>().unwrap(), "legacy(centroid) rally = W9N7");
+        assert_eq!(new_rally.room_name(), "W8N7".parse::<RoomName>().unwrap(), "new D2/D3 rally = W8N7");
+
+        // The bias: the new rally is STRICTLY closer to the laggard than the legacy rally is, and closer
+        // to the laggard than to the OTHER member — unambiguously onto the laggard's approach corridor.
+        let new_to_laggard = room_dist(new_rally.room_name(), laggard.room_name());
+        let legacy_to_laggard = room_dist(legacy.room_name(), laggard.room_name());
+        assert!(new_to_laggard < legacy_to_laggard, "new rally (dist {}) is strictly closer to the laggard than legacy (dist {})", new_to_laggard, legacy_to_laggard);
+        assert!(new_to_laggard < room_dist(new_rally.room_name(), m1.room_name()), "the bias is toward the laggard W1N1, not the other member W17N8");
+
+        // VALID: strictly closer to the target than the furthest member, a real room.
+        let furthest_dist = room_dist(laggard.room_name(), target.room_name());
+        assert!(room_dist(new_rally.room_name(), target.room_name()) < furthest_dist, "new rally strictly closer to the target than the laggard");
+        assert!(RoomName::new(&new_rally.room_name().to_string()).is_ok(), "new rally is a real room");
+    }
+
+    /// TIGHT / same-room squad parity (D2/D3 leaves the unchanged path untouched). A co-located squad
+    /// (the centroid room == the furthest member's room) must defer BYTE-IDENTICALLY to the legacy
+    /// `shared_rally_point(centroid, ..)` — the in-room/adjacent behaviour the existing
+    /// `shared_rally_stages_short_when_contested_at_room_when_uncontested` test pins. Covers both
+    /// contested and uncontested, plus an adjacent 1-room cluster whose centroid still lands in the
+    /// laggard's room.
+    ///
+    /// RED-able against: any change to the `centroid.room_name() == furthest_room` tight-defer branch in
+    /// `shared_rally_point_for_members` that made it diverge from the legacy kernel for a tight squad.
+    #[test]
+    fn d2_d3_tight_squad_defers_byte_identically_to_legacy() {
+        let target = pos(25, 25, "W9N8");
+
+        // Same-room squad: centroid room == furthest room → tight-defer branch.
+        let tm = [pos(20, 20, "W5N5"), pos(30, 30, "W5N5")];
+        let centroid = crate::cohesion::centroid(&tm).expect("two members");
+        let members: Vec<Option<Position>> = tm.iter().map(|p| Some(*p)).collect();
+        for &uncontested in &[false, true] {
+            let legacy = shared_rally_point(centroid, target, uncontested);
+            let new_rally = shared_rally_point_for_members(&members, target, uncontested);
+            assert_eq!(new_rally, legacy, "same-room squad defers byte-identically (uncontested={})", uncontested);
+        }
+
+        // Adjacent 1-room cluster (W5N5 + W6N5) whose world centroid still lands in the laggard's room.
+        let am = [pos(48, 25, "W5N5"), pos(2, 25, "W6N5")];
+        let acentroid = crate::cohesion::centroid(&am).expect("two members");
+        let afurthest = furthest_member_from(&am, target.room_name()).unwrap();
+        assert_eq!(acentroid.room_name(), afurthest.room_name(), "adjacent cluster: centroid room == furthest room (tight branch)");
+        let amembers: Vec<Option<Position>> = am.iter().map(|p| Some(*p)).collect();
+        let alegacy = shared_rally_point(acentroid, target, false);
+        let anew = shared_rally_point_for_members(&amembers, target, false);
+        assert_eq!(anew, alegacy, "adjacent 1-room cluster defers byte-identically to legacy");
     }
 
     // ── RALLY-OSCILLATION FIX (intel-reliability, not raw live vision) ──────────────────────────────
