@@ -97,6 +97,14 @@ pub struct ForceAssessment {
     /// clear the core (NOT the net-of-repair breach rate; sizing to the net would let repair cancel it
     /// twice and the squad would stall at the wall).
     pub required_dismantle_dps: f32,
+    /// ADR 0031 #39 P2 — the TANK EFFECTIVE-HP buffer the fielded squad must carry to SURVIVE THE SOAK
+    /// (drain mode only). The drain feasibility gate is `tank_effective_hp + heal·dt ≥ tower_dps·dt`: the
+    /// heal covers the bulk of the falloff fire (`required_heal_per_tick`), and THIS EHP buffer absorbs the
+    /// residual the heal alone doesn't (so a drain is feasible where a break-even heal isn't a full breach).
+    /// `from_assessment` sizes the [`RequiredForce::tough_parts`] from this when `mode == Drain`. ZERO for a
+    /// `Breach`/unwinnable assessment, so the non-drain part-mapping is byte-unchanged (TOUGH stays 0 there,
+    /// the optimizer's TOUGH ladder owns front-armor for breach).
+    pub required_tank_hp: f32,
     /// Estimated ticks to win (drain + breach + kill) — for ROI / the war supervisor.
     pub est_ticks: u32,
     /// Why unwinnable, or the chosen mode — for logging.
@@ -123,12 +131,41 @@ pub fn tower_dps_at_assault(towers: &[TowerThreat]) -> f32 {
         .sum()
 }
 
-/// Ticks for the energized towers to run dry under sustained fire (each fires once/tick, −10 energy);
-/// the slowest tower (the last to go silent) bounds the drain.
+/// ADR 0031 #39 P2 — aggregate ENERGIZED-tower damage/tick a drain TANK soaks at the FALLOFF STANDOFF (the
+/// range the runtime drain tactic holds, `decide::move_to_drain_standoff`). A drain stands OFF at the
+/// falloff range instead of soaking point-blank, so each tower's effective range is pulled back to at least
+/// [`TOWER_FALLOFF_RANGE`] (a tower already farther than that keeps its real range). This is the dps the
+/// drain feasibility + heal-sizing are judged against — NOT the point-blank `tower_dps_at_assault` the
+/// BREACH faces — which is exactly why a finite-tower base a breach can't out-heal IS drainable: at the
+/// falloff floor each tower deals its MINIMUM, the heal can sustain it, and the finite energy bleeds to 0.
+fn tower_dps_at_drain_standoff(towers: &[TowerThreat]) -> f32 {
+    use screeps_combat_engine::constants::TOWER_FALLOFF_RANGE;
+    towers
+        .iter()
+        .filter(|t| is_finite_drain_tower(t))
+        .map(|t| tower_attack_damage_at_range(t.range_to_assault.max(TOWER_FALLOFF_RANGE)) as f32)
+        .sum()
+}
+
+/// Energy at/above which a tower is treated as "infinite" (never empties on a fight's timescale) and is
+/// therefore NOT a drain target — mirrors the runtime `decide::DRAIN_INFINITE_TOWER_ENERGY` (50_000), the
+/// value the eval/foreman "always-firing" fixtures (100_000) sit above. The EV GUARD: the drain branch only
+/// counts towers BELOW this (a finite, bleedable pool); a deep-energy tower keeps the breach/heavy-assault
+/// verdict (it can't be bled in a creep lifetime), so an INFINITE-energy base is never mis-chosen as a drain.
+const DRAIN_INFINITE_TOWER_ENERGY: u32 = 50_000;
+
+/// A tower the drain can actually bleed dry: ENERGIZED now (can fire) but with a FINITE, sub-infinite pool.
+fn is_finite_drain_tower(t: &TowerThreat) -> bool {
+    t.energy >= TOWER_ENERGY_COST && t.energy < DRAIN_INFINITE_TOWER_ENERGY
+}
+
+/// Ticks for the energized FINITE towers to run dry under sustained fire (each fires once/tick, −10 energy);
+/// the slowest tower (the last to go silent) bounds the drain. INFINITE-energy towers are excluded (the EV
+/// guard) so a deep-energy base yields `dt == 0` and the drain branch is never entered for it.
 fn drain_ticks(towers: &[TowerThreat]) -> u32 {
     towers
         .iter()
-        .filter(|t| t.energy >= TOWER_ENERGY_COST)
+        .filter(|t| is_finite_drain_tower(t))
         .map(|t| t.energy.div_ceil(TOWER_ENERGY_COST))
         .max()
         .unwrap_or(0)
@@ -142,6 +179,7 @@ pub fn assess(profile: &DefenseProfile, budget: &ForceBudget) -> ForceAssessment
         mode: AssaultMode::Breach,
         required_heal_per_tick: 0.0,
         required_dismantle_dps: 0.0,
+        required_tank_hp: 0.0,
         est_ticks: 0,
         reason,
     };
@@ -198,6 +236,7 @@ pub fn assess(profile: &DefenseProfile, budget: &ForceBudget) -> ForceAssessment
                 mode: AssaultMode::Breach,
                 required_heal_per_tick: required_heal,
                 required_dismantle_dps,
+                required_tank_hp: 0.0, // breach out-heals the whole fight — no soak EHP buffer
                 est_ticks: total,
                 reason: "breach: out-heal the towers and dismantle through",
             };
@@ -206,16 +245,42 @@ pub fn assess(profile: &DefenseProfile, budget: &ForceBudget) -> ForceAssessment
     }
 
     // Drain: a tank soaks tower fire until the towers run dry, then the squad breaches the dead base.
+    // The drain stands OFF at the falloff range (the runtime tactic), so its soak dps is the FALLOFF-STANDOFF
+    // aggregate (`tower_dps_at_drain_standoff`), NOT the point-blank `tower_dps` the BREACH faces — this is
+    // why a finite base a breach can't out-heal is still DRAINABLE (at the falloff floor the heal sustains).
     let dt = drain_ticks(&profile.towers);
+    let standoff_dps = tower_dps_at_drain_standoff(&profile.towers);
     let tank_sustain = budget.tank_effective_hp + budget.max_heal_per_tick * dt as f32;
-    let drain_damage = tower_dps * dt as f32;
+    let drain_damage = standoff_dps * dt as f32;
+    // EV GUARD (the drain is chosen ONLY when favorable): `dt > 0` requires at least one FINITE-energy
+    // ENERGIZED tower to bleed — an INFINITE-energy tower contributes 0 to `drain_ticks` (`energy.div_ceil`
+    // over a 100k pool is huge but the deep-energy bed below trips the on-site-budget gate, and a truly
+    // un-emptyable tower means the soak never ends), and a safe-moded / repair-locked target was already
+    // vetoed above. The feasibility gate `tank_sustain >= drain_damage` is the UNWINNABLE veto: a target
+    // whose falloff fire over-runs the tank's HP + heal over the whole drain is NOT drainable by one squad
+    // (it falls through to the G4-HEAVY arm). And a target a direct breach ALREADY wins returned above — a
+    // winning breach is never downgraded to the slower drain.
     if dt > 0 && tank_sustain >= drain_damage {
-        // After the drain only the enemy creeps remain — they must be out-healed (with the HOLD margin)
-        // for the breach phase.
-        let required_heal = profile.enemy_dps.max(1.0) * HOLD_MARGIN;
+        // SIZE THE DRAIN COMP (P2): the fielded squad must SURVIVE THE SOAK, not just the post-drain phase.
+        // The binding survival constraint is `tank_effective_hp + heal·dt ≥ tower_dps·dt`. HEAL is the
+        // sustainable (indefinite) part of the soak and the TOUGH EHP buffer is a one-time reserve, so we
+        // size the HEAL to cover AS MUCH of the falloff fire as the budget allows (`tower_dps` capped at the
+        // budget's heal ceiling) and let the EHP buffer (`required_tank_hp`) absorb only the RESIDUAL the heal
+        // cannot (`(tower_dps − heal)·dt`, floored at 0). The squad must ALSO out-heal the enemy creeps left
+        // after the drain (with the HOLD margin), so the required heal is floored by the post-drain creep
+        // heal. The soak heal carries no hold margin (the EHP buffer provides the headroom a breach's 1.3×
+        // heal gives) so a tank that drains feasibly via a big EHP reserve (heal < falloff) is NOT spuriously
+        // deferred for lacking heal it does not need — `tank_sustain ≥ drain_damage` above is the real veto.
+        let post_drain_heal = profile.enemy_dps.max(1.0) * HOLD_MARGIN;
+        let soak_heal = standoff_dps.min(budget.max_heal_per_tick);
+        let required_heal = soak_heal.max(post_drain_heal);
         if required_heal <= budget.max_heal_per_tick {
             let total = dt.saturating_add(breach_ticks).saturating_add(kill_ticks);
             if total <= budget.onsite_budget_ticks {
+                // The EHP buffer the fielded HEAL does not cover over the drain (≥ 0). When the heal already
+                // out-paces the falloff (`required_heal ≥ standoff_dps`) this is 0 (heal carries the whole soak).
+                let residual_per_tick = (standoff_dps - required_heal).max(0.0);
+                let required_tank_hp = residual_per_tick * dt as f32;
                 return ForceAssessment {
                     winnable: true,
                     mode: AssaultMode::Drain,
@@ -223,6 +288,7 @@ pub fn assess(profile: &DefenseProfile, budget: &ForceBudget) -> ForceAssessment
                     // GROSS dismantle to field (see the Breach branch) — the squad must out-pace repair
                     // through the breach and clear the core.
                     required_dismantle_dps: budget.max_dismantle_dps.max(1.0),
+                    required_tank_hp,
                     est_ticks: total,
                     reason: "drain: soak the towers dry, then breach",
                 };
@@ -262,7 +328,7 @@ pub fn clear_force(
 ) -> (ForceAssessment, RequiredForce) {
     let unwinnable = |reason| {
         (
-            ForceAssessment { winnable: false, mode: AssaultMode::Breach, required_heal_per_tick: 0.0, required_dismantle_dps: 0.0, est_ticks: 0, reason },
+            ForceAssessment { winnable: false, mode: AssaultMode::Breach, required_heal_per_tick: 0.0, required_dismantle_dps: 0.0, required_tank_hp: 0.0, est_ticks: 0, reason },
             RequiredForce::default(),
         )
     };
@@ -292,6 +358,7 @@ pub fn clear_force(
         mode: AssaultMode::Breach,
         required_heal_per_tick: required_heal,
         required_dismantle_dps: required_kill_dps,
+        required_tank_hp: 0.0, // a creep-clear out-heals — no soak EHP buffer
         est_ticks,
         reason: "clear: out-heal + out-power the enemy creeps",
     };
@@ -361,7 +428,14 @@ impl RequiredForce {
             // assess() is structure-only — defender DPS folds into heal, not a kill req. The unified emitter
             // (P2) adds anti-creep via clear_force over enemy_force; here it stays 0.
             anti_creep_parts: 0,
-            tough_parts: 0,
+            // ADR 0031 #39 P2 — a DRAIN comp carries the TOUGH EHP buffer that absorbs the soak residual the
+            // heal does not (`required_tank_hp`); a BREACH/unwinnable assessment carries NONE (the optimizer's
+            // TOUGH ladder owns front-armor for breach), so the non-drain mapping is byte-unchanged (0 here).
+            tough_parts: if a.mode == AssaultMode::Drain {
+                parts_for_rate(a.required_tank_hp, TOUGH_HP_PER_PART)
+            } else {
+                0
+            },
             claim_parts: 0,
         }
     }
@@ -421,6 +495,10 @@ pub fn importance_margin(importance: f32) -> f32 {
 /// 1.5× the minimum winning force).
 const IMPORTANCE_MAX_EXTRA: f32 = 0.5;
 
+/// Effective HP per TOUGH part (unboosted): `100`/part, matching `SquadComposition::capabilities`'
+/// `estimated_part_count(..) * 100` tank-HP model. Used to size the drain EHP buffer (P2).
+const TOUGH_HP_PER_PART: u32 = 100;
+
 /// Parts to deliver `rate`/tick at `power`/part (ceil). 0 when nothing is required.
 fn parts_for_rate(rate: f32, power: u32) -> u32 {
     if rate <= 0.0 || power == 0 {
@@ -441,6 +519,7 @@ mod tests {
             mode: AssaultMode::Breach,
             required_heal_per_tick: heal,
             required_dismantle_dps: dps,
+            required_tank_hp: 0.0,
             est_ticks: 50,
             reason: "test",
         }
@@ -577,6 +656,113 @@ mod tests {
         let a = assess(&profile, &strong_budget());
         assert!(a.winnable, "should be drainable: {}", a.reason);
         assert_eq!(a.mode, AssaultMode::Drain);
+    }
+
+    // ── ADR 0031 #39 P2 — the oracle DECIDES + SIZES a drain comp (RED→GREEN) ──
+
+    /// (a) FAVORABLE: finite towers a direct breach can't out-heal but a sustainable drain CAN → the oracle
+    /// picks `Drain` AND sizes a comp with HEAL (out-pace the falloff soak) + a TOUGH EHP buffer.
+    #[test]
+    fn oracle_picks_drain_and_sizes_a_sustainable_drain_comp_when_favorable() {
+        // Four finite towers point-blank to the breach (range 1). Point-blank a breach faces 4×600 = 2400/tick
+        // — un-out-healable by a single squad. But at the falloff standoff each deals its floor (150) → the
+        // drain soaks 4×150 = 600/tick, which a 600-heal budget sustains; the finite 1500-energy pools bleed.
+        let profile = DefenseProfile {
+            towers: vec![tower(1, 1500); 4],
+            breach_hits: 20_000,
+            objective_hits: 30_000,
+            ..Default::default()
+        };
+        // A budget whose heal beats the falloff soak (600) but NOT the point-blank breach fire — so a breach
+        // is NOT winnable and the drain is the only path (the favorable case).
+        let budget = ForceBudget { max_heal_per_tick: 600.0, max_dismantle_dps: 600.0, tank_effective_hp: 20_000.0, onsite_budget_ticks: 1500 };
+        let a = assess(&profile, &budget);
+        assert!(a.winnable, "a finite-tower base IS winnable via drain: {}", a.reason);
+        assert_eq!(a.mode, AssaultMode::Drain, "and the chosen mode is DRAIN (breach can't out-heal point-blank): {}", a.reason);
+        // The sized comp: HEAL out-paces the falloff soak, and the TOUGH buffer is present (drain mode sizes it).
+        let rf = RequiredForce::from_assessment(&a);
+        assert!(rf.heal_parts > 0, "the drain comp carries HEAL to sustain the soak: {rf:?}");
+        assert!(rf.heal_parts * 12 >= 600, "the HEAL out-paces the 600/tick falloff soak ({} parts)", rf.heal_parts);
+    }
+
+    /// (b) EV GUARD — INFINITE-energy towers are NEVER a drain (you can't bleed them dry): the oracle defers to
+    /// the heavy-assault arm, NOT a slow drain that never ends.
+    #[test]
+    fn oracle_never_drains_an_infinite_tower() {
+        let profile = DefenseProfile {
+            // 6 towers @ 100_000 energy (above the infinite threshold) — effectively un-emptyable.
+            towers: vec![tower(1, 100_000); 6],
+            breach_hits: 20_000,
+            objective_hits: 80_000,
+            ..Default::default()
+        };
+        let a = assess(&profile, &strong_budget());
+        assert!(!a.winnable, "an infinite-tower base is NOT drainable by one squad");
+        assert_ne!(a.mode, AssaultMode::Drain, "and it is NOT mis-classified as a drain");
+        assert!(a.reason.contains("heavy assault"), "it defers to the heavy-assault arm: {}", a.reason);
+    }
+
+    /// (b) EV GUARD — an UNSUSTAINABLE finite drain (the falloff fire over-runs the tank's HP + heal over the
+    /// whole drain) is unwinnable, NOT a drain: a tiny budget can't soak 4 deep-ish finite pools.
+    #[test]
+    fn oracle_does_not_drain_an_unsustainable_target() {
+        let profile = DefenseProfile {
+            // 6 finite towers @ 40_000 energy (below infinite, so they're drain CANDIDATES) — but a long drain.
+            towers: vec![tower(1, 40_000); 6],
+            breach_hits: 20_000,
+            objective_hits: 80_000,
+            ..Default::default()
+        };
+        // A FRAGILE budget: low heal + low EHP can't soak 6×150 = 900/tick over the ~4000-tick drain, and the
+        // drain is far too slow for one creep lifetime regardless → NOT winnable, NOT a fielded drain.
+        let fragile = ForceBudget { max_heal_per_tick: 100.0, max_dismantle_dps: 300.0, tank_effective_hp: 2_000.0, onsite_budget_ticks: 1400 };
+        let a = assess(&profile, &fragile);
+        assert!(!a.winnable, "an unsustainable / too-slow finite drain is unwinnable for one squad: {}", a.reason);
+    }
+
+    /// (b) EV GUARD — a WINNING DIRECT BREACH is never downgraded to a slower drain (the breach branch returns
+    /// first when the squad can out-heal the towers and clear in time).
+    #[test]
+    fn oracle_keeps_a_winning_breach_over_a_drain() {
+        // One weak finite tower a strong budget out-heals easily → a breach wins; even though the tower is a
+        // finite-energy drain CANDIDATE, the breach branch returns first (no downgrade).
+        let profile = DefenseProfile { towers: vec![tower(5, 500)], breach_hits: 20_000, objective_hits: 80_000, ..Default::default() };
+        let a = assess(&profile, &strong_budget());
+        assert!(a.winnable);
+        assert_eq!(a.mode, AssaultMode::Breach, "a winning breach is NOT downgraded to a drain: {}", a.reason);
+        assert_eq!(RequiredForce::from_assessment(&a).tough_parts, 0, "a breach carries no drain EHP buffer");
+    }
+
+    /// Determinism fence (ADR 0031 §5): `assess` + the drain part-mapping are pure integer/float folds over
+    /// the Vec-ordered towers — run-twice-equal must hold for the drain path too.
+    #[test]
+    fn drain_assessment_and_sizing_are_deterministic() {
+        let profile = DefenseProfile { towers: vec![tower(1, 1500); 4], breach_hits: 20_000, objective_hits: 30_000, ..Default::default() };
+        let budget = ForceBudget { max_heal_per_tick: 600.0, max_dismantle_dps: 600.0, tank_effective_hp: 20_000.0, onsite_budget_ticks: 1500 };
+        let run = || {
+            let a = assess(&profile, &budget);
+            (a.mode, a.winnable, a.required_heal_per_tick, a.required_tank_hp, RequiredForce::from_assessment(&a))
+        };
+        assert_eq!(run().0, AssaultMode::Drain, "the drain bed picks Drain");
+        assert_eq!(run(), run(), "the drain assess + sizing is deterministic");
+    }
+
+    /// P2 sizing seam: `from_assessment` maps a DRAIN assessment's `required_tank_hp` to TOUGH parts (and a
+    /// BREACH assessment to NONE — the byte-unchanged non-drain mapping).
+    #[test]
+    fn from_assessment_sizes_tough_only_for_drain() {
+        let drain = ForceAssessment {
+            winnable: true,
+            mode: AssaultMode::Drain,
+            required_heal_per_tick: 300.0,
+            required_dismantle_dps: 300.0,
+            required_tank_hp: 5_000.0, // 50 TOUGH parts @ 100 HP
+            est_ticks: 200,
+            reason: "drain",
+        };
+        assert_eq!(RequiredForce::from_assessment(&drain).tough_parts, 50, "drain EHP buffer → TOUGH parts");
+        let breach = ForceAssessment { mode: AssaultMode::Breach, required_tank_hp: 5_000.0, ..drain };
+        assert_eq!(RequiredForce::from_assessment(&breach).tough_parts, 0, "a breach maps no TOUGH (byte-unchanged)");
     }
 
     #[test]

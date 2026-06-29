@@ -238,6 +238,7 @@ pub fn emit_requirement(
                 mode: AssaultMode::Breach,
                 required_heal_per_tick: keeper.dps * hold_margin,
                 required_dismantle_dps: 0.0,
+                required_tank_hp: 0.0,
                 est_ticks: SK_KEEPER_KILL_TICKS,
                 reason: "sk: out-heal + kill the keeper",
             };
@@ -264,6 +265,7 @@ pub fn emit_requirement(
                 mode: AssaultMode::Breach,
                 required_heal_per_tick: 0.0,
                 required_dismantle_dps: 0.0,
+                required_tank_hp: 0.0,
                 est_ticks: 0,
                 reason: "declaim: neutralize the controller (attackController)",
             };
