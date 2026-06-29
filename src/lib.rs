@@ -1282,8 +1282,23 @@ pub fn decide_squad(view: &SquadView) -> SquadDecision {
     // standoff (pinning), so it's exempt; a clearly-winning squad keeps pressing (the close gradient finishes it).
     let stalemate_disengage =
         view.engage_objective == EngageObjective::Destroy && view.enemy_stalled && assess.balance < ENGAGE_BALANCE_BAND;
-    let retreat_now =
-        assess.unwinnable || assess.balance <= -ENGAGE_BALANCE_BAND || any_critical || avg < view.retreat_threshold || stalemate_disengage;
+    // STABLE-INPUT COMMIT (reach bug #1 — Moving<->Retreating oscillation): the strength-`balance` retreat
+    // trigger must be driven from a STABLE present-fighting roster, never from a FLAPPING fighter-presence.
+    // `our_strength == 0` means the squad has ZERO present fighting capability this tick — no member with
+    // attack/ranged/dismantle is currently in the world (e.g. the lone fighter slot is spawning, or blinked
+    // out in the death-before-respawn window while the healers remain). That is a ROSTER-INCOMPLETENESS
+    // condition the rally / `ready_to_depart` gate + lifecycle resolution own — NOT a fight we are losing.
+    // Reading it as "balance hugely negative → retreat" makes the squad flip Moving->Retreating the tick the
+    // fighter is absent, then `can_reengage` flips it Retreating->Moving the tick it respawns — the observed
+    // tick-to-tick oscillation (the squad-level twin of the rally-vision flap; cf. rally.rs). So the
+    // balance-driven retreat is GATED on `our_strength > 0`: a squad with a PRESENT fighting force that is
+    // genuinely outmatched (balance <= -band) still retreats; a squad whose present strength is momentarily
+    // zero HOLDS its committed travel/engage state and lets the rally/lifecycle layer regroup or recycle it.
+    // The GENUINE retreats are untouched: the `unwinnable` bleed-out veto (irremovable enemy damage we can't
+    // out-heal — fires even at our_strength 0, so a present healer-only force under fire still retreats once),
+    // critical-HP, low-avg-HP, and the stalemate disengage all stand.
+    let balance_retreat = assess.our_strength > 0 && assess.balance <= -ENGAGE_BALANCE_BAND;
+    let retreat_now = assess.unwinnable || balance_retreat || any_critical || avg < view.retreat_threshold || stalemate_disengage;
     let can_reengage = !assess.unwinnable && !any_critical && avg > re_engage_band && assess.balance >= ENGAGE_BALANCE_BAND;
     let state = match view.current_state {
         SquadOrderState::Retreating => {
@@ -2540,6 +2555,115 @@ mod tests {
         assert_eq!(state(&squad(400, 17)), SquadOrderState::Retreating, "critically low → sanctioned retreat");
         // Under-sized (10 HEAL ×12 = 120 < 150): can't out-heal → bleeds → retreat even at full HP.
         assert_eq!(state(&squad(2000, 10)), SquadOrderState::Retreating, "under-sized (can't out-heal) → retreat");
+    }
+
+    // ── Reach bug #1: Moving<->Retreating STATE OSCILLATION on a flapping fighter-presence ────────────
+    //
+    // ROOT CAUSE: the strength-`balance` retreat trigger was driven from the INSTANTANEOUS present roster.
+    // A squad of 2 present healers + 1 ranged FIGHTER whose slot stutters across the spawn boundary (the
+    // creep spawns -> syncs -> dies/despawns -> a replacement spawns, repeat) has its present fighting
+    // strength toggle each tick: fighter present -> `our_strength > 0`, balance positive; fighter absent ->
+    // `our_strength == 0`, balance -1000. Feeding that flap into the old retreat/re-engage rule flips the
+    // squad Moving->Retreating (absent) then Retreating->Moving (present) tick-to-tick. The fix gates the
+    // balance-driven retreat on `our_strength > 0`, so a momentary zero-present-strength (a roster-
+    // incompleteness condition the rally/lifecycle layer owns) HOLDS the committed state instead of flapping.
+
+    /// A 2-healer + 1-ranged-fighter squad whose fighter slot toggles present/absent across a tick
+    /// sequence (the spawn-race stutter). Returns the per-tick `[present, absent, present, absent, ...]`
+    /// roster vectors fed to the decision; the enemy is a single weak attacker (winnable WITH the fighter).
+    fn flapping_fighter_rosters() -> Vec<Vec<SquadMemberView>> {
+        let healer_a = healer_at(2000, 2000, 10, 24, 25);
+        let healer_b = healer_at(2000, 2000, 10, 26, 25);
+        // The fighter present (in-world, full HP, real ranged body) vs the SAME slot absent
+        // (`position == None`, `hits == 0`) — exactly the two states `PreRunSquadUpdateSystem` writes for a
+        // resolved vs still-spawning member.
+        let fighter_present = ranged_member_at(2000, 2000, 25, 26);
+        let fighter_absent = SquadMemberView { hits: 0, hits_max: 0, ..Default::default() };
+        let present = || vec![healer_a, healer_b, fighter_present];
+        let absent = || vec![healer_a, healer_b, fighter_absent];
+        vec![present(), absent(), present(), absent(), present(), absent()]
+    }
+
+    /// REPRODUCE (RED before the fix): the OLD retreat rule — the balance trigger ungated by present
+    /// strength (`balance <= -band` alone) — flips the squad Moving<->Retreating every tick the fighter
+    /// blinks in/out. This re-implements the pre-fix state machine over `predict_engage` and asserts the
+    /// state OSCILLATES across the flapping-fighter sequence (the bug).
+    #[test]
+    fn squad_oscillates_moving_retreating_on_flapping_fighter_under_old_rule() {
+        let weak_enemy = vec![creep(1, 25, 25, 100, &[(Part::Attack, 1)])]; // winnable WITH the fighter
+        let rosters = flapping_fighter_rosters();
+
+        // Pre-fix state machine: balance-retreat NOT gated on present strength (the bug).
+        let mut state = SquadOrderState::Moving;
+        let mut states = Vec::new();
+        for members in &rosters {
+            let view = squad_view(members, &weak_enemy, state);
+            let a = predict_engage(&view, cohesion::centroid(&member_positions(&view.members)));
+            let avg = squad_avg_hp_fraction(members);
+            let any_critical = members.iter().any(|m| m.hits_max > 0 && (m.hits as f32 / m.hits_max as f32) < 0.25);
+            let re_engage_band = (0.3_f32 + 0.3).min(0.95);
+            let retreat_now = a.unwinnable || a.balance <= -ENGAGE_BALANCE_BAND || any_critical || avg < 0.3;
+            let can_reengage = !a.unwinnable && !any_critical && avg > re_engage_band && a.balance >= ENGAGE_BALANCE_BAND;
+            state = match state {
+                SquadOrderState::Retreating => if can_reengage { SquadOrderState::Moving } else { SquadOrderState::Retreating },
+                _ => if retreat_now { SquadOrderState::Retreating } else { SquadOrderState::Moving },
+            };
+            states.push(state);
+        }
+        // The bug: state flips Moving (fighter present) <-> Retreating (fighter absent) tick-to-tick. The
+        // roster sequence is [present, absent, present, absent, ...], so the state alternates the same way.
+        let distinct: std::collections::BTreeSet<_> = states.iter().map(|s| format!("{:?}", s)).collect();
+        assert!(distinct.len() > 1, "OLD rule OSCILLATES across the flapping fighter: {:?}", states);
+        assert_eq!(states[0], SquadOrderState::Moving, "fighter present (tick 0) -> not retreating under the old rule");
+        assert_eq!(states[1], SquadOrderState::Retreating, "fighter absent (tick 1) -> retreat under the old rule (the bug)");
+        assert_ne!(states[0], states[1], "the state OSCILLATES tick-to-tick (the reproduced bug)");
+        assert_ne!(states[1], states[2], "...and keeps oscillating as the fighter blinks back in");
+    }
+
+    /// PROVE the fix (GREEN): the SAME flapping-fighter sequence through `decide_squad` (the present-
+    /// strength gate) COMMITS to a stable state — the squad does NOT flip Moving<->Retreating as the
+    /// fighter slot stutters. A zero-present-strength tick HOLDS the committed Moving/Engaged state.
+    #[test]
+    fn squad_commits_stable_state_on_flapping_fighter_under_fix() {
+        let weak_enemy = vec![creep(1, 25, 25, 100, &[(Part::Attack, 1)])];
+        let rosters = flapping_fighter_rosters();
+
+        let mut state = SquadOrderState::Moving;
+        let mut states = Vec::new();
+        for members in &rosters {
+            state = decide_squad(&squad_view(members, &weak_enemy, state)).state;
+            states.push(state);
+        }
+        // No Retreating anywhere in the sequence — the flap never drives a retreat.
+        assert!(
+            states.iter().all(|&s| s != SquadOrderState::Retreating),
+            "the fix COMMITS (never retreats on the flap): {:?}",
+            states
+        );
+        // And it does not oscillate: every tick is the SAME committed state (Engaged — a winnable target
+        // exists; the absent-fighter ticks hold it rather than flipping).
+        let first = states[0];
+        assert!(states.iter().all(|&s| s == first), "the state is STABLE across the flap: {:?}", states);
+    }
+
+    /// PRESERVE the genuine retreat: a squad with a PRESENT fighting force that is truly outmatched
+    /// (our_strength > 0 but the Lanchester balance trails by the band) STILL retreats — the fix only
+    /// suppresses the SPURIOUS zero-present-strength flap, not a real losing fight.
+    #[test]
+    fn genuinely_losing_present_force_still_retreats_under_fix() {
+        // One present ranged fighter (our_strength > 0) vs four heavy bruisers → balance hugely negative.
+        let members = vec![ranged_member_at(2000, 2000, 25, 25)];
+        let enemy: Vec<_> = (0..4).map(|i| creep(10 + i, 30, 25 + i as u8, 1000, &[(Part::Attack, 5), (Part::Move, 5)])).collect();
+        let d = decide_squad(&squad_view(&members, &enemy, SquadOrderState::Moving));
+        assert_eq!(d.state, SquadOrderState::Retreating, "a present, outmatched force still retreats (genuine retreat preserved)");
+
+        // And a PRESENT healer-only force that is bleeding out (irremovable damage it can't out-heal)
+        // still retreats via the `unwinnable` veto, even though our_strength == 0 (the veto is exempt from
+        // the present-strength gate — a bleed-out is a real loss, not a roster-incompleteness flap).
+        let bleeding = vec![healer_at(2000, 2000, 1, 25, 25)]; // 1 HEAL part = ~12 heal/tick
+        let heavy: Vec<_> = (0..3).map(|i| creep(20 + i, 26, 25 + i as u8, 1000, &[(Part::Attack, 10), (Part::Move, 5)])).collect();
+        let d2 = decide_squad(&squad_view(&bleeding, &heavy, SquadOrderState::Engaged));
+        assert_eq!(d2.state, SquadOrderState::Retreating, "a present force bleeding out (unwinnable veto) still retreats even at our_strength 0");
     }
 
     /// A hostile tower at `(x,y)` with explicit `energy` (the `structure` helper hardcodes 1000).
