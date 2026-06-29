@@ -109,6 +109,38 @@ pub struct EngagementContext {
     /// The tournament-tunable optimizer knobs (ADR 0031 D16/D17). [`CompositionParams::default`] reproduces
     /// today's fielding.
     pub params: crate::composition::CompositionParams,
+    /// Is the `defense` intel RELIABLE — i.e. a SCOUTED / MAPPED / live-visible room, not merely UNSEEN
+    /// (ADR 0031 §2(d))? The caller sets this from the SAME intel-reliability source the rally fix uses
+    /// (`CombatIntelSource::is_reliable` — `Cached` mapped `RoomData` OR `LiveVisible`; `None` = no vision).
+    /// It is the ONLY new bit threaded for the CONFIRMED-undefended distinction: an empty `defense`
+    /// (towers=[], enemy_dps=0) means *genuinely clear* only when this is `true`; when `false` it means
+    /// merely *unseen*, so the always-field heal/anti-creep floor is RETAINED (don't field a naked force
+    /// into the unknown). Per-tick / computed — NOT serialized (no `WORLD_FORMAT_VERSION` bump). DEFAULT
+    /// `false` (the SAFE "not confirmed") for any caller that does not set it.
+    pub defense_intel_reliable: bool,
+}
+
+impl EngagementContext {
+    /// CONFIRMED-undefended (ADR 0031 §2(d)) — the ONE clean predicate that distinguishes a *genuinely
+    /// clear* target from an *unscouted/unseen* one, so the always-field doctrine floor can be suppressed
+    /// for the former while the hedge holds for the latter. True iff the intel is RELIABLE
+    /// ([`defense_intel_reliable`](Self::defense_intel_reliable)) AND the reliable target shows ZERO threat:
+    /// no ENERGIZED towers AND no defender DPS — mirroring the no-attrition detector
+    /// [`crate::composition::optimize_composition`] uses for its FIX-3 gate (`tower_dps == 0 &&
+    /// incoming == 0`). "No defender DPS" reads BOTH channels a caller can carry it in: `defense.enemy_dps`
+    /// (the structure arms' folded defender dps) AND the `enemy_force` (the creep-clear arms' observed creep
+    /// force) — so a player room with guard creeps but no towers (`defense.enemy_dps == 0` yet
+    /// `enemy_force.dps > 0`) is correctly NOT confirmed-undefended (the floor is retained — no regression).
+    /// Reliable-but-empty intel is required: an UNSEEN room (`defense_intel_reliable == false`) is never
+    /// "confirmed undefended" even with an all-zero target, so the floor's hedge against fielding a naked
+    /// force into the unknown is preserved (a strict regression-guard over the prior `incoming == 0` alone).
+    pub fn defense_confirmed_undefended(&self) -> bool {
+        let enemy_dps = self.enemy_force.map(|e| e.dps).unwrap_or(0.0);
+        self.defense_intel_reliable
+            && crate::force_sizing::tower_dps_at_assault(&self.defense.towers) == 0.0
+            && self.defense.enemy_dps == 0.0
+            && enemy_dps == 0.0
+    }
 }
 
 /// The driver's output: the assembled force + the oracle verdict (ADR 0026 §9.3 / ADR 0031).
@@ -345,7 +377,15 @@ pub fn plan_engagement(doctrine: &dyn ForceDoctrine, ctx: &EngagementContext, bu
     // and scales UP with the observed threat (D11). The floor is applied by raising the requirement the
     // optimizer searches over (a max — never below floor); the optimizer then EV-searches the over-power /
     // tough ladders from there.
-    if !doctrine.honor_verdict() {
+    //
+    // EXCEPTION (ADR 0031 §2(d)): suppress the floor for a CONFIRMED-undefended target — RELIABLE intel
+    // showing zero towers + zero defenders. The floor is a HEDGE for an UNSCOUTED room (`dps == 0` because
+    // we have no intel → don't field a naked force into the unknown), but on a genuinely-clear room it
+    // over-rides the oracle's correct `heal_parts = 0` into ≈2 wasted Healer slots. The floor is RETAINED
+    // for an unscouted room (`!defense_confirmed_undefended()`) and for any defended target, so the hedge
+    // holds exactly where it is correct.
+    let confirmed_undefended = ctx.defense_confirmed_undefended();
+    if !doctrine.honor_verdict() && !confirmed_undefended {
         let floor = default_floor_force();
         required.heal_parts = required.heal_parts.max(floor.heal_parts);
         required.anti_creep_parts = required.anti_creep_parts.max(floor.anti_creep_parts);
@@ -361,6 +401,7 @@ pub fn plan_engagement(doctrine: &dyn ForceDoctrine, ctx: &EngagementContext, bu
         ctx.coordination,
         ctx.importance,
         doctrine.honor_verdict(),
+        confirmed_undefended,
         &params,
     )
     // The always-field floor (above) ⇒ the optimizer searches a non-empty requirement; but if it can't field
@@ -647,6 +688,9 @@ mod tests {
             target_value: 100_000.0,
             onsite_window: 1400,
             params: crate::composition::CompositionParams { member_energy: 5600, ..Default::default() },
+            // Default to NOT-confirmed (an unseen room) — the SAFE side: the always-field floor is retained
+            // unless a test explicitly opts into confirmed-undefended (see the §2(d) suppression tests).
+            defense_intel_reliable: false,
         }
     }
 
@@ -830,6 +874,75 @@ mod tests {
             let plan = plan_engagement(doc, &c, None);
             assert!(plan.composition.is_some(), "{obj:?}: an always-field doctrine fields a force");
         }
+    }
+
+    /// Count the Healer slots an assembled composition fields.
+    fn healer_slots(comp: &SquadComposition) -> usize {
+        comp.slots.iter().filter(|s| s.role == SquadRole::Healer).count()
+    }
+
+    /// ADR 0031 §2(d) — the heal RIGHT-SIZING fix. The always-field heal/anti-creep floor is a HEDGE for an
+    /// UNSCOUTED room (don't field a naked force into the unknown), but it must NOT over-heal a CONFIRMED-
+    /// undefended target (RELIABLE intel showing zero towers + zero defenders), where the Lanchester oracle
+    /// already correctly sizes `heal_parts = 0`. The distinction is the SINGLE predicate
+    /// [`EngagementContext::defense_confirmed_undefended`] (reliable intel ∧ no towers ∧ no defender dps) —
+    /// suppressing on `dps == 0` ALONE would be a regression (it would strip the hedge from unscouted rooms).
+    #[test]
+    fn confirmed_undefended_suppresses_the_always_field_floor() {
+        let docs = default_doctrines();
+
+        // (a) CONFIRMED-undefended (reliable intel, no towers, no defenders) → floor SUPPRESSED → the oracle's
+        // heal_parts = 0 survives → NO Healer slot (the live undefended-core over-heal is gone).
+        let mut confirmed = ctx(DoctrineObjective::ClearCreeps, DefenseProfile::default());
+        confirmed.defense_intel_reliable = true; // scouted/mapped — empty defense is genuinely clear
+        confirmed.enemy_force = Some(EnemyForce::default()); // reliably zero defenders
+        assert!(confirmed.defense_confirmed_undefended(), "reliable + no towers + no defenders ⇒ confirmed-undefended");
+        let plan = plan_engagement(decide_doctrine(&confirmed, &docs).unwrap(), &confirmed, None);
+        let comp = plan.composition.expect("always-field still fields a force (the kill weapon), just no heal floor");
+        assert_eq!(plan.required.heal_parts, 0, "confirmed-undefended ⇒ the heal floor is suppressed (oracle's 0 survives)");
+        assert_eq!(healer_slots(&comp), 0, "confirmed-undefended ⇒ NO wasted Healer slot");
+
+        // (b) UNSCOUTED (no/unreliable intel, dps still reads 0 because we have NO vision) → floor RETAINED →
+        // the hedge holds (a survivable scout force, never naked). This is the regression-guard: the SAME
+        // all-zero defense, but `defense_intel_reliable == false`, MUST keep the floor.
+        let mut unscouted = ctx(DoctrineObjective::ClearCreeps, DefenseProfile::default());
+        unscouted.defense_intel_reliable = false; // no vision — empty is merely unseen, not clear
+        unscouted.enemy_force = Some(EnemyForce::default());
+        assert!(!unscouted.defense_confirmed_undefended(), "no reliable intel ⇒ NOT confirmed-undefended (even with dps == 0)");
+        let plan = plan_engagement(decide_doctrine(&unscouted, &docs).unwrap(), &unscouted, None);
+        assert!(plan.required.heal_parts >= DEFAULT_FLOOR_PARTS, "unscouted ⇒ the heal floor is RETAINED (the hedge): {}", plan.required.heal_parts);
+        assert!(healer_slots(&plan.composition.expect("unscouted still fields the floor force")) >= 1, "unscouted ⇒ a survivable (healed) scout force, never naked");
+
+        // (c) DEFENDED (reliable intel, but a present creep force) → NOT confirmed-undefended (the
+        // `enemy_force` dps channel) → the oracle sizes heal to the threat + the floor is honored UNCHANGED.
+        let mut defended = ctx(DoctrineObjective::ClearCreeps, DefenseProfile::default());
+        defended.defense_intel_reliable = true; // we DO see the room — and it has defenders
+        defended.enemy_force = Some(EnemyForce { dps: 150.0, heal: 0.0, hits: 0, count: 3, boosted: false });
+        assert!(!defended.defense_confirmed_undefended(), "a present defender force ⇒ NOT confirmed-undefended (no regression)");
+        let plan = plan_engagement(decide_doctrine(&defended, &docs).unwrap(), &defended, None);
+        assert!(plan.required.heal_parts >= DEFAULT_FLOOR_PARTS, "defended ⇒ heal sized to the threat (≥ floor)");
+        assert!(healer_slots(&plan.composition.expect("defended fields a healed force")) >= 1, "defended ⇒ a healed force");
+    }
+
+    /// (d) GarrisonDefense on a real/unknown threat is UNCHANGED — a defense caller carries the threat in
+    /// `enemy_force` (NOT `defense`) and leaves `defense_intel_reliable` at the SAFE default (false), so it is
+    /// never confirmed-undefended and the floor is always retained (the §2(d) guarantee).
+    #[test]
+    fn garrison_defense_floor_is_unchanged_by_the_fix() {
+        let docs = defense_doctrines();
+        // A present threat in enemy_force, an empty `defense` (the defense path's shape), default intel-flag.
+        let mut c = ctx(DoctrineObjective::ClearCreeps, DefenseProfile::default());
+        c.enemy_force = Some(EnemyForce { dps: 80.0, heal: 0.0, hits: 0, count: 2, boosted: false });
+        assert!(!c.defense_confirmed_undefended(), "defense vs a present threat is never confirmed-undefended");
+        let plan = plan_engagement(decide_doctrine(&c, &docs).unwrap(), &c, None);
+        assert!(healer_slots(&plan.composition.expect("defense always fields")) >= 1, "GarrisonDefense keeps a healed defender (unchanged)");
+
+        // Even an UNSCOUTED defend-flag room (enemy_force None, default intel-flag) keeps the floor.
+        let mut unscouted = ctx(DoctrineObjective::ClearCreeps, DefenseProfile::default());
+        unscouted.enemy_force = None;
+        assert!(!unscouted.defense_confirmed_undefended(), "no enemy_force + default (unreliable) intel ⇒ floor retained");
+        let plan = plan_engagement(decide_doctrine(&unscouted, &docs).unwrap(), &unscouted, None);
+        assert!(plan.required.heal_parts >= DEFAULT_FLOOR_PARTS, "unscouted defense keeps the floor");
     }
 
     /// ADR 0031 P2 determinism fence: the unified [`emit_requirement`] is a pure fold over Vec-ordered

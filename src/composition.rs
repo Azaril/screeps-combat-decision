@@ -530,6 +530,7 @@ pub fn optimize_composition(
     coordination: EnemyCoordination,
     importance: f32,
     honor_verdict: bool,
+    confirmed_undefended: bool,
     params: &CompositionParams,
 ) -> Option<SquadComposition> {
     let member_energy = params.member_energy;
@@ -546,7 +547,12 @@ pub fn optimize_composition(
         emit_requirement(objective, defense, enemy, Some(&budget), coordination, importance, params.hold_margin, params.over_power_margin);
     // ALWAYS-FIELD doctrines (defense / operator intent / deny) keep the minimal default floor on the
     // requirement (D11) — never field below a survivable scout force, even for a tiny scouted threat.
-    if !honor_verdict {
+    // EXCEPTION (ADR 0031 §2(d)): a CONFIRMED-undefended target (reliable intel, zero towers + zero
+    // defenders — `confirmed_undefended`, the ONE predicate computed by the caller's
+    // `EngagementContext::defense_confirmed_undefended`) suppresses the floor so the oracle's correct
+    // `heal_parts = 0` survives (no wasted Healer slots). The floor is RETAINED for an UNSCOUTED room
+    // (`!confirmed_undefended`, the hedge against a naked force into the unknown) and any defended target.
+    if !honor_verdict && !confirmed_undefended {
         base_required.heal_parts = base_required.heal_parts.max(DEFAULT_FLOOR_PARTS);
         base_required.anti_creep_parts = base_required.anti_creep_parts.max(DEFAULT_FLOOR_PARTS);
     }
@@ -917,6 +923,7 @@ mod tests {
                 EnemyCoordination::Individual,
                 0.0,
                 true,
+                false,
                 &p,
             )
             .map(|c| format!("{c:?}"))
@@ -941,6 +948,7 @@ mod tests {
             EnemyCoordination::Individual,
             0.0,
             true, // gated
+            false,
             &strict,
         );
         assert!(deferred.is_none(), "gated + EV ≤ commit threshold → defer (None)");
@@ -956,6 +964,7 @@ mod tests {
             EnemyCoordination::Individual,
             0.0,
             true,
+            false,
             &CompositionParams { member_energy: 5600, ..Default::default() },
         );
         assert!(committed.is_some(), "winnable target commits at Default");
@@ -984,7 +993,7 @@ mod tests {
         // still commits the minimal force.
         let p = CompositionParams { member_energy: 5600, w_energy: 0.01, ..Default::default() };
         let opt = |value: f32| {
-            optimize_composition(DoctrineObjective::RaidCreeps, &defense, enemy, value, 1400, EnemyCoordination::Coordinated, 0.0, true, &p)
+            optimize_composition(DoctrineObjective::RaidCreeps, &defense, enemy, value, 1400, EnemyCoordination::Coordinated, 0.0, true, false, &p)
                 .expect("winnable at both values")
         };
         // A small value: P(win) is already good at the minimal force, so the extra over-power doesn't pay
@@ -1013,6 +1022,7 @@ mod tests {
             EnemyCoordination::Individual,
             0.0,
             true,
+            false,
             &CompositionParams { member_energy: 5600, ..Default::default() },
         )
         .expect("a winnable immune core commits at Default");
@@ -1044,6 +1054,7 @@ mod tests {
             EnemyCoordination::Individual,
             0.0,
             true,
+            false,
             &CompositionParams { member_energy: 5600, ..Default::default() },
         )
         .expect("an undefended core is trivially winnable");
@@ -1078,7 +1089,7 @@ mod tests {
         let counts: Vec<usize> = [400u32, 600, 900, 1200, 1400]
             .iter()
             .map(|&window| {
-                optimize_composition(DoctrineObjective::KillImmuneStructure, &core, None, 100_000.0, window, EnemyCoordination::Individual, 0.0, true, &p)
+                optimize_composition(DoctrineObjective::KillImmuneStructure, &core, None, 100_000.0, window, EnemyCoordination::Individual, 0.0, true, false, &p)
                     .expect("a small undefended core is winnable at every realistic window")
                     .member_count()
             })
@@ -1119,6 +1130,7 @@ mod tests {
                 EnemyCoordination::Individual,
                 0.0,
                 true,
+                false,
                 &p,
             )
             .expect("winnable")
