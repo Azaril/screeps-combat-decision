@@ -1332,15 +1332,29 @@ fn assess_engage(view: &SquadView, centroid: Option<Position>) -> EngageAssessme
             .sum()
     });
     // ADR 0031 #39 DRAIN exception — SCOPED to `drain_stance` (a breach/normal squad takes the byte-
-    // unchanged veto below). When this squad is fielded to drain AND the towers are FINITE-energy (they
-    // WILL run dry) AND the squad's heal sustains against the FALLOFF tower dps at the drain standoff
-    // (heal ≥ falloff dps), the towers are NOT irremovable — they bleed to 0 under the soak, then the
-    // squad breaches the dead base. So we drop their `tower_dps` from the unwinnable accounting (we hold
-    // the standoff instead of retreating). If the drain does NOT sustain (heal < falloff dps) or the
-    // towers are infinite, the standard veto applies (no free pass). The non-tower irremovable damage
-    // (`unkillable_dps`) is unaffected — a creep we can't out-heal still vetoes.
-    let drain_exempt_tower_dps = view.drain_stance && drain_sustains(view.structures, our_heal);
-    let counted_tower_dps = if drain_exempt_tower_dps { 0 } else { tower_dps };
+    // unchanged veto below). When this squad is fielded to drain AND the squad's heal sustains against the
+    // FALLOFF tower dps at the drain standoff (heal ≥ falloff dps), the FINITE-energy towers (which WILL run
+    // dry) are NOT irremovable — they bleed to 0 under the soak, then the squad breaches the dead base. So we
+    // drop the FINITE towers' contribution from the unwinnable accounting (we hold the standoff instead of
+    // retreating). If the drain does NOT sustain (heal < falloff dps), the standard veto applies (no free pass).
+    //
+    // ADR 0031 §2(g) FOLLOW-UP 2 — MIXED finite+infinite hardening: exempt ONLY the FINITE towers' dps, NOT
+    // the whole `tower_dps`. An INFINITE-energy tower (`energy >= DRAIN_INFINITE_TOWER_ENERGY`) never bleeds,
+    // so its standoff fire STILL counts in the veto while draining — consistent with the soak sizing
+    // (`finite_drain_towers`, finite-only) so a MIXED base correctly reads unwinnable-via-drain. (Behaviour-
+    // neutral live: real towers cap at 1000 energy, far below the 50_000 sentinel.) The non-tower irremovable
+    // damage (`unkillable_dps`) is unaffected — a creep we can't out-heal still vetoes.
+    let exempt_finite_tower_dps = if view.drain_stance && drain_sustains(view.structures, our_heal) {
+        centroid.map_or(0, |ctr| {
+            finite_drain_towers(view.structures)
+                .iter()
+                .map(|t| screeps_combat_engine::damage::tower_attack_damage_at_range(ctr.get_range_to(t.pos)) as u64)
+                .sum()
+        })
+    } else {
+        0
+    };
+    let counted_tower_dps = tower_dps.saturating_sub(exempt_finite_tower_dps);
     // We bleed out if damage we can neither kill nor out-heal is positive.
     let unwinnable = unkillable_dps + counted_tower_dps > our_heal;
 
@@ -2992,6 +3006,65 @@ mod tests {
             }
             other => panic!("drain squad should emit a Drain standoff directive, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn mixed_finite_infinite_tower_drain_exemption_still_counts_the_infinite_tower() {
+        // ADR 0031 §2(g) FOLLOW-UP 2 (FIX B) — on a MIXED finite+infinite base, the drain exemption must
+        // drop ONLY the FINITE towers' dps; the INFINITE tower's standoff fire STILL counts in the
+        // winnability veto (it never bleeds dry). Bed: 3 finite (1500) + 1 infinite (100_000) tower nest at
+        // the centroid; a drain-stance squad whose heal sustains the FINITE-only falloff soak. Pre-fix the
+        // whole `tower_dps` was exempted → the infinite tower's fire vanished → falsely winnable; post-fix
+        // the infinite tower's dps remains and over-runs the heal → correctly UNWINNABLE.
+        let towers = vec![
+            tower_e(24, 24, 1500),
+            tower_e(26, 24, 1500),
+            tower_e(24, 26, 1500),
+            tower_e(26, 26, 100_000),
+            tower_e(25, 24, 100_000),
+        ];
+        let structures: Vec<CombatStructureDto> = towers
+            .into_iter()
+            .chain(std::iter::once(structure(25, 25, StructureType::Spawn, Ownership::Hostile)))
+            .collect();
+        // A tank + healers at the nest centroid. Heal = 2×25×12 = 600/tick — enough to sustain the
+        // FINITE-only falloff floor (3×150 = 450, ×1.2 margin = 540 ≤ 600) so `drain_sustains` is true and
+        // the exemption fires — but the TWO infinite towers' OPTIMAL-range fire at the point-blank centroid
+        // (2×600 = 1200) is well above 600, so once they are (correctly) NOT exempted the fight is unwinnable.
+        let members = vec![
+            SquadMemberView { hits: 6000, hits_max: 6000, pos: Some(pos(25, 25)), ..Default::default() }, // tank at the centroid
+            SquadMemberView { hits: 2000, hits_max: 2000, heal_power: 25, pos: Some(pos(25, 24)), ..Default::default() },
+            SquadMemberView { hits: 2000, hits_max: 2000, heal_power: 25, pos: Some(pos(24, 25)), ..Default::default() },
+        ];
+        let view = SquadView {
+            members: &members,
+            hostiles: &[],
+            structures: &structures,
+            retreat_threshold: 0.3,
+            current_state: SquadOrderState::Engaged,
+            enemy_safe_mode: false,
+            engage_objective: EngageObjective::Destroy,
+            enemy_stalled: false,
+            drain_stance: true,
+        };
+        let centroid = cohesion::centroid(&member_positions(view.members));
+        // FIX B: the >=50k infinite tower is NOT exempted from the veto → unwinnable-via-drain.
+        assert!(
+            predict_engage(&view, centroid).unwinnable,
+            "a mixed finite+infinite base reads UNWINNABLE — the infinite tower's standoff fire still counts"
+        );
+
+        // REGRESSION GUARD: drop the infinite tower (pure-finite nest, otherwise identical) → the SAME
+        // exemption now zeroes the WHOLE tower dps (all towers are finite) → the drain holds (winnable).
+        let finite_only: Vec<CombatStructureDto> = vec![tower_e(24, 24, 1500), tower_e(26, 24, 1500), tower_e(24, 26, 1500)]
+            .into_iter()
+            .chain(std::iter::once(structure(25, 25, StructureType::Spawn, Ownership::Hostile)))
+            .collect();
+        let finite_view = SquadView { structures: &finite_only, ..view };
+        assert!(
+            !predict_engage(&finite_view, centroid).unwinnable,
+            "a PURE-finite drain still holds (byte-unchanged): the whole tower dps is exempted"
+        );
     }
 
     #[test]

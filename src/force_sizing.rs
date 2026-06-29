@@ -164,6 +164,17 @@ fn is_finite_drain_tower(t: &TowerThreat) -> bool {
     t.energy >= TOWER_ENERGY_COST && t.energy < DRAIN_INFINITE_TOWER_ENERGY
 }
 
+/// ADR 0031 §2(g) FOLLOW-UP 2 — does the base have ANY energized INFINITE-energy tower (`energy >=
+/// DRAIN_INFINITE_TOWER_ENERGY`)? Such a tower NEVER bleeds dry, so a MIXED finite+infinite base cannot be
+/// safely drained: the drain-soak sizing (`tower_dps_at_drain_standoff` / `drain_ticks`) counts only the
+/// FINITE towers and would UNDER-size the heal (ignore the infinite tower's standoff fire) AND mis-read the
+/// base as drainable. When this holds we REFUSE the drain branch and fall to the heavy-assault / unwinnable
+/// path (which sizes for ALL tower dps). Behaviour-NEUTRAL live: real Screeps towers cap at 1000 energy,
+/// always far below the 50_000 sentinel — the `>=` case exists only for synthetic eval/foreman fixtures.
+fn has_energized_infinite_tower(towers: &[TowerThreat]) -> bool {
+    towers.iter().any(|t| t.energy >= DRAIN_INFINITE_TOWER_ENERGY)
+}
+
 /// Ticks for the energized FINITE towers to run dry under sustained fire (each fires once/tick, −10 energy);
 /// the slowest tower (the last to go silent) bounds the drain. INFINITE-energy towers are excluded (the EV
 /// guard) so a deep-energy base yields `dt == 0` and the drain branch is never entered for it.
@@ -273,7 +284,14 @@ pub fn assess(profile: &DefenseProfile, enemy_dps: f32, budget: &ForceBudget) ->
     // whose falloff fire over-runs the tank's HP + heal over the whole drain is NOT drainable by one squad
     // (it falls through to the G4-HEAVY arm). And a target a direct breach ALREADY wins returned above — a
     // winning breach is never downgraded to the slower drain.
-    if dt > 0 && tank_sustain >= drain_damage {
+    //
+    // ADR 0031 §2(g) FOLLOW-UP 2 — MIXED finite+infinite hardening: a base with ANY energized INFINITE-energy
+    // tower is NEVER a drain target even if it ALSO has finite towers. The soak sizing above
+    // (`standoff_dps`/`dt`) counts ONLY the finite towers, so a mixed base would UNDER-size the heal (ignore
+    // the never-draining tower's standoff fire) and mis-read as drainable; the squad would commit to a drain
+    // it cannot sustain (the infinite tower never bleeds). REFUSE the drain so it falls to the heavy-assault /
+    // unwinnable path (which sizes for ALL tower dps). A PURE-finite base (no infinite tower) is byte-unchanged.
+    if dt > 0 && tank_sustain >= drain_damage && !has_energized_infinite_tower(&profile.towers) {
         // SIZE THE DRAIN COMP (P2): the fielded squad must SURVIVE THE SOAK, not just the post-drain phase.
         // The binding survival constraint is `tank_effective_hp + heal·dt ≥ tower_dps·dt`. HEAL is the
         // sustainable (indefinite) part of the soak and the TOUGH EHP buffer is a one-time reserve, so we
@@ -713,6 +731,31 @@ mod tests {
         assert!(!a.winnable, "an infinite-tower base is NOT drainable by one squad");
         assert_ne!(a.mode, AssaultMode::Drain, "and it is NOT mis-classified as a drain");
         assert!(a.reason.contains("heavy assault"), "it defers to the heavy-assault arm: {}", a.reason);
+    }
+
+    /// ADR 0031 §2(g) FOLLOW-UP 2 (FIX A) — a MIXED finite+infinite base is NEVER a drain target: the soak
+    /// sizing counts only the finite towers (under-sizing the heal + mis-reading drainability), so any
+    /// energized infinite tower REFUSES the drain branch → it falls to the heavy-assault / unwinnable path.
+    #[test]
+    fn oracle_never_drains_a_mixed_finite_and_infinite_base() {
+        // 3 finite (1500) + 1 infinite (100_000) tower nest. With only the 3 finite towers the falloff soak
+        // (3×150 = 450) would be sustainable by the budget below — i.e. WITHOUT the mixed guard the drain
+        // branch would fire (pre-fix bug). The infinite tower must veto the drain.
+        let profile = DefenseProfile {
+            towers: vec![tower(1, 1500), tower(1, 1500), tower(1, 1500), tower(1, 100_000)],
+            breach_hits: 20_000,
+            objective_hits: 30_000,
+            ..Default::default()
+        };
+        let budget = ForceBudget { max_heal_per_tick: 600.0, max_dismantle_dps: 600.0, tank_effective_hp: 20_000.0, onsite_budget_ticks: 1500 };
+        let a = assess(&profile, 0.0, &budget);
+        assert_ne!(a.mode, AssaultMode::Drain, "a mixed finite+infinite base is NOT mis-classified as a drain: {}", a.reason);
+        assert!(!a.winnable, "it falls to the heavy-assault / unwinnable path (the infinite tower can't be bled): {}", a.reason);
+        assert!(a.reason.contains("heavy assault"), "it defers to the heavy-assault arm: {}", a.reason);
+        // And the comparison case: the SAME 3 finite towers WITHOUT the infinite one DO pick Drain (the guard
+        // is what flips the verdict, not the budget).
+        let pure_finite = DefenseProfile { towers: vec![tower(1, 1500); 3], ..profile };
+        assert_eq!(assess(&pure_finite, 0.0, &budget).mode, AssaultMode::Drain, "the pure-finite nest still drains");
     }
 
     /// (b) EV GUARD — an UNSUSTAINABLE finite drain (the falloff fire over-runs the tank's HP + heal over the
