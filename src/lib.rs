@@ -1432,6 +1432,22 @@ pub fn present_force_wins_or_stalls(view: &SquadView, centroid: Option<Position>
     a.our_strength > 0 && !a.unwinnable && a.balance > -ENGAGE_BALANCE_BAND
 }
 
+/// RC-11 — whether the win-or-stall fast-path may FIRE (gate the proceed/quorum on REAL target intel).
+///
+/// [`present_force_wins_or_stalls`] returns TRUE **vacuously** against an UNSCOUTED room: with empty
+/// hostiles + empty structures, `assess_engage` sees killable_dps=0 / tower_dps=0 → `unwinnable=false`,
+/// `enemy_strength≈0`, `our_strength>0` → the balance clamps to +1000 ("we win"). Acting on that vacuous
+/// win while the squad is still scattered latches a cross-room formation assault that FREEZES the lagging
+/// members. So the live caller ANDs the fast-path with this predicate: it only fires when the squad has
+/// REAL intel for the target — a non-empty DTO set (a hostile/structure is actually visible) OR an
+/// on-arrival live read of the room. An empty cached/no-vision view does NOT qualify (empty there means
+/// merely UNSEEN), so the squad falls back to the gather-quorum count gate and masses before committing.
+/// The fast-path re-enables the moment real DTOs arrive. Pure boolean algebra — kept here next to the
+/// predicate it guards so the policy lives in one place and is unit-testable without the live DTO plumbing.
+pub fn winnable_fast_path_allowed(present_wins_or_stalls: bool, have_target_intel: bool) -> bool {
+    present_wins_or_stalls && have_target_intel
+}
+
 /// **The squad-level tactical decision** (ADR 0008 §4, P2.G3). Picks the squad's shared
 /// focus ([`select_focus_target`] from the whole roster's perspective) and resolves
 /// engage-vs-retreat with **coupled hysteresis** (no yo-yo): once `Retreating`, the squad
@@ -2658,6 +2674,43 @@ mod tests {
         current_state: SquadOrderState,
     ) -> SquadView<'a> {
         SquadView { members, hostiles, structures: &[], retreat_threshold: 0.3, current_state, enemy_safe_mode: false, engage_objective: EngageObjective::Destroy, enemy_stalled: false, drain_stance: false }
+    }
+
+    // ── RC-11: the vacuous win-or-stall against an unscouted room + the intel-gated fast-path ──
+    #[test]
+    fn present_force_wins_or_stalls_is_vacuously_true_against_empty_unscouted_room() {
+        // A present fighting force (70 ranged DPS, our_strength > 0) vs an UNSCOUTED room: EMPTY hostiles
+        // AND EMPTY structures (the source-`None` DTO set). `assess_engage` sees killable_dps=0/tower_dps=0
+        // → unwinnable=false, enemy_strength≈0 → balance clamps +1000 → "we win" against ZERO visible
+        // enemies. This pins the VACUOUS win the RC-11 intel gate must not act on.
+        let members = vec![ranged_member_at(600, 600, 25, 25)];
+        let view = squad_view(&members, &[], SquadOrderState::Moving); // structures: &[] in the helper
+        let center = cohesion::centroid(&member_positions(view.members));
+        assert!(
+            present_force_wins_or_stalls(&view, center),
+            "win-or-stall is vacuously TRUE against an empty (unscouted) room — the RC-11 freeze trigger"
+        );
+    }
+
+    #[test]
+    fn winnable_fast_path_gated_on_real_target_intel() {
+        // The pure gate the live caller ANDs with the win-or-stall fast-path. With a vacuous win but NO
+        // real intel (empty DTOs, not LiveVisible) the fast-path is BLOCKED → fall back to the gather-
+        // quorum count gate (mass before assaulting). Real intel re-enables it.
+        let no_intel = false; // !hostiles.is_empty() || !structures.is_empty() || LiveVisible
+        let with_intel = true; // a hostile/structure is visible OR the room is LiveVisible
+        assert!(
+            !winnable_fast_path_allowed(true, no_intel),
+            "a vacuous win with NO target intel must NOT fire the fast-path (RC-11 freeze guard)"
+        );
+        assert!(
+            winnable_fast_path_allowed(true, with_intel),
+            "a win-or-stall WITH real intel re-enables the fast-path (D7 preserved)"
+        );
+        assert!(
+            !winnable_fast_path_allowed(false, with_intel),
+            "no fast-path when the force would LOSE, even with intel"
+        );
     }
 
     #[test]
