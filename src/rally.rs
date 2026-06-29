@@ -102,6 +102,77 @@ pub fn ready_to_depart_gate(member_positions: &[Option<Position>], requested_slo
     present >= min_viable
 }
 
+// ─── D6 lifetime-aware staging / renew-in-transit (ADR 0034 RC-5/RC-6/RC-7) ─────────────────────────────
+//
+// A member committed to MoveTo(rally) burns TTL crossing to the rally AND then fights — but nothing today
+// checks it can survive the journey. A far-spawned member travels several rooms (~RALLY_TRAVEL_PER_ROOM
+// ticks each), idles at the rally while the bulk gathers, then must still have enough life to be useful in
+// the fight (FIGHT_BUFFER). Without the gate it arrives low or dead → roster drops → quorum oscillates and a
+// slow far-home form ages its early members out before it masses (RC-7). The KERNEL below is the single
+// source of truth the sim AND the bot share so they cannot drift.
+
+/// A member's remaining life must cover the journey to the rally PLUS the journey rally→target PLUS this
+/// many ticks of fighting at the objective, or it should not be committed to travel as-is. ~2 room-hops of
+/// fight margin (a member arriving with under this much life cannot meaningfully contribute to + sustain the
+/// engagement, so committing it just feeds the oscillation). Tunable; integer (no float branch).
+pub const FIGHT_BUFFER: u32 = 100;
+
+/// Ticks of TTL a member spends per ROOM of travel (Chebyshev room-distance → ticks). A loaded combat body
+/// (heavy, fatigue-bound, ~2 tiles/tick across a 50-tile room) crosses a room in ~50 ticks. Multiplies the
+/// room-distance legs in the lifetime gate. Integer; deterministic.
+pub const RALLY_TRAVEL_PER_ROOM: u32 = 50;
+
+/// Renew tops a held member back up TOWARD this TTL ceiling (engine `CREEP_LIFE_TIME` is 1500; renew is
+/// capped a little under to avoid waste). The renew-to-sufficiency target the bot + sim share (D6b).
+pub const RENEW_TARGET_TTL: u32 = 1400;
+
+/// The per-member commit decision the lifetime gate (D6a) returns — what to do with a member that is (or is
+/// not) able to survive the journey + fight from its current TTL. A PURE function of the inputs so the sim
+/// and the live bot reach the identical verdict.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommitDecision {
+    /// TTL covers the rally leg + the assault leg + the fight buffer — release it to travel now.
+    Commit,
+    /// TTL is short of sufficiency BUT a renew (held at home / at a renewable rally) can top it up enough —
+    /// hold + renew to sufficiency before committing (RC-5/RC-6). Self-healing, no new infra.
+    RenewThenCommit,
+    /// TTL cannot be topped up enough even by a full renew to `RENEW_TARGET_TTL` (the journey alone exceeds
+    /// a fresh creep's life, e.g. a hopelessly-far home) — recycle the slot rather than feed the oscillation.
+    Recycle,
+}
+
+/// D6a PRE-DEPARTURE LIFETIME GATE (RC-7): decide whether a member with `ttl` remaining can be committed to
+/// travel `dist_to_rally` rooms to the staging point, then `dist_to_target` rooms rally→target, and still
+/// have `fight_buffer` ticks of life to fight. Pure integer math (deterministic — no float-into-discrete
+/// branch, no allocation): the journey cost is `(dist_to_rally + dist_to_target) * RALLY_TRAVEL_PER_ROOM`.
+///
+/// - `ttl >= journey + fight_buffer` ⇒ [`CommitDecision::Commit`].
+/// - else if a renew to `renew_ceiling` WOULD cover it ⇒ [`CommitDecision::RenewThenCommit`] (hold + renew).
+/// - else (even a full renew is short) ⇒ [`CommitDecision::Recycle`].
+///
+/// Shared by the bot (gate a member before releasing it to `MoveTo(rally)`) and the sim (the S3
+/// renew-in-transit repro). `renew_ceiling` is normally [`RENEW_TARGET_TTL`]; passing the SAME value the bot
+/// renews toward keeps the verdicts identical.
+pub fn lifetime_sufficient_for_deployment(
+    ttl: u32,
+    dist_to_rally: u32,
+    dist_to_target: u32,
+    fight_buffer: u32,
+    renew_ceiling: u32,
+) -> CommitDecision {
+    let journey = (dist_to_rally + dist_to_target).saturating_mul(RALLY_TRAVEL_PER_ROOM);
+    let required = journey.saturating_add(fight_buffer);
+    if ttl >= required {
+        CommitDecision::Commit
+    } else if renew_ceiling >= required {
+        // A renew (up to the ceiling) can reach sufficiency — hold + top up first (RC-5).
+        CommitDecision::RenewThenCommit
+    } else {
+        // Even a full renew to the ceiling cannot cover the journey + fight — hopeless (RC-7 recycle).
+        CommitDecision::Recycle
+    }
+}
+
 /// Whether to HOLD the squad's virtual anchor at a room boundary for cohesion (don't advance across until
 /// enough members are gathered near the edge), instead of letting fast creeps trickle into a contested
 /// room one at a time. The P-OBJ #23 fix lives here: counts ONLY members with a resolved position — a
@@ -960,6 +1031,46 @@ mod tests {
             rally_rooms.iter().all(|&r| r == first),
             "the rally room is CONSTANT across the flapping-vision sequence (oscillation fixed): {:?}",
             rally_rooms
+        );
+    }
+
+    // ── D6 lifetime-aware staging / renew-in-transit kernel (ADR 0034 RC-5/RC-6/RC-7) ──
+
+    /// A high-TTL member that can clearly cover the journey + fight is COMMITTED as-is (no renew waste).
+    #[test]
+    fn lifetime_gate_commits_a_healthy_member() {
+        // 5 rooms to the rally + 1 rally→target = 6 rooms * 50 = 300 + FIGHT_BUFFER(100) = 400 required.
+        let d = lifetime_sufficient_for_deployment(1500, 5, 1, FIGHT_BUFFER, RENEW_TARGET_TTL);
+        assert_eq!(d, CommitDecision::Commit, "ample TTL covers the journey + fight → commit");
+    }
+
+    /// A member SHORT of sufficiency but rescuable by a renew (the journey + fight fits under the renew
+    /// ceiling) holds + renews to sufficiency (RC-5) rather than being sent to arrive low/dead.
+    #[test]
+    fn lifetime_gate_renews_a_short_but_rescuable_member() {
+        // Same 400-tick requirement; the member has only 200 → short, but RENEW_TARGET_TTL(1400) >= 400.
+        let d = lifetime_sufficient_for_deployment(200, 5, 1, FIGHT_BUFFER, RENEW_TARGET_TTL);
+        assert_eq!(d, CommitDecision::RenewThenCommit, "short but a renew can top it up → hold + renew");
+    }
+
+    /// A journey so long that even a FULL renew to the ceiling cannot cover it is RECYCLED (RC-7) — sending
+    /// it just feeds the oscillation. required = 27 rooms * 50 + 100 = 1450 > RENEW_TARGET_TTL(1400), and the
+    /// member's current TTL (300) is also short → neither commit nor renew can cover it → recycle.
+    #[test]
+    fn lifetime_gate_recycles_a_hopeless_journey() {
+        let d = lifetime_sufficient_for_deployment(300, 27, 0, FIGHT_BUFFER, RENEW_TARGET_TTL);
+        assert_eq!(d, CommitDecision::Recycle, "even a full renew can't cover the journey + fight → recycle");
+    }
+
+    /// Pure + deterministic: same inputs → same verdict, and the boundary is integer-exact (no float drift).
+    #[test]
+    fn lifetime_gate_is_deterministic_and_boundary_exact() {
+        // required = (4+0)*50 + 100 = 300. ttl exactly 300 commits; 299 must NOT.
+        assert_eq!(lifetime_sufficient_for_deployment(300, 4, 0, FIGHT_BUFFER, RENEW_TARGET_TTL), CommitDecision::Commit);
+        assert_eq!(lifetime_sufficient_for_deployment(299, 4, 0, FIGHT_BUFFER, RENEW_TARGET_TTL), CommitDecision::RenewThenCommit);
+        assert_eq!(
+            lifetime_sufficient_for_deployment(123, 7, 2, FIGHT_BUFFER, RENEW_TARGET_TTL),
+            lifetime_sufficient_for_deployment(123, 7, 2, FIGHT_BUFFER, RENEW_TARGET_TTL)
         );
     }
 }
