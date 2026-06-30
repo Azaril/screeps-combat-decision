@@ -86,6 +86,25 @@ pub struct ReconcileSnapshot {
     /// fight. `Duplicate` still retires (it is being consolidated, not freed). `false` => the existing
     /// retire behaviour (no sibling, or capability mismatch) — reassignment is strictly ADDITIVE.
     pub reassign_available: bool,
+    /// ADR 0035 D4 (ABANDON-ON-UNWINNABLE-CONTACT): the squad has REACHED the target room, ENGAGED at
+    /// least once, and the real in-room P(win) = LOSE — a GENUINELY UNWINNABLE fight, not standing in a
+    /// CLEARED room. Computed by the manager as `in_room_any && engaged_once &&
+    /// !present_force_wins_or_stalls(view, center)` (in-room ⇒ `LiveVisible` ⇒ the assessment is over the
+    /// REAL towers — no vacuous win), the EXACT INVERSE of `present_force_wins_or_stalls` — the lose SUBSET.
+    /// It is DELIBERATELY NOT `ctx.state == Retreating`: that retreat STATE is a SUPERSET that also fires for
+    /// a critical-HP member / low squad-average / kiting stalemate on a WINNABLE fight, so deriving abandon
+    /// from it would retire a bloodied-but-WINNING squad mid-fight + back off a winnable room (the
+    /// false-abandon this carrier fixes). EPHEMERAL — carried tick-to-tick from Phase B's real-intel
+    /// assessment via a non-serialized set; NOT serialized (`ReconcileSnapshot` is `Copy`, no
+    /// WORLD_FORMAT_VERSION bump).
+    ///
+    /// This SPLITS the `resolved` (clean clear) gate from the new `unwinnable_contact` (lost-fight)
+    /// terminal: a TRUE clear has no living hostile, so its in-room P(win) is NOT a lose → `resolved`
+    /// requires `!retreated_from_contact`; a squad in-room + engaged + GENUINELY LOSING is
+    /// `unwinnable_contact` ⇒ `Retire { GaveUp, withdraw: false, mark_unwinnable: true }` (BACKED OFF, not
+    /// withdrawn-as-clean — which would invite an instant re-field). `is_defend` is exempt from
+    /// `mark_unwinnable` (kernel rule), so an owned room is never abandoned even if its defender retreats.
+    pub retreated_from_contact: bool,
 }
 
 /// Why a squad is being retired (drives logging + backoff).
@@ -162,8 +181,28 @@ pub fn reconcile(s: ReconcileSnapshot) -> ReconcileAction {
     // clear / a give-up. Treated exactly like `holding_station`: it refreshes the lease and blocks both
     // terminals; the producer withdraws the objective when the controller goes neutral (objective_gone retires).
     let declaiming = s.declaiming && s.in_target_room && s.has_members;
-    // A declaimer in its room with no focus must NOT read as a clean clear (it is still striking, not done).
-    let resolved = s.engaged_once && s.in_target_room && !s.has_focus && s.has_members && !declaiming;
+    // ADR 0035 D4 — DISTINGUISH a CLEARED room from a RETREATED-FROM one. The pre-fix `resolved` gate
+    // (engaged_once && in_room && !focus && members) could not tell "I cleared the room" from "I reached a
+    // towered room I cannot win, engaged, and am now retreating" — both present focus-less + in-room + had
+    // engaged, so a LOST fight mis-resolved → withdraw (no backoff) → instant re-field → reach↔retreat
+    // oscillation (the W4N5 spiral, 455 Retreating vs 1 Engaged, 0 kills). `retreated_from_contact` is the
+    // GENUINE LOSE verdict — the EXACT INVERSE of `present_force_wins_or_stalls` over the real in-room view
+    // (real in-room P(win)=LOSE) — NOT the broader `decide_squad` retreat STATE (which a critical-HP /
+    // low-avg / stalemate retreat on a WINNABLE fight also enters; carrying THAT would falsely abandon a
+    // winning squad). A TRUE clear has no living hostile ⇒ the squad is not losing ⇒ `resolved` also
+    // requires `!retreated_from_contact`. A declaimer in its room with no focus must NOT read as a clean clear.
+    let resolved =
+        s.engaged_once && s.in_target_room && !s.has_focus && s.has_members && !declaiming && !s.retreated_from_contact;
+    // ADR 0035 D4 — the LOST-FIGHT terminal: reached + engaged + the GENUINE in-room LOSE verdict
+    // (`retreated_from_contact` = `!present_force_wins_or_stalls`, NOT merely the squad being in a Retreating
+    // STATE) ⇒ ABANDON via the give-up backoff (NOT withdraw-as-clean). Distinct from `gave_up` (a lease
+    // lapse) — this fires the instant the in-room P(win) verdict is LOSE, with members still alive, no lease
+    // wait. Because the signal is the lose SUBSET, a squad still WINNING a fight whose member dipped to
+    // critical HP (`present_force_wins_or_stalls=true` ⇒ `retreated_from_contact=false`) does NOT trip this —
+    // it holds/wins, no false-abandon; so no extra winnable-guard is needed here. A Defend squad is exempt
+    // from the backoff downstream (the kernel never sets `mark_unwinnable` for `is_defend`), so an owned
+    // room's defender that momentarily retreats is never marked unwinnable / abandoned.
+    let unwinnable_contact = s.engaged_once && s.in_target_room && s.retreated_from_contact && s.has_members;
     // A forming squad keeps its lease alive past the deadline (bounded — see the doc comment) while it is
     // making spawn PROGRESS (a member just appeared) OR a member is IN FLIGHT (banking/spawning the next
     // member, even on a tick the present count is flat). The in-flight refresh is bounded by
@@ -187,23 +226,31 @@ pub fn reconcile(s: ReconcileSnapshot) -> ReconcileAction {
         && !holding_station
         && !declaiming;
 
-    if s.objective_gone || s.duplicate || s.wiped || resolved || gave_up {
+    if s.objective_gone || s.duplicate || s.wiped || resolved || gave_up || unwinnable_contact {
         // Precedence: a clean clear (Resolved) is the most informative + drives withdraw; then the
-        // objective simply being gone (no backoff — not our loss); then a wipe; then the lease give-up;
-        // then a duplicate. (Ordering matters: `gave_up` must NOT mislabel an `objective_gone` retire.)
+        // objective simply being gone (no backoff — not our loss); then a wipe; then an unwinnable-contact
+        // abandon (reached + engaged + retreating = a LOST fight, backed off); then the lease give-up;
+        // then a duplicate. (Ordering matters: `gave_up`/`unwinnable_contact` must NOT mislabel an
+        // `objective_gone` retire — a vanished objective is not our loss.) ADR 0035 D4: `unwinnable_contact`
+        // ranks below `objective_gone`/`wiped` (a gone/wiped squad is already terminal) but ABOVE `gave_up`
+        // and is itself a LOSS terminal (GaveUp reason + backoff) — it fires the instant the in-room P(win)
+        // is LOSE, without waiting for the lease to lapse.
         let reason = if resolved {
             RetireReason::Resolved
         } else if s.objective_gone {
             RetireReason::ObjectiveGone
         } else if s.wiped {
             RetireReason::Wiped
-        } else if gave_up {
+        } else if gave_up || unwinnable_contact {
             RetireReason::GaveUp
         } else {
             RetireReason::Duplicate
         };
         let withdraw = resolved;
-        let mark_unwinnable = (s.wiped || gave_up) && !s.objective_gone && !s.is_defend;
+        // ADR 0035 D4: an `unwinnable_contact` abandon ALSO backs the room off (same backoff a `gave_up` /
+        // `wiped` loss uses). Exempt for `is_defend` (we never abandon an owned room) and never when the
+        // objective is already gone (not our loss).
+        let mark_unwinnable = (s.wiped || gave_up || unwinnable_contact) && !s.objective_gone && !s.is_defend;
         // ADR 0027 v1: on a NON-LOSS terminal (a clean clear, or the target simply vanished) with a
         // compatible sibling objective available, REASSIGN the squad in place instead of retiring it —
         // reuse the invested bodies (no Generation churn). A LOSS terminal (`Wiped`/`GaveUp`) or a
@@ -261,6 +308,7 @@ mod tests {
             holding_station: false,
             declaiming: false,
             reassign_available: false,
+            retreated_from_contact: false,
         }
     }
 
@@ -293,6 +341,64 @@ mod tests {
         assert_eq!(
             reconcile(s),
             ReconcileAction::Retire { reason: RetireReason::Resolved, withdraw: true, mark_unwinnable: false }
+        );
+    }
+
+    /// ADR 0035 D4 (K4) — ABANDON-ON-UNWINNABLE-CONTACT: a squad that REACHED the target, ENGAGED, and is
+    /// now RETREATING (real in-room P(win)=LOSE) must NOT mis-resolve as a clean clear (which would withdraw
+    /// and invite an instant re-field, the reach↔retreat spiral). It is its OWN terminal: GaveUp with
+    /// `withdraw=false` and `mark_unwinnable=true` (BACKED OFF). Fires WITHOUT waiting for the lease to lapse.
+    #[test]
+    fn retreated_from_contact_abandons_with_backoff_not_resolve() {
+        let s = ReconcileSnapshot {
+            engaged_once: true,
+            in_target_room: true,
+            has_focus: false,
+            retreated_from_contact: true,
+            ..forming()
+        };
+        assert_eq!(
+            reconcile(s),
+            ReconcileAction::Retire { reason: RetireReason::GaveUp, withdraw: false, mark_unwinnable: true },
+            "reached + engaged + retreating = lost fight → abandon with backoff, NOT a clean resolve/withdraw"
+        );
+    }
+
+    /// ADR 0035 D4 (K4 mirror) — the SAME in-room/engaged/focus-less shape but NOT retreating (a TRUE clear:
+    /// no living hostile, so the squad is not retreating) STILL resolves cleanly (withdraw, no backoff). This
+    /// pins that the split does NOT false-abandon a genuine win.
+    #[test]
+    fn cleared_not_retreating_still_resolves_with_withdraw() {
+        let s = ReconcileSnapshot {
+            engaged_once: true,
+            in_target_room: true,
+            has_focus: false,
+            retreated_from_contact: false,
+            ..forming()
+        };
+        assert_eq!(
+            reconcile(s),
+            ReconcileAction::Retire { reason: RetireReason::Resolved, withdraw: true, mark_unwinnable: false },
+            "a genuine clear (not retreating) still resolves — no false-abandon"
+        );
+    }
+
+    /// ADR 0035 D4 — a DEFEND squad retreating from in-room contact is exempt from the backoff (we never
+    /// abandon an owned room). It still retires as GaveUp but `mark_unwinnable=false`.
+    #[test]
+    fn defend_retreated_from_contact_does_not_back_off() {
+        let s = ReconcileSnapshot {
+            engaged_once: true,
+            in_target_room: true,
+            has_focus: false,
+            retreated_from_contact: true,
+            is_defend: true,
+            ..forming()
+        };
+        assert_eq!(
+            reconcile(s),
+            ReconcileAction::Retire { reason: RetireReason::GaveUp, withdraw: false, mark_unwinnable: false },
+            "a Defend squad's owned room is never marked unwinnable even on a retreat"
         );
     }
 

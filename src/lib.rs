@@ -2738,6 +2738,97 @@ mod tests {
         assert_eq!(decide_squad(&squad_view(&mixed, &hostiles, SquadOrderState::Engaged)).state, SquadOrderState::Retreating);
     }
 
+    /// ADR 0035 D4 (E1 false-abandon fix) — the LOST-IN-ROOM verdict must be the GENUINE lose subset
+    /// (`!present_force_wins_or_stalls`), NOT the broader `decide_squad` Retreating STATE. This pins the
+    /// DIVERGENCE the manager's old `ctx.state == Retreating` signal got wrong: a WINNABLE fight whose
+    /// focus-fired member dips to critical HP is sent Retreating (`any_critical`) YET still wins-or-stalls.
+    /// Deriving abandon from the state would retire a bloodied-but-WINNING squad mid-fight + back off the
+    /// winnable room (the dangerous false-abandon). Deriving it from the lose verdict does NOT.
+    #[test]
+    fn winnable_fight_with_critical_member_retreats_but_does_not_lose_so_does_not_abandon() {
+        use crate::lifecycle::{reconcile, ReconcileAction, ReconcileSnapshot, RetireReason};
+        // A baseline in-room/engaged/focus-less snapshot; the only knob under test is `retreated_from_contact`.
+        let base = ReconcileSnapshot {
+            objective_gone: false,
+            duplicate: false,
+            is_defend: false,
+            deadline_lapsed: false,
+            wiped: false,
+            has_focus: false,
+            engaged_once: true,
+            in_target_room: true,
+            has_members: true,
+            forming: false,
+            forming_progress: false,
+            forming_in_flight: false,
+            forming_budget_remaining: true,
+            traveling: false,
+            travel_progress: false,
+            travel_budget_remaining: true,
+            holding_station: false,
+            declaiming: false,
+            reassign_available: false,
+            retreated_from_contact: false,
+        };
+        // Two 70-ranged-power fighters vs a single 1-ATTACK-part target ⇒ overwhelmingly winnable
+        // (our_strength ≫ enemy_strength, no bleed-out). One member at ~17% HP (350/2000 < 25%).
+        let hostiles = vec![creep(1, 25, 25, 100, &[(Part::Attack, 1)])];
+        let winning_but_bloodied = vec![ranged_member_at(2000, 2000, 24, 25), ranged_member_at(350, 2000, 26, 25)];
+        let view = squad_view(&winning_but_bloodied, &hostiles, SquadOrderState::Engaged);
+        let center = cohesion::centroid(&member_positions(view.members));
+
+        // The DIVERGENCE the old `ctx.state == Retreating` signal would have read as a loss:
+        // decide_squad RETREATS (the critical member trips `any_critical`) …
+        assert_eq!(
+            decide_squad(&view).state,
+            SquadOrderState::Retreating,
+            "a critical-HP member sends the squad Retreating (any_critical) …"
+        );
+        // … yet the GENUINE lose verdict is FALSE — the present force still WINS-OR-STALLS.
+        assert!(
+            present_force_wins_or_stalls(&view, center),
+            "… but the present force still WINS-OR-STALLS — it is NOT losing the fight"
+        );
+
+        // The manager's carrier: `lost_in_room = engaged_once && in_room_any && !present_force_wins_or_stalls`.
+        let (engaged_once, in_room_any) = (true, true);
+        let lost_in_room = engaged_once && in_room_any && !present_force_wins_or_stalls(&view, center);
+        assert!(!lost_in_room, "the lose-verdict carrier is FALSE for a winning-but-bloodied squad");
+
+        // Phase A feeds THAT (not the Retreating state) as `retreated_from_contact` → the kernel must NOT
+        // abandon (no Retire{GaveUp, mark_unwinnable}); it resolves cleanly as a focus-less in-room clear.
+        let snapshot = ReconcileSnapshot { retreated_from_contact: lost_in_room, ..base };
+        match reconcile(snapshot) {
+            ReconcileAction::Retire { reason: RetireReason::GaveUp, mark_unwinnable: true, .. } => {
+                panic!("a WINNING bloodied squad must NOT be abandoned (false-abandon regression)")
+            }
+            other => {
+                // It resolves as a clean clear (no living-enough hostile focus this snapshot) — the point is
+                // it is NOT a GaveUp+mark_unwinnable abandon.
+                assert!(
+                    !matches!(other, ReconcileAction::Retire { mark_unwinnable: true, .. }),
+                    "no backoff/abandon for a winning squad, got {other:?}"
+                );
+            }
+        }
+
+        // CONTRAST — a GENUINE lose (one ranged fighter vs four heavy bruisers): present_force_wins_or_stalls
+        // is FALSE ⇒ lost_in_room=TRUE ⇒ the kernel abandons (GaveUp + mark_unwinnable + backoff).
+        let losing = vec![ranged_member_at(2000, 2000, 25, 25)];
+        let heavy: Vec<_> = (0..4u8).map(|i| creep(10 + i, 30, 25 + i, 1000, &[(Part::Attack, 5), (Part::Move, 5)])).collect();
+        let lview = squad_view(&losing, &heavy, SquadOrderState::Engaged);
+        let lcenter = cohesion::centroid(&member_positions(lview.members));
+        assert!(!present_force_wins_or_stalls(&lview, lcenter), "the genuine-lose force does NOT win-or-stall");
+        let genuine_lost = engaged_once && in_room_any && !present_force_wins_or_stalls(&lview, lcenter);
+        assert!(genuine_lost, "the lose-verdict carrier is TRUE for a genuinely-losing in-room squad");
+        let lose_snapshot = ReconcileSnapshot { retreated_from_contact: genuine_lost, ..base };
+        assert_eq!(
+            reconcile(lose_snapshot),
+            ReconcileAction::Retire { reason: RetireReason::GaveUp, withdraw: false, mark_unwinnable: true },
+            "a GENUINE lose still abandons + backs off (the D4 behaviour the operator wants)"
+        );
+    }
+
     #[test]
     fn squad_retreat_hysteresis_has_no_yo_yo() {
         // A combat-winnable matchup (70 DPS vs a 30-DPS target) so μ engages — the HP hysteresis is
@@ -2924,9 +3015,13 @@ mod tests {
     //
     // The proceed gate ([`present_force_wins_or_stalls`]) fires when the CURRENT PRESENT force will WIN or
     // STALL (won't lose) — REGARDLESS of whether the expected archetypes are all present. Composition still
-    // SIZES the spawn; P(win) GATES the proceed. The predicate is the exact INVERSE of the present-force
-    // retreat (lose) condition `decide_squad` uses, so the proceed gate and the retreat gate can never
-    // disagree about what "losing" means. The four cases the directive demands: (a) a winning incomplete
+    // SIZES the spawn; P(win) GATES the proceed. The predicate is the exact INVERSE of the present-force LOSE
+    // condition (`our_strength == 0 || unwinnable || balance <= -ENGAGE_BALANCE_BAND`) — NOT the inverse of
+    // the broader `decide_squad` RETREAT STATE, which ALSO enters Retreating on a critical-HP member, a low
+    // squad-average, or a kiting stalemate even while the force still wins-or-stalls. So a Retreating squad is
+    // NOT necessarily losing: only `!present_force_wins_or_stalls` is the genuine lose verdict the abandon
+    // path (ADR 0035 D4 `retreated_from_contact`) and the proceed gate share. The four cases the directive
+    // demands: (a) a winning incomplete
     // force proceeds, (b) a stalling force proceeds, (c) a losing force HOLDS, (d) sizing is untouched.
 
     /// (a) WIN with incomplete archetypes: a single present ranged fighter (NO healer archetype yet) that

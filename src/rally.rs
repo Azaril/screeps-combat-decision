@@ -717,6 +717,64 @@ mod tests {
         assert!(!target_is_uncontested(true, true, true, false), "enemy safe mode → not uncontested");
     }
 
+    // ── ADR 0035 D3 (K1): `target_is_uncontested` over an intel TRANSITION (RC-11 parity) ──────────
+    //
+    // The C7 crux: the squad-manager's uncontested classifier USED `intel_source.is_reliable()`
+    // (Cached || LiveVisible) as the first arg, so an empty-CACHED towered room (reliable=true, no
+    // hostiles/towers VISIBLE because the cache is stale) classified UNCONTESTED — the rally then staged
+    // AT the target centre and the squad walked into the towers. D3 changes the CALLER to pass the SAME
+    // real-intel notion D9 uses for the fast-path: `uncontested_intel = !hostiles.is_empty() ||
+    // !structures.is_empty() || intel_source == LiveVisible`. The KERNEL is unchanged; this pins the
+    // semantics of the value the caller must now pass:
+    //   - empty-Cached towered (real_intel=false, no_hostiles=true, no_towers=true) → FALSE (NOT uncontested)
+    //   - LiveVisible with real towers (real_intel=true, no_towers=false)           → FALSE (real towers seen)
+    //   - the ONLY true path: REAL intel + genuinely no hostiles/towers/safe-mode.
+    #[test]
+    fn uncontested_over_intel_transition_requires_real_intel() {
+        // T0 — commit-time empty CACHE (the vacuous case): the squad has a RoomData entity (is_reliable()
+        // would say true) but the DTOs are empty because no towers were VISIBLE last scout, not because
+        // there are none. With D3 the caller passes real_intel=FALSE → NOT uncontested.
+        assert!(
+            !target_is_uncontested(false, true, true, true),
+            "empty-Cached towered room (no REAL intel) is NOT uncontested — the C7 fix"
+        );
+        // T1 — a member gains LIVE vision and SEES the towers: real_intel=true but no_hostile_towers=false.
+        assert!(
+            !target_is_uncontested(true, true, false, true),
+            "LiveVisible with real towers seen → NOT uncontested"
+        );
+        // The ONLY true path is REAL intel + genuinely clear.
+        assert!(
+            target_is_uncontested(true, true, true, true),
+            "REAL intel + no hostiles + no towers + no safe mode → uncontested (legitimate LiveVisible-empty)"
+        );
+        // Exhaustively: every other combination is contested.
+        for &(intel, h, t, sm) in &[
+            (false, true, true, true),
+            (false, false, true, true),
+            (true, false, true, true),
+            (true, true, false, true),
+            (true, true, true, false),
+        ] {
+            assert!(!target_is_uncontested(intel, h, t, sm), "contested combo ({intel},{h},{t},{sm})");
+        }
+    }
+
+    /// K2 (ADR 0035 D3): with `uncontested=false` (the D3 output for an empty-Cached towered target) the
+    /// shared rally stages ONE ROOM SHORT on the approach side (out of tower range), NOT the target centre —
+    /// so the squad masses out of fire and advances only on the gather quorum. Mirrors C8a.
+    #[test]
+    fn contested_empty_cache_stages_one_room_short_not_target_centre() {
+        let target = pos(25, 25, "W4N5"); // the live towered room
+        let approach = pos(25, 25, "W6N5"); // two rooms away (W5N5 is the neighbour toward the approach)
+
+        // D3 classified this CONTESTED (empty-Cached towered) → stage one room short, NOT the target centre.
+        let r = shared_rally_point(approach, target, false);
+        assert_ne!(r.room_name(), target.room_name(), "contested → NOT the target room centre (out of tower range)");
+        assert_eq!(r.room_name(), "W5N5".parse::<RoomName>().unwrap(), "stages the neighbour toward the approach");
+        assert_eq!((r.x().u8(), r.y().u8()), (25, 25), "room centre of the staging room");
+    }
+
     // ── ADR 0034 Phase 0: FAR-HOME / CROSS-QUADRANT real-geometry rally repro (RC-1 + RC-2) ─────────
 
     /// Chebyshev room-distance helper for the rally tests.
