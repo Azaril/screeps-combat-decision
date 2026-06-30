@@ -900,9 +900,10 @@ mod tests {
         DefenseProfile {
             towers: vec![TowerThreat { range_to_assault: 18, energy: 200 }],
             breach_hits: 10_000,
-            objective_hits: 50_000,
+            objective_hits: 50_000,
             repair_per_tick: 0.0,
             safe_mode: false,
+            ..Default::default()
         }
     }
 
@@ -982,9 +983,10 @@ mod tests {
         let defense = DefenseProfile {
             towers: vec![TowerThreat { range_to_assault: 14, energy: 1000 }],
             breach_hits: 0,
-            objective_hits: 0,
+            objective_hits: 0,
             repair_per_tick: 0.0,
             safe_mode: false,
+            ..Default::default()
         };
         let enemy = Some(EnemyForce { dps: 60.0, heal: 0.0, hits: 3_000, count: 2, boosted: false });
         // A cost weight that makes the ladder rungs a real EV trade-off, but low enough that a modest value
@@ -1013,7 +1015,7 @@ mod tests {
     fn optimize_composition_commits_a_winnable_target_at_default() {
         let comp = optimize_composition(
             DoctrineObjective::KillImmuneStructure,
-            &DefenseProfile { towers: vec![TowerThreat { range_to_assault: 15, energy: 200 }], breach_hits: 0, objective_hits: 100_000, repair_per_tick: 0.0, safe_mode: false },
+            &DefenseProfile { towers: vec![TowerThreat { range_to_assault: 15, energy: 200 }], breach_hits: 0, objective_hits: 100_000, repair_per_tick: 0.0, safe_mode: false, ..Default::default() },
             None,
             100_000.0,
             1400,
@@ -1041,6 +1043,7 @@ mod tests {
             objective_hits: 100_000,
             repair_per_tick: 0.0,
             safe_mode: false,
+            ..Default::default()
         };
         let comp = optimize_composition(
             DoctrineObjective::KillImmuneStructure,
@@ -1081,7 +1084,7 @@ mod tests {
     fn undefended_core_sizes_to_a_stable_single_slot_across_windows() {
         // A small undefended core a single capped RANGED member clears within ~hundreds of ticks — so it is
         // winnable across the whole realistic on-site window range (no window forces a 2nd member).
-        let core = DefenseProfile { towers: vec![], breach_hits: 0, objective_hits: 8_000, repair_per_tick: 0.0, safe_mode: false };
+        let core = DefenseProfile { towers: vec![], breach_hits: 0, objective_hits: 8_000, repair_per_tick: 0.0, safe_mode: false, ..Default::default() };
         let p = CompositionParams { member_energy: 5600, ..Default::default() };
         let counts: Vec<usize> = [400u32, 600, 900, 1200, 1400]
             .iter()
@@ -1107,9 +1110,10 @@ mod tests {
         let undefended = DefenseProfile {
             towers: vec![],
             breach_hits: 0,
-            objective_hits: 100_000,
+            objective_hits: 100_000,
             repair_per_tick: 0.0,
             safe_mode: false,
+            ..Default::default()
         };
         let defended = DefenseProfile {
             towers: vec![TowerThreat { range_to_assault: 14, energy: 1000 }], // energized tower → real attrition

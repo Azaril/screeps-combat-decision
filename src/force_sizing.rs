@@ -40,6 +40,79 @@ const UNDEFENDED_KILL_HEADROOM: f32 = 1.15;
 /// Coordinated player-squad bed (ADR 0026 §9.8, deferred — see the §9.10 ledger).
 pub const COORDINATED_DPS_MARGIN: f32 = 1.5;
 
+/// Content-staleness window for an EMPTY-tower defense on an ATTACK/CORE commit candidate (ADR 0035 D2).
+///
+/// DISTINCT from the war.rs 200-tick `last_seen` re-scout gate (`operations/war.rs`): that gate is about
+/// *recency of ANY vision* of the room; THIS one is about *reliability of the empty-tower CONTENT*. A room
+/// seen 60 ticks ago with zero towers is "fresh" by the 200-tick gate — yet its towers may have energized
+/// AFTER that snapshot, so committing a squad sized to ZERO tower DPS walks it into a fight it was never
+/// built for (the W4N5 vacuous-intel cascade). When `tower_intel == ScoutedEmpty` AND the empty snapshot is
+/// older than this window, the offense DEFERS the commit and re-scouts to re-confirm the room is still clear.
+/// A FRESH (`< SCOUT_RECONFIRM_TICKS`) empty snapshot is TRUSTED (just scouted clear); a `Seen` (non-empty)
+/// profile is ALWAYS trusted and sized against the REAL towers — the gate only ever defers empty-STALE.
+///
+/// Tuned tighter than the 200-tick recency gate (towers energize in tens of ticks, not hundreds) but loose
+/// enough that a squad we JUST scouted-clear is not re-scouted on every scan. The compile-time fence below
+/// pins it strictly inside the 200-tick recency gate so D2 is always the *narrower* (content) gate.
+pub const SCOUT_RECONFIRM_TICKS: u32 = 40;
+
+// Compile-time fence (ADR 0035 D2): the content-staleness window MUST be strictly tighter than war.rs's
+// 200-tick recency re-scout gate, else D2 would never fire before the recency gate already re-scouted.
+const _: () = assert!(SCOUT_RECONFIRM_TICKS > 0 && SCOUT_RECONFIRM_TICKS < 200);
+
+/// Tri-state tower-intel reliability for an offense COMMIT decision (ADR 0035 D1). Replaces the implicit
+/// boolean "we have a `DefenseProfile` ⇒ trust it" with an explicit notion of HOW we know the tower list.
+///
+/// DERIVED (never serialized) in war.rs at the consumption point from the EXISTING
+/// `RoomThreatData.hostile_tower_positions.is_empty()` + `last_seen` recency via [`tower_intel_from`] — so
+/// D1 adds NO new persisted state and is WFV-neutral (see ADR 0035 §4 WORLD_FORMAT_VERSION risk).
+///
+/// - [`Seen`](TowerIntel::Seen): non-empty tower positions — we have SEEN real towers; trust + size to them.
+/// - [`ScoutedEmpty`](TowerIntel::ScoutedEmpty): empty tower positions but the room was mapped/seen at some
+///   point (`threat_data` exists, so `last_seen` is meaningful). "No towers were visible last time we
+///   looked" — VACUOUS; may be a genuinely clear room OR a room whose towers energized after the snapshot.
+/// - [`NeverSeen`](TowerIntel::NeverSeen): no `threat_data` at all. (Does not reach the offense scan — the
+///   scan requires `threat_data` — and the selection gate already defers on `defense.is_none()`; carried
+///   for completeness so the classification is total.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum TowerIntel {
+    /// No threat data at all — never scouted. Default: the most conservative "we don't know" state, so a
+    /// `DefenseProfile::default()` (the `defense.is_none()` fallback) reads as un-trusted, never as `Seen`.
+    #[default]
+    NeverSeen,
+    /// Non-empty tower positions seen — trust and size against the real towers.
+    Seen,
+    /// Empty tower list, but the room has been mapped — "clear last time we looked" (may be stale).
+    ScoutedEmpty,
+}
+
+/// Classify the tower intel (ADR 0035 D1) from the EXISTING threat fields — pure, deterministic, no
+/// serialized state. `has_threat_data` is whether a `RoomThreatData` component exists for the room
+/// (`NeverSeen` when not). Non-empty `hostile_tower_positions` ⇒ [`TowerIntel::Seen`]; empty + has-data ⇒
+/// [`TowerIntel::ScoutedEmpty`] (regardless of recency — recency is judged by
+/// [`should_defer_offense_commit`], keeping classification and the staleness decision separate).
+pub fn tower_intel_from(hostile_tower_positions_empty: bool, has_threat_data: bool) -> TowerIntel {
+    if !has_threat_data {
+        TowerIntel::NeverSeen
+    } else if hostile_tower_positions_empty {
+        TowerIntel::ScoutedEmpty
+    } else {
+        TowerIntel::Seen
+    }
+}
+
+/// Whether the offense must DEFER committing a squad to this candidate and re-scout first (ADR 0035 D2).
+///
+/// True IFF the tower intel is [`TowerIntel::ScoutedEmpty`] AND the empty snapshot is older than
+/// [`SCOUT_RECONFIRM_TICKS`] — i.e. an empty-tower defense we can no longer trust is current. `Seen` (real
+/// towers) is NEVER deferred (size to the real towers); a FRESH `ScoutedEmpty` (just scouted clear) is
+/// NEVER deferred; `NeverSeen` is handled upstream by the `defense.is_none()` gate (returns false here so
+/// this helper alone never claims a never-seen room is deferrable on the content gate). `now.saturating_sub`
+/// keeps a clock that went backwards (private-server reset) benign — a future `last_seen` reads "recent".
+pub fn should_defer_offense_commit(intel: TowerIntel, last_seen: u32, now: u32) -> bool {
+    matches!(intel, TowerIntel::ScoutedEmpty) && now.saturating_sub(last_seen) > SCOUT_RECONFIRM_TICKS
+}
+
 /// One hostile tower's threat to the planned assault position.
 #[derive(Clone, Copy, Debug)]
 pub struct TowerThreat {
@@ -68,6 +141,12 @@ pub struct DefenseProfile {
     pub repair_per_tick: f32,
     /// Owner safe-mode active → zero damage possible → a hard veto.
     pub safe_mode: bool,
+    /// ADR 0035 D1 — HOW we know the `towers` list, for the scout-before-commit gate. DERIVED in war.rs
+    /// from `RoomThreatData.hostile_tower_positions.is_empty()` + whether the component exists (NOT a
+    /// serialized field; this struct is not serialized either). Drives the selection defer (D2) and the
+    /// `economic_rank_score` penalty so a VACUOUS empty-tower profile (`ScoutedEmpty`) never sizes/ranks as
+    /// a genuinely-`Seen`-clear room. Defaults to `NeverSeen` (the `defense.is_none()` fallback profile).
+    pub tower_intel: TowerIntel,
 }
 
 /// What ONE squad brings + how long it has on-site. `onsite_budget_ticks` =
@@ -542,6 +621,47 @@ fn parts_for_rate(rate: f32, power: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── ADR 0035 D1/D2: scout-before-commit tower-intel classification + the content-staleness defer ──
+
+    #[test]
+    fn tower_intel_classification_is_total() {
+        // No threat data at all ⇒ NeverSeen (regardless of the empty flag).
+        assert_eq!(tower_intel_from(true, false), TowerIntel::NeverSeen);
+        assert_eq!(tower_intel_from(false, false), TowerIntel::NeverSeen);
+        // Threat data present, empty tower list ⇒ ScoutedEmpty (the vacuous case).
+        assert_eq!(tower_intel_from(true, true), TowerIntel::ScoutedEmpty);
+        // Threat data present, non-empty tower list ⇒ Seen (size to the real towers).
+        assert_eq!(tower_intel_from(false, true), TowerIntel::Seen);
+        // The DefenseProfile default is the conservative NeverSeen (the `defense.is_none()` fallback).
+        assert_eq!(DefenseProfile::default().tower_intel, TowerIntel::NeverSeen);
+    }
+
+    #[test]
+    fn defer_only_empty_stale_never_seen_or_recent() {
+        let now = 100_000u32;
+        // ScoutedEmpty + STALE (older than the re-confirm window) ⇒ DEFER (re-scout before committing).
+        assert!(should_defer_offense_commit(
+            TowerIntel::ScoutedEmpty,
+            now - (SCOUT_RECONFIRM_TICKS + 1),
+            now
+        ));
+        // ScoutedEmpty + RECENT (just scouted clear, inside the window) ⇒ do NOT defer (trust it, proceed).
+        assert!(!should_defer_offense_commit(TowerIntel::ScoutedEmpty, now - 1, now));
+        // Exactly AT the window boundary is still trusted (strict `>` — not yet stale).
+        assert!(!should_defer_offense_commit(TowerIntel::ScoutedEmpty, now - SCOUT_RECONFIRM_TICKS, now));
+        // Seen (real towers) is NEVER deferred — size to the real towers no matter how old.
+        assert!(!should_defer_offense_commit(TowerIntel::Seen, now - 10_000, now));
+        // NeverSeen is handled by the upstream `defense.is_none()` gate; the content gate never claims it.
+        assert!(!should_defer_offense_commit(TowerIntel::NeverSeen, now - 10_000, now));
+    }
+
+    #[test]
+    fn defer_clock_reset_is_benign() {
+        // A `last_seen` AHEAD of `now` (private-server time reset / restored snapshot) reads as "recent"
+        // via saturating_sub ⇒ NOT deferred, never an underflow panic.
+        assert!(!should_defer_offense_commit(TowerIntel::ScoutedEmpty, 10_000, 100));
+    }
 
     // ── R2: RequiredForce (capability → parts) ──
     fn assessment(winnable: bool, heal: f32, dps: f32) -> ForceAssessment {

@@ -834,6 +834,7 @@ mod tests {
             objective_hits: 100_000,
             repair_per_tick: 0.0,
             safe_mode: false,
+            ..Default::default()
         }
     }
 
@@ -972,6 +973,7 @@ mod tests {
             objective_hits: 100_000,
             repair_per_tick: 50.0,
             safe_mode: false,
+            ..Default::default()
         };
         // ADR 0031 #41: the enemy creep dps the structure breach out-heals comes from THIS `EnemyForce` (the
         // single channel), no longer a co-resident `defense.enemy_dps`.
@@ -1001,7 +1003,7 @@ mod tests {
     fn emit_requirement_reproduces_per_objective_semantics() {
         // A guard but NO towers, so the anti-creep overlay's `clear_force` is out-heal-feasible against the
         // siege budget (towers + a guard exceed the siege ceiling's heal — that's a correct defer, tested elsewhere).
-        let guarded = DefenseProfile { towers: vec![], breach_hits: 10_000, objective_hits: 100_000, repair_per_tick: 0.0, safe_mode: false };
+        let guarded = DefenseProfile { towers: vec![], breach_hits: 10_000, objective_hits: 100_000, repair_per_tick: 0.0, safe_mode: false, ..Default::default() };
         let undefended = DefenseProfile { breach_hits: 10_000, objective_hits: 100_000, ..Default::default() };
         let guard = Some(EnemyForce { dps: 90.0, heal: 0.0, hits: 3000, count: 2, boosted: false });
         let budget = crate::composition::optimizer_ceiling_budget(DoctrineObjective::DismantleStructure, 5600, 1400);
