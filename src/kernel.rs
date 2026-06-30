@@ -21,7 +21,7 @@
 use crate::kite::ThreatField;
 use crate::{CombatCreepDto, CombatIntent, CombatStructureDto, FocusTarget, Ownership};
 use screeps::local::LocalCostMatrix;
-use screeps::{Position, RawObjectId, RoomCoordinate, StructureType};
+use screeps::{Position, RawObjectId, RoomCoordinate};
 use screeps_combat_engine::constants::{HEAL_POWER, RANGED_HEAL_POWER};
 use std::collections::HashMap;
 
@@ -251,14 +251,6 @@ pub struct EvResult {
 // get a clean working system, then sweep). Structure objective values are in the same "fighting-strength
 // removed" units as a creep's `threat_value`, so the `g_them` currency prices razing a tower vs killing a
 // creep on one scale.
-fn struct_kind_value(t: StructureType) -> i64 {
-    match t {
-        StructureType::InvaderCore => 700,
-        StructureType::Tower => 600, // its tower_dps is literally in enemy_strength — razing it raises W
-        StructureType::Spawn => 500,
-        _ => 0, // ramparts/walls/etc. are valueless EXCEPT the chosen breach focus (bonus below)
-    }
-}
 /// The chosen objective / breach structure (`focus`) gets this ×bonus so the squad commits to breaking it
 /// (reuses the existing `select_focus_target`/`breach_redirect` to pick WHICH structure; ADR 0025 §2.4).
 const FOCUS_STRUCT_VALUE: i64 = 600;
@@ -375,7 +367,9 @@ pub fn plan_squad_ev(
     // Valuable enemy structures (kind value; the chosen focus/breach structure gets the big bonus).
     for s in structures.iter().filter(|s| s.ownership == Ownership::Hostile && s.hits > 0) {
         let is_focus = focus.is_some_and(|f| f.id.is_none() && f.pos == s.pos);
-        let base = struct_kind_value(s.structure_type);
+        // ADR 0036 D1: strategic value + threat removed (a live tower's real incoming dps), not a fixed
+        // kind rank; the chosen breach/focus structure keeps the commit multiplier.
+        let base = crate::struct_target_value(s, centroid);
         let v = if is_focus { (base + FOCUS_STRUCT_VALUE) * FOCUS_STRUCT_BONUS } else { base };
         if v == 0 {
             continue;
@@ -897,6 +891,53 @@ mod tests {
         let focus = Some(FocusTarget { pos: spawn.pos, id: None });
         let out = plan_squad_ev(&[me], &[], &[spawn], focus, kpos(25, 25), 10_000, 5_000, 300, &no_threat(), 0, &LocalCostMatrix::new(), &chebyshev_flood(kpos(26, 25)), &KernelParams::default());
         assert!(out[0].intents.iter().any(|i| matches!(i, CombatIntent::Attack { target, id: None } if *target == kpos(26, 25))), "melee breaches the structure: {:?}", out[0].intents);
+    }
+
+    fn ranged_evm(idx: usize, id: u8, x: u8, y: u8) -> EvMember {
+        EvMember {
+            idx,
+            id: Some(kraw(id)),
+            pos: kpos(x, y),
+            hits: 1000,
+            hits_max: 1000,
+            caps: ActorCaps { ranged: true, ..Default::default() },
+            melee_power: 0,
+            ranged_power: 30,
+            heal_parts: 0,
+            dismantle_power: 0,
+            claim_power: 0,
+        }
+    }
+
+    #[test]
+    fn a_ranged_member_closes_on_and_razes_a_bare_focus_core() {
+        // ADR 0036 D3/D4 sim proof: a ranged member at range 5 from a BARE invader-core focus (no creeps,
+        // no towers) CLOSES — its move goal strictly decreases range to the core — and once at range ≤3
+        // emits `RangedAttack{target: core}`. This is the kernel side of "make the squad raze the core".
+        let core_pos = kpos(30, 25);
+        let core = CombatStructureDto {
+            pos: core_pos,
+            structure_type: StructureType::InvaderCore,
+            hits: 100_000,
+            hits_max: 100_000,
+            ownership: Ownership::Hostile,
+            energy: 0,
+        };
+        let focus = Some(FocusTarget { pos: core_pos, id: None });
+        // (a) Range 5 (at x=25): out of weapon range → the goal steps DOWNHILL toward the core, no fire yet.
+        let far = ranged_evm(0, 1, 25, 25);
+        let out_far = plan_squad_ev(&[far], &[], &[core.clone()], focus, kpos(25, 25), 10_000, 5_000, 300, &no_threat(), 0, &LocalCostMatrix::new(), &chebyshev_flood(core_pos), &KernelParams::default());
+        let goal = out_far[0].goal.expect("a move goal toward the core");
+        assert!(goal.get_range_to(core_pos) < kpos(25, 25).get_range_to(core_pos), "closes toward the core: {goal:?}");
+        assert!(out_far[0].intents.is_empty(), "range 5 → out of range → no fire yet: {:?}", out_far[0].intents);
+        // (b) Range 3 (at x=27): in weapon range → emits RangedAttack at the core by position (id None).
+        let near = ranged_evm(0, 1, 27, 25);
+        let out_near = plan_squad_ev(&[near], &[], &[core], focus, kpos(27, 25), 10_000, 5_000, 300, &no_threat(), 0, &LocalCostMatrix::new(), &chebyshev_flood(core_pos), &KernelParams::default());
+        assert!(
+            out_near[0].intents.iter().any(|i| matches!(i, CombatIntent::RangedAttack { target, id: None } if *target == core_pos)),
+            "in range ≤3 → ranged-razes the core: {:?}",
+            out_near[0].intents
+        );
     }
 
     #[test]

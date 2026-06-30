@@ -250,13 +250,38 @@ pub trait TacticalAgent {
     fn decide(&mut self, view: &CombatView) -> Vec<CombatIntent>;
 }
 
-fn structure_rank(ty: StructureType) -> u32 {
+/// ADR 0036 D1 — the **strategic** half of a structure's target value (worth as a WIN CONDITION /
+/// objective, independent of how much it shoots us). InvaderCore (the win condition) highest, Spawn
+/// (the enemy's reproduction) medium, else 0 (a live Tower earns its value from `threat_removed`, not a
+/// hand rank). In the SAME fighting-strength-removed units as a creep's `threat_value`. (Canonical here;
+/// the kernel ledger calls [`struct_target_value`] so both orderings agree — replaces the old parallel
+/// `structure_rank` / `struct_kind_value` pair.)
+pub(crate) fn strategic_value(ty: StructureType) -> i64 {
     match ty {
-        StructureType::InvaderCore => 0,
-        StructureType::Spawn => 1,
-        StructureType::Tower => 2,
-        _ => 10,
+        StructureType::InvaderCore => 700,
+        StructureType::Spawn => 500,
+        _ => 0,
     }
+}
+/// ADR 0036 D1 — the **threat** half: incoming dps razing this structure stops doing to us. For an
+/// ENERGIZED tower this is its `tower_attack_damage_at_range` at the range to `centroid` (the SAME
+/// engine curve `assess_engage`/`force_sizing` price); a DRAINED tower (`< TOWER_ENERGY_COST`) or a
+/// non-shooter is 0. Integer throughout (the engine fn floors to `u32` before the cast — no float into a
+/// discrete branch, determinism preserved).
+pub(crate) fn threat_removed(s: &CombatStructureDto, centroid: Position) -> i64 {
+    use screeps_combat_engine::constants::TOWER_ENERGY_COST;
+    if s.structure_type == StructureType::Tower && s.energy >= TOWER_ENERGY_COST {
+        screeps_combat_engine::damage::tower_attack_damage_at_range(centroid.get_range_to(s.pos)) as i64
+    } else {
+        0
+    }
+}
+/// ADR 0036 D1 — a structure's unified target value = **strategic value + threat removed**, the single
+/// currency that orders hostile structures for both the kernel ledger and the focus/per-creep fallbacks
+/// (D2). A live tower (real incoming dps) beats a spawn; the win-condition core stays top — no parallel
+/// hand rank. Higher = raze first (callers sort DESCENDING — the inverse of the old `structure_rank`).
+pub(crate) fn struct_target_value(s: &CombatStructureDto, centroid: Position) -> i64 {
+    strategic_value(s.structure_type) + threat_removed(s, centroid)
 }
 
 /// The squad's shared focus target — an **expected-value** choice (ADR 0020 §4.2). Among the hostiles
@@ -278,7 +303,12 @@ fn structure_rank(ty: StructureType) -> u32 {
 ///
 /// (NOTE: safeMode — where the enemy room nullifies all our combat — is an engage-level veto handled
 /// by the upcoming Lanchester gate, not here; the DTOs don't yet carry it.)
-pub fn select_focus_target(hostiles: &[CombatCreepDto], structures: &[CombatStructureDto], our_dps: u32) -> Option<FocusTarget> {
+pub fn select_focus_target(
+    hostiles: &[CombatCreepDto],
+    structures: &[CombatStructureDto],
+    our_dps: u32,
+    centroid: Position,
+) -> Option<FocusTarget> {
     // Primary: the top of the EV order (killable, unshielded, best threat/ttk).
     if let Some((c, _)) = ev_target_order(hostiles, structures, our_dps).first() {
         return Some(c.as_target());
@@ -288,11 +318,14 @@ pub fn select_focus_target(hostiles: &[CombatCreepDto], structures: &[CombatStru
     if let Some(c) = hostiles.iter().filter(|c| !ramparts.contains(&(c.pos.x().u8(), c.pos.y().u8()))).min_by_key(|c| c.hits) {
         return Some(c.as_target());
     }
-    // Fallback 2: hostile structures by rank (breach logic resolves a shielding rampart).
+    // Fallback 2 (ADR 0036 D2): hostile structures by threat×value DESCENDING from the squad centroid —
+    // towers-then-core in a towered room (the live tower's incoming dps outranks the spawn), the core
+    // directly in a bare room. Replaces the fixed `structure_rank` MIN. Ties → lower hits (nearer raze).
+    // The breach logic still resolves a shielding rampart on top of this pick.
     structures
         .iter()
         .filter(|s| s.ownership == Ownership::Hostile)
-        .min_by_key(|s| structure_rank(s.structure_type))
+        .max_by_key(|s| (struct_target_value(s, centroid), std::cmp::Reverse(s.hits)))
         .map(|s| FocusTarget { pos: s.pos, id: None })
 }
 
@@ -556,10 +589,13 @@ fn priority_hostile_within<'a>(view: &CombatView<'a>, range: u32) -> Option<&'a 
 }
 
 fn best_hostile_structure_within<'a>(view: &CombatView<'a>, range: u32) -> Option<&'a CombatStructureDto> {
+    // ADR 0036 D2: pick by threat×value DESCENDING (a live tower out-prioritizes a spawn by its real
+    // incoming dps) — the inverse of the old `structure_rank` MIN. Centroid = this creep's tile (the
+    // range a tower would shoot it from). Ties → lower hits = nearer raze (stable, deterministic).
     view.structures
         .iter()
         .filter(|s| s.ownership == Ownership::Hostile && view.me.pos.get_range_to(s.pos) <= range)
-        .min_by_key(|s| structure_rank(s.structure_type))
+        .max_by_key(|s| (struct_target_value(s, view.me.pos), std::cmp::Reverse(s.hits)))
 }
 
 fn attack_with_orders(view: &CombatView, orders: &CreepOrders, out: &mut Vec<CombatIntent>) {
@@ -1459,14 +1495,20 @@ pub fn decide_squad(view: &SquadView) -> SquadDecision {
     // Our focusable single-target output (melee + ranged) over living members — feeds the EV focus
     // pick's kill-inequality (is a target out-healed?) and ttk ranking (ADR 0020 §4.2 / §8.2).
     let our_dps: u32 = view.members.iter().filter(|m| m.hits > 0).map(|m| m.melee_power + m.ranged_power).sum();
-    let focus = select_focus_target(view.hostiles, view.structures, our_dps);
+
+    let center = cohesion::centroid(&member_positions(view.members));
+    // ADR 0036 D2: the focus pick prices tower threat by range to the squad — feed the centroid (or, if
+    // no member is positioned yet, the first hostile/structure tile as a stand-in so the focus is still
+    // chosen; this only seeds the range for tower-vs-spawn ordering, not engagement).
+    let focus_centroid = center
+        .or_else(|| view.hostiles.first().map(|c| c.pos))
+        .or_else(|| view.structures.first().map(|s| s.pos));
+    let focus = focus_centroid.and_then(|fc| select_focus_target(view.hostiles, view.structures, our_dps, fc));
     let engaged_or_moving = if focus.is_some() {
         SquadOrderState::Engaged
     } else {
         SquadOrderState::Moving
     };
-
-    let center = cohesion::centroid(&member_positions(view.members));
 
     // EV winnability (ADR 0020 §4.3): the Lanchester fighting-strength balance over the KILLABLE enemy
     // force + the hard vetoes (safeMode / irremovable damage we can't out-heal). This replaces the old
@@ -2210,7 +2252,7 @@ mod tests {
         let c1 = creep(2, 30, 30, 200, &[(Part::Heal, 5)]); // low hits, but...
         let c2 = creep(3, 30, 31, 1000, &[(Part::Heal, 10)]); // ...adjacent → heals c1 120/tick (+self 60)
         let attacker = creep(1, 10, 10, 300, &[(Part::Attack, 3)]); // far, unhealed → killable
-        let f = select_focus_target(&[c1, c2, attacker], &[], 100).unwrap();
+        let f = select_focus_target(&[c1, c2, attacker], &[], 100, pos(25, 25)).unwrap();
         assert_eq!(f.id, Some(raw(1)), "skips the out-healed healer, kills the exposed attacker");
     }
 
@@ -2221,7 +2263,7 @@ mod tests {
         let shielded = creep(1, 25, 25, 100, &[(Part::Attack, 1)]);
         let exposed = creep(2, 26, 25, 300, &[(Part::Attack, 1)]);
         let ramparts = vec![structure(25, 25, StructureType::Rampart, Ownership::Hostile)];
-        let f = select_focus_target(&[shielded, exposed], &ramparts, 200).unwrap();
+        let f = select_focus_target(&[shielded, exposed], &ramparts, 200, pos(25, 25)).unwrap();
         assert_eq!(f.id, Some(raw(2)), "the rampart-shielded creep is unkillable by direct fire");
     }
 
@@ -2231,7 +2273,7 @@ mod tests {
         // ttk 3 (ev 50). EV picks B (more enemy capability removed per tick) over the lower-hits A.
         let a = creep(1, 10, 10, 100, &[(Part::Attack, 1)]);
         let b = creep(2, 40, 40, 300, &[(Part::Attack, 5)]);
-        let f = select_focus_target(&[a, b], &[], 100).unwrap();
+        let f = select_focus_target(&[a, b], &[], 100, pos(25, 25)).unwrap();
         assert_eq!(f.id, Some(raw(2)), "threat/ttk beats raw lowest-hits");
     }
 
@@ -2297,16 +2339,67 @@ mod tests {
         // No offense (our_dps 0) ⇒ nothing is "killable" ⇒ best-effort lowest-hits unshielded creep.
         let weak = creep(1, 20, 20, 100, &[(Part::Attack, 1)]);
         let strong = creep(2, 40, 40, 400, &[(Part::Attack, 5)]);
-        assert_eq!(select_focus_target(&[strong, weak.clone()], &[], 0).unwrap().id, Some(raw(1)));
+        assert_eq!(select_focus_target(&[strong, weak.clone()], &[], 0, pos(25, 25)).unwrap().id, Some(raw(1)));
         // No hostiles → InvaderCore beats spawn/tower; my/neutral excluded.
         let structs = vec![
             structure(10, 10, StructureType::Tower, Ownership::Hostile),
             structure(11, 11, StructureType::InvaderCore, Ownership::Hostile),
             structure(12, 12, StructureType::Spawn, Ownership::Mine),
         ];
-        let t = select_focus_target(&[], &structs, 100).unwrap();
+        let t = select_focus_target(&[], &structs, 100, pos(11, 11)).unwrap();
         assert_eq!((t.pos, t.id), (pos(11, 11), None));
-        assert_eq!(select_focus_target(&[], &[], 100), None);
+        assert_eq!(select_focus_target(&[], &[], 100, pos(25, 25)), None);
+    }
+
+    // ── ADR 0036 D1/D2 — threat×value structure ordering ────────────────
+    #[test]
+    fn struct_target_value_ranks_an_energized_tower_above_a_spawn() {
+        // The operator directive: a LIVE tower (what shoots us) must out-prioritize a spawn, WITHOUT a
+        // hand rank. An energized tower at range ≤5 of the centroid removes 600 incoming dps (strategic
+        // 0 + threat 600 = 600); a spawn is strategic 500 + threat 0 = 500. So tower > spawn. The OLD
+        // `struct_kind_value` (Spawn 500 > Tower... wait, 600) AND the OLD `structure_rank` (Spawn 1 <
+        // Tower 2 ⇒ spawn first) both got this wrong for the focus pick — this is the RED→GREEN.
+        let centroid = pos(25, 25);
+        let tower = structure(27, 25, StructureType::Tower, Ownership::Hostile); // range 2, energy 1000
+        let spawn = structure(23, 25, StructureType::Spawn, Ownership::Hostile);
+        assert!(
+            struct_target_value(&tower, centroid) > struct_target_value(&spawn, centroid),
+            "an energized tower ({}) out-prioritizes a spawn ({})",
+            struct_target_value(&tower, centroid),
+            struct_target_value(&spawn, centroid)
+        );
+        // A DRAINED tower stops nobody → threat 0, strategic 0 → drops to 0 (below the spawn).
+        let drained = CombatStructureDto { energy: 0, ..tower };
+        assert_eq!(struct_target_value(&drained, centroid), 0, "a drained tower removes no threat");
+        assert!(struct_target_value(&spawn, centroid) > struct_target_value(&drained, centroid), "spawn beats a drained tower");
+        // The win-condition core stays top (700 + 0).
+        let core = structure(25, 27, StructureType::InvaderCore, Ownership::Hostile);
+        assert!(struct_target_value(&core, centroid) > struct_target_value(&tower, centroid), "the core (win condition) is highest");
+    }
+
+    #[test]
+    fn select_focus_target_picks_the_in_range_energized_tower_then_the_core() {
+        // Towered room, no creeps: the focus fallback picks the highest threat×value structure — the
+        // energized tower (it shoots us) over the spawn, with the core highest of all.
+        let centroid = pos(25, 25);
+        let tower = structure(27, 25, StructureType::Tower, Ownership::Hostile); // energized, range 2
+        let spawn = structure(20, 20, StructureType::Spawn, Ownership::Hostile);
+        let core = structure(30, 30, StructureType::InvaderCore, Ownership::Hostile);
+        let f = select_focus_target(&[], &[tower, spawn, core], 100, centroid).unwrap();
+        assert_eq!((f.pos, f.id), (pos(30, 30), None), "the core (700) is the top threat×value pick");
+        // Drain the core out (only tower + spawn remain) → the energized tower beats the spawn.
+        let tower = structure(27, 25, StructureType::Tower, Ownership::Hostile);
+        let spawn = structure(20, 20, StructureType::Spawn, Ownership::Hostile);
+        let f2 = select_focus_target(&[], &[spawn, tower], 100, centroid).unwrap();
+        assert_eq!(f2.pos, pos(27, 25), "with no core, the energized tower out-prioritizes the spawn");
+    }
+
+    #[test]
+    fn select_focus_target_picks_a_bare_core_directly() {
+        // A BARE room (just the core, no towers/creeps): the focus is the core itself (the squad razes it).
+        let core = structure(25, 25, StructureType::InvaderCore, Ownership::Hostile);
+        let f = select_focus_target(&[], &[core], 100, pos(20, 20)).unwrap();
+        assert_eq!((f.pos, f.id), (pos(25, 25), None), "a bare core is the sole, top target");
     }
 
     #[test]
@@ -2315,7 +2408,7 @@ mod tests {
         faux.body[0].hits = 0; // its only HEAL part is destroyed → not a healer
         let weak = creep(2, 30, 30, 150, &[(Part::Attack, 5)]); // genuinely lower hits + real threat
         // EV: the dead HEAL part contributes no heal threat; the armed `weak` is the higher threat/ttk kill.
-        assert_eq!(select_focus_target(&[faux, weak.clone()], &[], 100).unwrap().id, weak.id);
+        assert_eq!(select_focus_target(&[faux, weak.clone()], &[], 100, pos(25, 25)).unwrap().id, weak.id);
     }
 
     // ── decide_combat: ordered path ─────────────────────────────────────
