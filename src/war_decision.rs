@@ -320,9 +320,31 @@ where
         if !armed {
             continue;
         }
-        // Carry the tower signal through DISTINCT from the creep danger (ADR 0037 T1). UNGATED: `tower_danger`
-        // never enters the armed-check or the danger fold above — it rides straight through so a *defender*
-        // is never sized to it, while the T2/T3 stages can suppress the bare reflex / route to offense on it.
+        // ── ADR 0037 T2 (SUPPRESS the bare defense reflex) ────────────────────────────────────────────────
+        // Do NOT emit a Secure for a neighbour whose ONLY threat is a `danger==0` creep sitting under hostile
+        // towers. A non-attacking creep (a Work dismantler / Claim controller-attacker / Heal healer — armed
+        // per `hostile_warrants_defender` but scoring 0 DPS in `estimate_danger`) that is inside a
+        // towered/hostile-owned room is NOT attacking US: a bare floor-sized defender can never beat the
+        // towers (T3 routes a towered room to the winnability-gated offense path instead), and the creep only
+        // becomes a real threat if it ENTERS one of our rooms — at which point it fires its OWN owned-room
+        // Secure (which this neighbour path never touches). So DROP exactly this room.
+        //
+        // PRESERVE (do NOT suppress):
+        //   (i)  `danger > 0.0` — a REAL attacker (Attack/RangedAttack) adjacent IS a threat, towered or not.
+        //   (ii) `danger == 0.0 && tower_danger == 0.0` — a Work/Claim/Heal creep in a NON-towered room (a
+        //        dismantler razing our remote, a claimer attacking our reservation) is a genuine non-tower
+        //        threat and still warrants a defender.
+        // ONLY the `danger==0 && tower_danger>0` case is dropped. Threshold gate: an EXACT-ZERO compare on the
+        // creep danger + a strictly-positive tower signal — a clean `==0`/`>0` boundary (no float→discrete
+        // bucketing beyond the threshold), so it stays deterministic. `tower_danger` is otherwise unconsumed
+        // (T1 carries it ungated); this is its first (T2) consumer.
+        if danger == 0.0 && obs.tower_danger > 0.0 {
+            continue;
+        }
+        // Carry the tower signal through DISTINCT from the creep danger (ADR 0037 T1). It rode ungated in T1;
+        // T2 (above) is now its first consumer (the suppress gate). It still never enters the armed-check or
+        // the danger fold — so a *defender* that IS emitted (a real attacker) is never sized to the towers,
+        // and the T3 stage can still route a towered room to the offense/winnability path.
         out.push(ObservedRoom { room: obs.room, armed, danger, tower_danger: obs.tower_danger });
     }
 
@@ -598,22 +620,52 @@ mod tests {
 
     // ── ADR 0037 T1: tower-aware neighbour threat SIGNAL (distinct from the creep danger) ────────────────
 
-    /// THE T1 case (the exact live symptom): a towered neighbour whose only creep is a Work-only body
-    /// (a dismantler — armed, danger 0). `observe_neighbours` must carry `tower_danger > 0` DISTINCT from the
-    /// creep `danger`, which stays 0 (a defender is NOT sized to beat towers). The armed flag is unchanged.
+    /// ── ADR 0037 T2 (SUPPRESS the bare defense reflex) — the exact live W13N56 symptom ──
+    /// A towered neighbour whose ONLY creep is a Work-only body (a dismantler — armed per
+    /// `hostile_warrants_defender`, but danger 0 in `estimate_danger`) sitting under hostile towers is NOT
+    /// attacking US. `observe_neighbours` must now SUPPRESS it: NO `ObservedRoom` → no `Threat` → no bare
+    /// Secure (a floor defender can never beat towers; T3 routes it to offense). RED before T2 (it emitted).
     #[test]
-    fn observe_carries_tower_danger_distinct_from_creep_danger() {
-        // A Work-only creep: armed (dismantler warrants a defender) but danger 0 (estimate_danger scores
-        // only Attack/RangedAttack). This is the exact live W13N56 case.
+    fn observe_suppresses_bare_secure_for_danger0_creep_under_towers() {
+        // A Work-only creep: armed (dismantler warrants a defender) but danger 0. This is the exact live
+        // W13N56 case: danger==0 && tower_danger>0 → the suppress gate drops the whole room.
         let dismantler = vec![Part::Work, Part::Move];
         let bodies = [dismantler];
         let observations = [raw_towered((1, 0), &bodies, 300.0)];
         let out = observe_neighbours(&observations, DefensePolicy::default());
-        assert_eq!(out.len(), 1);
-        assert!(out[0].armed, "a Work-only dismantler still warrants a defender");
-        assert_eq!(out[0].danger, 0.0, "the creep danger is UNCHANGED — a Work-only body scores 0 DPS");
-        assert!(out[0].tower_danger > 0.0, "the tower threat is carried DISTINCT from the creep danger");
-        assert_eq!(out[0].tower_danger, 300.0, "the tower_danger is carried through verbatim (ungated in T1)");
+        assert!(
+            out.is_empty(),
+            "a danger==0 creep sitting under hostile towers is NOT attacking us — the bare Secure is suppressed (T2)"
+        );
+    }
+
+    /// PRESERVE (i): a REAL attacker (danger>0) in a towered room STILL emits — a real attacker adjacent IS a
+    /// threat, towered or not. The tower signal rides through DISTINCT from the (non-zero) creep danger.
+    #[test]
+    fn observe_preserves_real_attacker_even_under_towers() {
+        let attacker = vec![Part::Attack, Part::Move]; // danger 30 (>0)
+        let bodies = [attacker];
+        let observations = [raw_towered((1, 0), &bodies, 300.0)];
+        let out = observe_neighbours(&observations, DefensePolicy::default());
+        assert_eq!(out.len(), 1, "a REAL attacker (danger>0) under towers STILL emits — the suppress gate spares it");
+        assert!(out[0].armed);
+        assert_eq!(out[0].danger, 30.0, "the creep danger is UNCHANGED — the attacker scores its DPS");
+        assert_eq!(out[0].tower_danger, 300.0, "the tower threat is carried DISTINCT (for T3), not folded into danger");
+    }
+
+    /// PRESERVE (ii): a danger==0 creep (Work/Claim/Heal) in a NON-towered room STILL emits — a dismantler
+    /// razing our remote / a claimer attacking our reservation is a genuine non-tower threat that warrants a
+    /// defender. Only the `danger==0 && tower_danger>0` case is dropped; `tower_danger==0` is NOT.
+    #[test]
+    fn observe_preserves_danger0_creep_in_non_towered_room() {
+        let claimer = vec![Part::Claim, Part::Move]; // armed, danger 0, but NO towers
+        let bodies = [claimer];
+        let observations = [raw_towered((1, 0), &bodies, 0.0)];
+        let out = observe_neighbours(&observations, DefensePolicy::default());
+        assert_eq!(out.len(), 1, "a danger==0 creep in a NON-towered room STILL emits (a genuine non-tower threat)");
+        assert!(out[0].armed, "a Claim controller-attacker still warrants a defender");
+        assert_eq!(out[0].danger, 0.0, "its creep danger is 0 (estimate_danger scores only Attack/RangedAttack)");
+        assert_eq!(out[0].tower_danger, 0.0, "no towers ⇒ the suppress gate does not fire");
     }
 
     /// A neighbour with NO towers carries `tower_danger == 0` — the signal is only present when scouted
