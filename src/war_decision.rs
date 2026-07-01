@@ -39,6 +39,12 @@ pub struct Threat<R> {
     /// the threat ranks higher among multiple threats AT THE SAME effective priority band. Never feeds the
     /// band itself (that comes from the asset-priority boost), only the within-band tie-break.
     pub danger: f32,
+    /// The neighbour's hostile-TOWER threat (Σ energized-tower DPS at a representative range), carried
+    /// DISTINCT from `danger` (ADR 0037 T1). A *defender* must NOT be sized to beat towers, so this is a
+    /// pure SIGNAL of "how towered" the room is — kept separate from the creep `danger` and (in T1) never
+    /// gating/priority/sizing: it flows through un-consumed for the T2/T3 stages that suppress the bare
+    /// defense reflex + route a towered neighbour to the offense/winnability path. `0.0` ⇒ no live towers.
+    pub tower_danger: f32,
 }
 
 /// One owned room the defender protects, with its strategic value (RCL / asset weight). The kernel uses
@@ -152,6 +158,12 @@ pub struct ObservedRoom<R> {
     /// The danger estimate (summed DPS, etc.) the caller folded over the armed hostiles — passed straight
     /// through to `Threat::danger` for the within-band tie-break.
     pub danger: f32,
+    /// The room's hostile-TOWER threat (Σ energized-tower DPS at a representative range), DISTINCT from the
+    /// creep `danger` (ADR 0037 T1). The caller reads it from the SCOUTED threat data
+    /// (`RoomThreatData.hostile_tower_positions` + `tower_energy`, the same signal offense uses); the kernel
+    /// carries it straight through to `Threat::tower_danger` UNGATED (T1 is purely additive — it never
+    /// filters/prioritises/sizes on it yet). `0.0` ⇒ no live (energized) towers scouted.
+    pub tower_danger: f32,
 }
 
 /// PURE neighbour-threat builder (ADR 0027 v1 LIVE SEAM). Given the owned rooms, the observed visible
@@ -195,7 +207,9 @@ where
             continue;
         }
 
-        out.push(Threat { room: obs.room, danger: obs.danger });
+        // Carry the tower signal through DISTINCT from the creep danger (ADR 0037 T1). Ungated — nothing
+        // filters/prioritises on `tower_danger` yet; it just rides alongside for the T2/T3 consumers.
+        out.push(Threat { room: obs.room, danger: obs.danger, tower_danger: obs.tower_danger });
     }
 
     out
@@ -259,6 +273,13 @@ pub struct RawObservation<'a, R> {
     pub is_owned: bool,
     /// Chebyshev room-distance to the NEAREST owned room (`None` ⇒ no owned rooms → nothing to defend).
     pub nearest_owned_dist: Option<u32>,
+    /// The room's hostile-TOWER threat (Σ energized-tower DPS at a representative range), read by the bot
+    /// from the SCOUTED `RoomThreatData` (`hostile_tower_positions` + `tower_energy`, the same signal
+    /// offense uses); the harness sets it synthetically. DISTINCT from the creep `hostile_bodies` danger
+    /// (ADR 0037 T1). `observe_neighbours` carries it through to `ObservedRoom::tower_danger` UNGATED — T1
+    /// never folds it into the armed-check, the danger, or any filter; it is a pure additive signal for the
+    /// T2/T3 consumers. `0.0` ⇒ no live towers.
+    pub tower_danger: f32,
 }
 
 /// THE pure OBSERVATION decision (ADR 0027 P0). Given the raw per-room hostile observations + the leash,
@@ -299,7 +320,10 @@ where
         if !armed {
             continue;
         }
-        out.push(ObservedRoom { room: obs.room, armed, danger });
+        // Carry the tower signal through DISTINCT from the creep danger (ADR 0037 T1). UNGATED: `tower_danger`
+        // never enters the armed-check or the danger fold above — it rides straight through so a *defender*
+        // is never sized to it, while the T2/T3 stages can suppress the bare reflex / route to offense on it.
+        out.push(ObservedRoom { room: obs.room, armed, danger, tower_danger: obs.tower_danger });
     }
 
     out
@@ -319,7 +343,7 @@ mod tests {
         OwnedRoom { room: r, value }
     }
     fn threat(r: Room, danger: f32) -> Threat<Room> {
-        Threat { room: r, danger }
+        Threat { room: r, danger, tower_danger: 0.0 }
     }
 
     /// The objective is emitted AT THE THREAT'S CURRENT ROOM (the intercept point), not the owned room —
@@ -408,7 +432,7 @@ mod tests {
     // ── neighbour_threats (ADR 0027 v1 LIVE SEAM) ──────────────────────────────────────────────────────
 
     fn obs(r: Room, armed: bool, danger: f32) -> ObservedRoom<Room> {
-        ObservedRoom { room: r, armed, danger }
+        ObservedRoom { room: r, armed, danger, tower_danger: 0.0 }
     }
 
     /// An ARMED hostile in a VISIBLE neighbour WITHIN the leash becomes one `Threat` at that neighbour, with
@@ -489,6 +513,19 @@ mod tests {
             visible,
             is_owned,
             nearest_owned_dist: Some(cheby((0, 0), r)),
+            tower_danger: 0.0,
+        }
+    }
+
+    /// Like [`raw`] but with a hostile-TOWER threat (ADR 0037 T1) — the towered-neighbour case.
+    fn raw_towered<'a>(r: Room, bodies: &'a [Vec<Part>], tower_danger: f32) -> RawObservation<'a, Room> {
+        RawObservation {
+            room: r,
+            hostile_bodies: bodies,
+            visible: true,
+            is_owned: false,
+            nearest_owned_dist: Some(cheby((0, 0), r)),
+            tower_danger,
         }
     }
 
@@ -557,6 +594,69 @@ mod tests {
         let out = observe_neighbours(&observations, DefensePolicy::default());
         assert_eq!(out.len(), 1, "a swarm in one room is a single ObservedRoom");
         assert_eq!(out[0], obs((1, 0), true, 70.0), "danger summed across the swarm");
+    }
+
+    // ── ADR 0037 T1: tower-aware neighbour threat SIGNAL (distinct from the creep danger) ────────────────
+
+    /// THE T1 case (the exact live symptom): a towered neighbour whose only creep is a Work-only body
+    /// (a dismantler — armed, danger 0). `observe_neighbours` must carry `tower_danger > 0` DISTINCT from the
+    /// creep `danger`, which stays 0 (a defender is NOT sized to beat towers). The armed flag is unchanged.
+    #[test]
+    fn observe_carries_tower_danger_distinct_from_creep_danger() {
+        // A Work-only creep: armed (dismantler warrants a defender) but danger 0 (estimate_danger scores
+        // only Attack/RangedAttack). This is the exact live W13N56 case.
+        let dismantler = vec![Part::Work, Part::Move];
+        let bodies = [dismantler];
+        let observations = [raw_towered((1, 0), &bodies, 300.0)];
+        let out = observe_neighbours(&observations, DefensePolicy::default());
+        assert_eq!(out.len(), 1);
+        assert!(out[0].armed, "a Work-only dismantler still warrants a defender");
+        assert_eq!(out[0].danger, 0.0, "the creep danger is UNCHANGED — a Work-only body scores 0 DPS");
+        assert!(out[0].tower_danger > 0.0, "the tower threat is carried DISTINCT from the creep danger");
+        assert_eq!(out[0].tower_danger, 300.0, "the tower_danger is carried through verbatim (ungated in T1)");
+    }
+
+    /// A neighbour with NO towers carries `tower_danger == 0` — the signal is only present when scouted
+    /// towers exist. The creep danger is independent (an attacker still scores its DPS).
+    #[test]
+    fn observe_no_towers_carries_zero_tower_danger() {
+        let attacker = vec![Part::Attack, Part::Move]; // danger 30
+        let bodies = [attacker];
+        let observations = [raw_towered((1, 0), &bodies, 0.0)];
+        let out = observe_neighbours(&observations, DefensePolicy::default());
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].danger, 30.0, "the creep danger is unaffected by the tower signal");
+        assert_eq!(out[0].tower_danger, 0.0, "no scouted towers ⇒ tower_danger is 0");
+    }
+
+    /// The tower signal is PURELY ADDITIVE: it does NOT alter the armed-check, the creep danger, OR the
+    /// downstream emission. Two observations identical except for `tower_danger` yield the SAME creep
+    /// danger + armed verdict, and the same `neighbour_threats`/`emit_defense` emission (priority/room/order
+    /// byte-identical) — only the carried `tower_danger` differs. Guards the "T1 gates nothing" contract.
+    #[test]
+    fn tower_danger_does_not_alter_the_emission() {
+        let attacker = vec![Part::Attack, Part::Move]; // danger 30, armed
+        let bodies = [attacker];
+        let no_tower = [raw_towered((1, 0), &bodies, 0.0)];
+        let with_tower = [raw_towered((1, 0), &bodies, 500.0)];
+
+        let obs_no = observe_neighbours(&no_tower, DefensePolicy::default());
+        let obs_yes = observe_neighbours(&with_tower, DefensePolicy::default());
+        // armed + creep danger are byte-identical; only tower_danger differs.
+        assert_eq!(obs_no[0].armed, obs_yes[0].armed);
+        assert_eq!(obs_no[0].danger, obs_yes[0].danger);
+        assert_ne!(obs_no[0].tower_danger, obs_yes[0].tower_danger);
+
+        // The full emission is UNCHANGED by the tower signal (T1 gates nothing).
+        let owned_rooms = [owned((0, 0), 1.0)];
+        let threats_no = neighbour_threats(&owned_rooms, &obs_no, DefensePolicy::default(), cheby);
+        let threats_yes = neighbour_threats(&owned_rooms, &obs_yes, DefensePolicy::default(), cheby);
+        let emit_no = emit_defense(&owned_rooms, &threats_no, DefensePolicy::default(), cheby);
+        let emit_yes = emit_defense(&owned_rooms, &threats_yes, DefensePolicy::default(), cheby);
+        assert_eq!(emit_no, emit_yes, "the Secure emission (room/priority/order) is byte-identical — T1 gates nothing");
+        // The threat carries the tower signal through (distinct), while the emission ignores it.
+        assert_eq!(threats_yes[0].tower_danger, 500.0);
+        assert_eq!(threats_no[0].tower_danger, 0.0);
     }
 
     /// Deterministic: same input → same output, in the caller's stable order.
