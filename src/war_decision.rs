@@ -255,6 +255,26 @@ pub fn estimate_danger(parts: &[screeps::Part]) -> f32 {
         .sum()
 }
 
+/// Per-WORK dismantle-danger, applied only where we own structures to tear down (see [`dismantle_danger`]).
+/// Weighted below a pure attacker (30) because a dismantler cannot counter-attack; a defense-urgency proxy,
+/// not literal `DISMANTLE_POWER`. Tune here.
+pub const DISMANTLE_DANGER_PER_WORK: f32 = 15.0;
+
+/// Dismantle danger from a hostile's WORK parts, **gated on whether we own dismantle-able structures in that
+/// room**. A hostile WORK creep threatens us ONLY where we have built structures (base / ramparts / walls)
+/// for it to tear down — `DISMANTLE_POWER` 50/tick, a breach even at ZERO creep-DPS; there, size a killer.
+/// Where we hold nothing, there is nothing to dismantle, so it is harmless. This is the same principle that
+/// keeps [`estimate_danger`] at 0 for WORK on the NEIGHBOUR path (a dismantler idling in a hostile room where
+/// we own nothing — the ADR 0037 towered-neighbour case — is not a threat to US); the structure gate makes
+/// the condition explicit rather than a fixed weight.
+pub fn dismantle_danger(work_parts: usize, has_targetable_structures: bool) -> f32 {
+    if has_targetable_structures {
+        work_parts as f32 * DISMANTLE_DANGER_PER_WORK
+    } else {
+        0.0
+    }
+}
+
 /// One RAW per-room observation the live scan gathered (the only non-pure step left in war.rs): a room, the
 /// hostile bodies seen in it (each a slice of LIVE parts), and the visibility/ownership/distance facts. The
 /// bot builds these from `game::rooms()` / room intel (excluding Source Keepers before this point); the
@@ -571,6 +591,20 @@ mod tests {
         assert_eq!(estimate_danger(&[Part::Attack, Part::Attack, Part::Move]), 60.0);
         assert_eq!(estimate_danger(&[Part::RangedAttack, Part::Move]), 10.0);
         assert_eq!(estimate_danger(&[Part::Heal, Part::Work, Part::Claim, Part::Move]), 0.0);
+    }
+
+    /// Dismantle danger is gated on our owning structures the creep can tear down — the fix for the live
+    /// `Secure ... (dps=0, ... count=3)` (3 pure dismantlers reading as harmless) while NOT over-defending a
+    /// room where we hold nothing. The neighbour creep-DPS path (`estimate_danger`) still keeps WORK at 0.
+    #[test]
+    fn dismantle_danger_gated_on_our_structures() {
+        // We own structures here → WORK breaches → danger scales with WORK count.
+        assert_eq!(dismantle_danger(5, true), 5.0 * DISMANTLE_DANGER_PER_WORK);
+        // Nothing of ours to dismantle → harmless (same principle as the ADR 0037 neighbour suppression).
+        assert_eq!(dismantle_danger(5, false), 0.0);
+        assert_eq!(dismantle_danger(0, true), 0.0);
+        // The neighbour creep-DPS estimate still ignores WORK (towered-neighbour suppression).
+        assert_eq!(estimate_danger(&[Part::Work, Part::Work, Part::Move]), 0.0);
     }
 
     /// An ARMED hostile in a VISIBLE, NON-OWNED, within-leash room becomes one `ObservedRoom` with the
